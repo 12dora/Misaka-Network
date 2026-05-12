@@ -12,13 +12,63 @@ export default function Home() {
 
   return (
     <div className="min-h-screen" style={{ background: 'var(--bg-primary)' }}>
-      {/* ── FirstFold: Hero ────────────────────────────────────── */}
+
+      {/* ── Mobile Hero ─────────────────────────────────────────────── */}
+      <section className="md:hidden flex flex-col pt-16" style={{ minHeight: 'calc(100svh - 64px)' }}>
+        {/* Character: upper portion of screen */}
+        <div className="relative w-full flex-shrink-0 overflow-visible" style={{ height: '42vw', maxHeight: 240 }}>
+          <img
+            src={HERO_CHARACTER}
+            alt="御坂美琴"
+            className="animate-float select-none pointer-events-none"
+            style={{
+              position: 'absolute',
+              bottom: 0,
+              left: '50%',
+              transform: 'translateX(-50%)',
+              height: '220%',
+              objectFit: 'contain',
+              objectPosition: 'bottom center',
+              zIndex: 0,
+            }}
+            draggable={false}
+          />
+          {/* fade to bg at top */}
+          <div
+            className="absolute inset-0 pointer-events-none"
+            style={{
+              background: 'linear-gradient(to bottom, var(--bg-primary) 0%, transparent 35%)',
+              zIndex: 1,
+            }}
+          />
+        </div>
+
+        {/* Content below character */}
+        <div className="relative z-10 flex flex-col items-center px-5 pt-4 pb-10 gap-6 flex-1">
+          <img
+            src={HERO_TITLE}
+            alt="とある科学 御坂网络"
+            className="select-none pointer-events-none"
+            style={{
+              width: 'min(260px, 72vw)',
+              height: 'auto',
+              filter: 'drop-shadow(0 4px 12px rgba(0,0,0,0.22))',
+            }}
+            draggable={false}
+          />
+          <div className="w-full max-w-[420px]">
+            <LoginCard />
+          </div>
+        </div>
+      </section>
+
+      {/* ── Desktop Hero (44 / 56 split) ─────────────────────────── */}
       <section
-        className="relative grid overflow-hidden"
+        className="relative hidden md:grid overflow-hidden"
         style={{
           gridTemplateColumns: '44% 1fr',
           minHeight: 'min(100vh, 820px)',
-          paddingTop: 64, // nav height
+          paddingTop: 64,
         }}
       >
         {/* Left: Character illustration */}
@@ -37,12 +87,11 @@ export default function Home() {
           />
         </div>
 
-        {/* Right: Nav area + Title + LoginCard */}
+        {/* Right: Title + LoginCard */}
         <div
-          className="flex flex-col justify-center pr-12 pl-8 gap-10"
+          className="flex flex-col justify-center pr-12 pl-8 gap-10 relative z-10"
           style={{ paddingTop: '2rem', paddingBottom: '3rem' }}
         >
-          {/* Title Lockup */}
           <div>
             <img
               src={HERO_TITLE}
@@ -56,12 +105,10 @@ export default function Home() {
               draggable={false}
             />
           </div>
-
-          {/* Login Card */}
           <LoginCard />
         </div>
 
-        {/* Subtle dot grid overlay on right side */}
+        {/* Dot grid on right half */}
         <div
           className="absolute inset-0 pointer-events-none"
           style={{
@@ -72,18 +119,18 @@ export default function Home() {
         />
       </section>
 
-      {/* ── Second Fold: Stats ──────────────────────────────────── */}
+      {/* ── Stats ───────────────────────────────────────────────────── */}
       <StatsDashboard />
 
-      {/* ── Third Fold: Activity Stream ─────────────────────────── */}
+      {/* ── Activity Stream ─────────────────────────────────────────── */}
       <ActivityStream />
 
-      {/* ── Fourth Fold: QuickJoin (unauthenticated) ────────────── */}
+      {/* ── Quick Join ──────────────────────────────────────────────── */}
       {!isConnected && <QuickJoin />}
 
-      {/* ── Footer ─────────────────────────────────────────────── */}
+      {/* ── Footer ──────────────────────────────────────────────────── */}
       <footer
-        className="px-8 py-10 text-center"
+        className="px-6 py-10 text-center"
         style={{ background: 'var(--bg-deep)' }}
       >
         <p className="font-jp text-sm text-[var(--text-on-blue-2)] leading-loose">

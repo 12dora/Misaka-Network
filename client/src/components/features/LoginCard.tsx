@@ -1,9 +1,10 @@
-import { useRef, KeyboardEvent } from 'react'
+import { useRef, useState, KeyboardEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuthStore } from '@/store/auth'
 import MisakaCard from '@/components/ui/MisakaCard'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
+import QRModal from '@/components/features/QRModal'
 
 export default function LoginCard() {
   const navigate = useNavigate()
@@ -14,6 +15,7 @@ export default function LoginCard() {
   } = useAuthStore()
 
   const passInputs = useRef<(HTMLInputElement | null)[]>([])
+  const [showQR, setShowQR] = useState(false)
 
   function handleNodeIdChange(val: string) {
     const n = parseInt(val, 10)
@@ -54,6 +56,14 @@ export default function LoginCard() {
 
   if (isConnected && session) {
     return (
+      <>
+      {showQR && (
+        <QRModal
+          nodeId={identity.nodeId}
+          passCode={identity.passCode}
+          onClose={() => setShowQR(false)}
+        />
+      )}
       <MisakaCard padding="lg" className="w-full max-w-[420px]">
         <div className="flex items-center gap-2 mb-1">
           <span
@@ -85,7 +95,7 @@ export default function LoginCard() {
             📡 进入网络
           </MisakaButton>
           <div className="flex gap-2">
-            <MisakaButton variant="pill" size="sm" className="flex-1">
+            <MisakaButton variant="pill" size="sm" className="flex-1" onClick={() => setShowQR(true)}>
               🔲 显示 QR
             </MisakaButton>
             <MisakaButton
@@ -99,6 +109,7 @@ export default function LoginCard() {
           </div>
         </div>
       </MisakaCard>
+      </>
     )
   }
 

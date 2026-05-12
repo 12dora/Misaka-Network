@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import MisakaCard from '@/components/ui/MisakaCard'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
@@ -33,24 +34,41 @@ const CARDS = [
 
 export default function QuickJoin() {
   const navigate = useNavigate()
+  const [visible, setVisible] = useState(false)
+  const gridRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const el = gridRef.current
+    if (!el) return
+    const observer = new IntersectionObserver(
+      ([entry]) => { if (entry.isIntersecting) { setVisible(true); observer.disconnect() } },
+      { threshold: 0.1 }
+    )
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [])
 
   return (
-    <section className="px-8 py-14">
+    <section className="px-5 md:px-8 py-14">
       <div className="section-header">
         <div className="title-row">
           <MisakaKanjiBlock char="入" size="lg" />
           <h2>快速接入</h2>
         </div>
-        <p className="furigana ml-[calc(2rem+0.6rem)]">クイックアクセス</p>
+        <p className="furigana">クイックアクセス</p>
         <div className="accent-line" />
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-5 max-w-3xl">
-        {CARDS.map(card => (
+      <div ref={gridRef} className="grid grid-cols-1 md:grid-cols-3 gap-5 max-w-3xl">
+        {CARDS.map((card, idx) => (
           <MisakaCard
             key={card.kanji}
             padding="md"
             className="flex flex-col items-center text-center hover:-translate-y-1 hover:shadow-float transition-all duration-200"
+            style={{
+              opacity: visible ? undefined : 0,
+              animation: visible ? `card-in 0.45s ease ${idx * 0.1}s forwards` : 'none',
+            }}
           >
             <span className="text-4xl mb-3">{card.icon}</span>
             <div className="flex items-center gap-1.5 mb-1">
