@@ -1,9 +1,23 @@
 import { WebSocketServer, WebSocket } from 'ws'
 import { IncomingMessage } from 'http'
+import { z } from 'zod'
 import { nodes, channels } from './store.js'
 import { broadcast } from './activity.js'
 import { authMiddleware } from './http.js'
-import type { WSClientMessage, NodeSession } from './types.js'
+import type { NodeSession } from './types.js'
+
+const MAX_CHANNELS_PER_NODE = 3
+const MAX_MESSAGE_SIZE = 64 * 1024
+
+const wsMessageSchema = z.discriminatedUnion('t', [
+  z.object({ t: z.literal('JOIN_CHANNEL'),  channelId:    z.string().min(1).max(64) }),
+  z.object({ t: z.literal('LEAVE_CHANNEL') }),
+  z.object({ t: z.literal('CONNECT_REQ'),  targetNodeId: z.number().int().min(1).max(20001) }),
+  z.object({ t: z.literal('SIGNAL_SDP'),   targetNodeId: z.number().int().min(1).max(20001), sdp: z.object({}).passthrough() }),
+  z.object({ t: z.literal('SIGNAL_ICE'),   targetNodeId: z.number().int().min(1).max(20001), candidate: z.object({}).passthrough() }),
+  z.object({ t: z.literal('PING') }),
+  z.object({ t: z.literal('BLOCK'),         nodeId:       z.number().int().min(1).max(20001) }),
+])
 
 function send(ws: WebSocket, msg: object) {
   if (ws.readyState === WebSocket.OPEN) {
@@ -16,8 +30,23 @@ function forwardToNode(targetNodeId: number, msg: object) {
   if (target?.socket) send(target.socket, msg)
 }
 
+function getWSIP(req: IncomingMessage): string {
+  const xff = req.headers['x-forwarded-for']
+  if (typeof xff === 'string') return xff.split(',')[0].trim()
+  return req.socket.remoteAddress ?? 'unknown'
+}
+
+function countChannelsForNode(nodeId: number): number {
+  let count = 0
+  for (const ch of channels.values()) {
+    if (ch.has(nodeId)) count++
+  }
+  return count
+}
+
 export function setupWS(wss: WebSocketServer) {
   wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
+    // Check message size before parsing
     const url = new URL(req.url ?? '', 'http://localhost')
     const token = url.searchParams.get('token')
     if (!token) { ws.close(4001, 'MISSING_TOKEN'); return }
@@ -25,9 +54,10 @@ export function setupWS(wss: WebSocketServer) {
     const session = authMiddleware(token)
     if (!session) { ws.close(4002, 'INVALID_TOKEN'); return }
 
-    // Attach socket
+    // Attach socket and update IP
     session.socket = ws
     session.lastSeen = Date.now()
+    session.ip = getWSIP(req)
 
     send(ws, {
       t: 'WELCOME',
@@ -36,9 +66,22 @@ export function setupWS(wss: WebSocketServer) {
     })
 
     ws.on('message', (raw) => {
-      let msg: WSClientMessage
-      try { msg = JSON.parse(raw.toString()) as WSClientMessage }
-      catch { return }
+      // Enforce max message size
+      const rawStr = raw.toString()
+      if (Buffer.byteLength(rawStr) > MAX_MESSAGE_SIZE) {
+        send(ws, { t: 'ERROR', code: 'MESSAGE_TOO_LARGE', message: '消息过大' })
+        return
+      }
+
+      // Validate with zod
+      let msg: z.infer<typeof wsMessageSchema>
+      try {
+        const parsed = JSON.parse(rawStr)
+        msg = wsMessageSchema.parse(parsed)
+      } catch {
+        // Silently drop invalid messages
+        return
+      }
 
       session.lastSeen = Date.now()
       handleMessage(ws, session, msg)
@@ -67,7 +110,7 @@ export function setupWS(wss: WebSocketServer) {
   })
 }
 
-function handleMessage(ws: WebSocket, session: NodeSession, msg: WSClientMessage) {
+function handleMessage(ws: WebSocket, session: NodeSession, msg: z.infer<typeof wsMessageSchema>) {
   switch (msg.t) {
     case 'PING':
       send(ws, { t: 'PONG' })
@@ -76,6 +119,12 @@ function handleMessage(ws: WebSocket, session: NodeSession, msg: WSClientMessage
     case 'JOIN_CHANNEL': {
       // Leave existing channel
       if (session.channelId) leaveChannel(session)
+
+      // Enforce max channels per node
+      if (countChannelsForNode(session.nodeId) >= MAX_CHANNELS_PER_NODE) {
+        send(ws, { t: 'ERROR', code: 'TOO_MANY_CHANNELS', message: '频道数已达上限' })
+        return
+      }
 
       const ch = channels.get(msg.channelId) ?? new Set<number>()
       channels.set(msg.channelId, ch)

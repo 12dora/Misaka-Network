@@ -1,20 +1,38 @@
-import { Router } from 'express'
+import { Router, type Request, type Response, type NextFunction } from 'express'
 import { createHash, randomBytes } from 'crypto'
 import { nanoid } from 'nanoid'
 import { z } from 'zod'
-import { nodes, qrTokens, stats, getOnlineCount, getLongestUptimeMs } from './store.js'
+import { nodes, channels, qrTokens, reports, stats, getOnlineCount, getLongestUptimeMs, countNodesByIp } from './store.js'
 import { broadcast } from './activity.js'
-import type { NodeSession, QrTokenRecord } from './types.js'
+import { checkRateLimit } from './ratelimit.js'
+import type { NodeSession, QrTokenRecord, ReportRecord } from './types.js'
 
 export const router = Router()
 
 const MAX_NODES_PER_IP = 5
+const MAX_NODES = parseInt(process.env.MAX_NODES ?? '0', 10) || Infinity
 const LOCK_DURATION = 5 * 60 * 1000
 const MAX_ATTEMPTS = 3
+const RATE_LIMIT_PER_MIN = 60
+const RATE_WINDOW_MS = 60_000
 
 function hashPassCode(code: string) {
   return createHash('sha256').update(code).digest('hex')
 }
+
+function getClientIP(req: Request): string {
+  return req.ip ?? req.socket.remoteAddress ?? 'unknown'
+}
+
+// Rate limit middleware
+router.use((req: Request, res: Response, next: NextFunction) => {
+  const ip = getClientIP(req)
+  if (!checkRateLimit(`api:${ip}`, RATE_LIMIT_PER_MIN, RATE_WINDOW_MS)) {
+    res.status(429).json({ error: 'RATE_LIMITED', message: '请求过于频繁，请稍后再试' })
+    return
+  }
+  next()
+})
 
 // POST /api/register
 router.post('/register', (req, res) => {
@@ -29,6 +47,7 @@ router.post('/register', (req, res) => {
   }
 
   const { nodeId, passCode } = parsed.data
+  const ip = getClientIP(req)
   const now = Date.now()
   const existing = nodes.get(nodeId)
 
@@ -44,6 +63,7 @@ router.post('/register', (req, res) => {
       existing.lastSeen = now
       existing.token = randomBytes(32).toString('hex')
       existing.failedAttempts = 0
+      existing.ip = ip
       res.json({ token: existing.token, expiresAt: now + 30 * 60 * 1000, resumed: true })
       return
     }
@@ -56,6 +76,18 @@ router.post('/register', (req, res) => {
     } else {
       res.status(409).json({ error: 'NODE_OCCUPIED' })
     }
+    return
+  }
+
+  // Global node limit
+  if (nodes.size >= MAX_NODES) {
+    res.status(503).json({ error: 'NETWORK_FULL', message: '御坂网络已达容量上限' })
+    return
+  }
+
+  // IP-based node limit
+  if (countNodesByIp(ip) >= MAX_NODES_PER_IP) {
+    res.status(429).json({ error: 'IP_LIMITED', message: '此 IP 地址节点数已达上限' })
     return
   }
 
@@ -72,6 +104,7 @@ router.post('/register', (req, res) => {
     failedAttempts: 0,
     lockedUntil: 0,
     joinedAt: now,
+    ip,
   }
   nodes.set(nodeId, session)
 
@@ -140,7 +173,7 @@ router.get('/stats', (_req, res) => {
     onlineNodes:      getOnlineCount(),
     totalTransfers:   stats.totalTransfers,
     totalBytes:       stats.totalBytes,
-    activeChannels:   0, // TODO: count active transfers
+    activeChannels:   channels.size,
     uptimeLongestMs:  getLongestUptimeMs(),
     cpuLoadPercent:   Math.floor(Math.random() * 30 + 20), // decorative
   })
@@ -191,6 +224,56 @@ router.post('/qr-redeem', (req, res) => {
   record.used = true
   const channelId = record.channelId ?? nanoid(8)
   res.json({ targetNodeId: record.ownerNodeId, channelId })
+})
+
+// POST /api/report
+router.post('/report', (req, res) => {
+  const parsed = z.object({
+    targetNodeId: z.number().int().min(1).max(20001),
+    reason:       z.enum(['spam', 'malicious', 'harassment', 'other']),
+    sourceToken:  z.string(),
+  }).safeParse(req.body)
+
+  if (!parsed.success) { res.status(400).json({ error: 'INVALID_INPUT' }); return }
+
+  const { targetNodeId, reason, sourceToken } = parsed.data
+  const ip = getClientIP(req)
+
+  // Find source node
+  let sourceSession: NodeSession | undefined
+  for (const s of nodes.values()) {
+    if (s.token === sourceToken) { sourceSession = s; break }
+  }
+  if (!sourceSession) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
+
+  // Target must exist
+  if (!nodes.has(targetNodeId)) { res.status(404).json({ error: 'NODE_NOT_FOUND' }); return }
+
+  // Rate limit: max 5 reports per IP per 10 minutes
+  const now = Date.now()
+  const recentFromIp = reports.filter(r => r.reporterIp === ip && now - r.reportedAt < 10 * 60_000).length
+  if (recentFromIp >= 5) {
+    res.status(429).json({ error: 'RATE_LIMITED', message: '上报过于频繁' })
+    return
+  }
+
+  const record: ReportRecord = {
+    id: nanoid(12),
+    sourceNodeId: sourceSession.nodeId,
+    targetNodeId,
+    reason,
+    reporterIp: ip,
+    reportedAt: now,
+  }
+  reports.push(record)
+
+  // If a node gets too many reports in a short time, broadcast a warning
+  const recentOnTarget = reports.filter(r => r.targetNodeId === targetNodeId && now - r.reportedAt < 60_000).length
+  if (recentOnTarget >= 3) {
+    broadcast({ type: 'channel', message: `树形图设计者已注意到御坂 ${targetNodeId} 号的行为` })
+  }
+
+  res.status(204).end()
 })
 
 // Middleware to look up session by token

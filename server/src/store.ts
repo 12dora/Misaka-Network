@@ -1,8 +1,9 @@
-import type { NodeSession, QrTokenRecord } from './types.js'
+import type { NodeSession, QrTokenRecord, ReportRecord } from './types.js'
 
 export const nodes    = new Map<number, NodeSession>()
 export const channels = new Map<string, Set<number>>()
 export const qrTokens = new Map<string, QrTokenRecord>()
+export const reports: ReportRecord[] = []
 
 export const stats = {
   totalTransfers: 0,
@@ -28,4 +29,20 @@ export function getLongestUptimeMs() {
     }
   }
   return longest
+}
+
+export function countNodesByIp(ip: string): number {
+  let count = 0
+  for (const n of nodes.values()) {
+    if (n.ip === ip) count++
+  }
+  return count
+}
+
+export function countReportsForTarget(nodeId: number, since: number): number {
+  let count = 0
+  for (const r of reports) {
+    if (r.targetNodeId === nodeId && r.reportedAt > since) count++
+  }
+  return count
 }

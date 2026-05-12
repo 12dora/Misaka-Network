@@ -27,7 +27,7 @@
 - ☑ 活动流广播
 - ☑ QR token 接口（/api/qr-token, /api/qr-redeem）
 - ☑ 30 分钟会话清理任务
-- ☐ 限流与防护
+- ☑ 限流与防护
 
 ### 身份系统（参考 05-auth-identity.md）
 - ☑ 客户端身份生成
@@ -85,22 +85,21 @@
 - ☐ 集成到 ICE 配置
 
 ### 安全（参考 10-security-privacy.md）
-- ☐ 通行码 hash
-- ☐ 节点锁定机制
-- ☐ 黑名单 localStorage
-- ☐ 上报接口
-- ☐ ToS / Privacy 页
+- ☑ 通行码 hash
+- ☑ 节点锁定机制
+- ☐ 黑名单 localStorage（客户端）
+- ☑ 上报接口
+- ☐ ToS / Privacy 页（客户端）
 
 ## 当前会话焦点
 
-MVP v1 初始实现（本次完成）：脚手架 + 全部 UI 框架 + 信令服务器核心逻辑 + 身份系统
+后端安全加固完成：速率限制 + IP 追踪 + WS zod 校验 + 上报接口 + 锁定自动解锁
 
 ## 已知问题
 
 - Network 页 NodeRadar/TransferChannel/TaskPanel 当前使用 mock 数据，需接入 WebRTC 信令
 - 接收确认 Modal 未实现
 - 移动端 Tab 布局未实现
-- 信令服务器无限流与防护
 
 ## 决策记录
 
@@ -108,3 +107,5 @@ MVP v1 初始实现（本次完成）：脚手架 + 全部 UI 框架 + 信令服
 - 2026-05-12: chunk size 定为 64KB，平衡内存与吞吐
 - 2026-05-12: 设计 token 用 CSS custom properties + Tailwind extend，而非 Tailwind 原生值
 - 2026-05-12: lore.ts 写死彩蛋数据，无需后端
+- 2026-05-12: 速率限制用滑动窗口（Map<ip, {count, resetAt}>），不引入外部依赖
+- 2026-05-12: 上报记录内存保留 1 小时，不做持久化
