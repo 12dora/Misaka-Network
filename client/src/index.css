@@ -2,7 +2,7 @@
 @tailwind components;
 @tailwind utilities;
 
-/* ── Design Tokens ── */
+/* ── Design Tokens ─────────────────────────────────────────────── */
 :root {
   /* Backgrounds */
   --bg-primary:    #1A4FC4;
@@ -35,37 +35,50 @@
   --border-strong: #0E2A6B;
   --shadow-card:   0 10px 30px -12px rgba(14, 42, 107, 0.25);
   --shadow-float:  0 20px 50px -20px rgba(14, 42, 107, 0.35);
+
+  /* Nav height */
+  --nav-h: 64px;
 }
 
-/* ── Base ── */
-* { box-sizing: border-box; }
+/* ── Base Reset ─────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { scroll-behavior: smooth; }
 
 body {
-  margin: 0;
-  font-family: 'Noto Sans SC', 'Noto Sans JP', system-ui, sans-serif;
+  font-family: 'Noto Sans SC', 'Noto Sans JP', 'PingFang SC', 'Hiragino Sans GB', system-ui, sans-serif;
   background: var(--bg-primary);
   color: var(--text-on-blue);
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   min-height: 100vh;
+  overflow-x: hidden;
 }
 
-/* ── Utility Classes ── */
+/* ── Typography helpers ─────────────────────────────────────────── */
+.font-jp    { font-family: 'Shippori Mincho', 'Noto Serif JP', 'Source Han Serif SC', serif; }
+.font-kanji { font-family: 'Noto Sans JP', 'Noto Sans SC', 'PingFang SC', sans-serif; }
+.font-mono  { font-family: 'IBM Plex Mono', 'Roboto Mono', 'Courier New', monospace; }
+.tabular    { font-variant-numeric: tabular-nums; }
+
+/* ── Core Components ────────────────────────────────────────────── */
 @layer components {
-  /* Kanji Block */
+
+  /* Kanji Block ─── */
   .kanji-block {
     display: inline-grid;
     place-items: center;
-    width: 1.2em;
-    height: 1.2em;
     background: var(--bg-deep);
     color: var(--surface);
     font-family: 'Noto Sans JP', 'Noto Sans SC', sans-serif;
     font-weight: 800;
     line-height: 1;
+    border-radius: 2px;
     flex-shrink: 0;
+    user-select: none;
   }
 
-  /* White Card */
+  /* White Card ─── */
   .misaka-card {
     background: var(--surface);
     border: 1px solid var(--border-card);
@@ -73,143 +86,230 @@ body {
     box-shadow: var(--shadow-card);
   }
 
-  /* Nav Pill */
+  /* Nav Pill ─── */
   .nav-pill {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     background: var(--surface);
     color: var(--text-on-white);
     border-radius: 9999px;
-    padding: 0.5rem 1.4rem;
+    padding: 0.5rem 1.25rem;
+    font-family: 'Noto Sans JP', 'Noto Sans SC', sans-serif;
     font-weight: 600;
-    font-size: 0.9rem;
-    box-shadow: var(--shadow-card);
-    transition: transform 0.2s ease, box-shadow 0.2s ease;
+    font-size: 0.875rem;
+    line-height: 1;
     border: none;
     cursor: pointer;
     white-space: nowrap;
+    transition: transform 0.2s ease, box-shadow 0.2s ease, background 0.15s;
+    box-shadow: var(--shadow-card);
+    text-decoration: none;
   }
   .nav-pill:hover {
     transform: translateY(-2px);
     box-shadow: var(--shadow-float);
   }
-  .nav-pill.active {
+  .nav-pill.active,
+  .nav-pill[data-active="true"] {
     background: var(--bg-deep);
     color: var(--surface);
   }
 
-  /* Primary Button */
+  /* Primary Button ─── */
   .btn-primary {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     background: var(--bg-deep);
     color: var(--surface);
     border-radius: 0.75rem;
     padding: 0.85rem 1.5rem;
+    font-family: 'Noto Sans SC', 'Noto Sans JP', sans-serif;
     font-weight: 600;
-    font-family: 'Noto Sans SC', sans-serif;
     font-size: 1rem;
-    width: 100%;
     border: none;
     cursor: pointer;
-    transition: transform 0.2s ease, box-shadow 0.2s ease;
+    transition: transform 0.2s ease, box-shadow 0.2s ease, opacity 0.15s;
     position: relative;
     overflow: hidden;
+    text-decoration: none;
   }
-  .btn-primary:hover {
+  .btn-primary:hover:not(:disabled) {
     transform: translateY(-2px);
     box-shadow: var(--shadow-float);
   }
   .btn-primary:disabled {
     opacity: 0.5;
     cursor: not-allowed;
-    transform: none;
+  }
+  /* Sweep animation on click */
+  .btn-primary::after {
+    content: '';
+    position: absolute;
+    top: 0; left: -60%;
+    width: 40%; height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(91,179,255,0.35), transparent);
+    transform: skewX(-20deg);
+    transition: none;
+    opacity: 0;
+  }
+  .btn-primary:active::after {
+    animation: btn-sweep 0.6s ease forwards;
   }
 
-  /* Ghost Button (on blue bg) */
+  /* Ghost Button ─── */
   .btn-ghost {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     background: transparent;
     color: var(--surface);
-    border: 1px solid rgba(255, 255, 255, 0.5);
+    border: 1px solid rgba(255,255,255,0.5);
     border-radius: 9999px;
     padding: 0.5rem 1.2rem;
+    font-family: 'Noto Sans SC', sans-serif;
     font-weight: 600;
     cursor: pointer;
     transition: background 0.2s, border-color 0.2s;
+    text-decoration: none;
   }
   .btn-ghost:hover {
-    background: rgba(255, 255, 255, 0.1);
-    border-color: rgba(255, 255, 255, 0.8);
+    background: rgba(255,255,255,0.12);
+    border-color: rgba(255,255,255,0.85);
   }
 
-  /* Section Header */
-  .section-header {
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-    margin-bottom: 2rem;
-  }
+  /* Section Header ─── */
+  .section-header { margin-bottom: 2rem; }
   .section-header .title-row {
     display: flex;
     align-items: center;
     gap: 0.6rem;
+    margin-bottom: 0.35rem;
   }
   .section-header h2 {
     font-family: 'Noto Sans JP', 'Noto Sans SC', sans-serif;
     font-weight: 700;
-    font-size: 1.6rem;
+    font-size: clamp(1.25rem, 2.5vw, 1.6rem);
     color: var(--text-on-blue);
     margin: 0;
   }
   .section-header .furigana {
-    font-family: 'Shippori Mincho', serif;
-    font-size: 0.85rem;
+    font-family: 'Shippori Mincho', 'Noto Serif JP', serif;
+    font-size: 0.8rem;
     color: var(--text-on-blue-2);
+    margin-left: calc(2rem + 0.6rem);
+    display: block;
+    margin-bottom: 0.6rem;
   }
   .section-header .accent-line {
     width: 80px;
     height: 2px;
     background: var(--accent-cyan);
     border-radius: 1px;
-    margin-left: calc(1.2em + 0.6rem);
+    margin-left: calc(2rem + 0.6rem);
+  }
+
+  /* Input field ─── */
+  .misaka-input {
+    width: 100%;
+    padding: 0.6rem 0.875rem;
+    border-radius: 0.625rem;
+    border: 1px solid var(--border-card);
+    background: var(--surface);
+    color: var(--text-on-white);
+    font-family: 'Noto Sans SC', sans-serif;
+    font-size: 0.9rem;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .misaka-input:focus { border-color: var(--bg-deep); }
+
+  /* Corner Frame ─── used on QR/scan */
+  .corner-frame { position: relative; }
+  .corner-frame::before,
+  .corner-frame::after {
+    content: '';
+    position: absolute;
+    width: 14px;
+    height: 14px;
+    border-color: var(--bg-deep);
+    border-style: solid;
+    pointer-events: none;
+  }
+  .corner-frame::before { top: -1px; left: -1px; border-width: 3px 0 0 3px; border-radius: 2px 0 0 0; }
+  .corner-frame::after  { bottom: -1px; right: -1px; border-width: 0 3px 3px 0; border-radius: 0 0 2px 0; }
+
+  /* Dot grid background ─── */
+  .dot-grid {
+    background-image: radial-gradient(circle, rgba(255,255,255,0.07) 1px, transparent 1px);
+    background-size: 24px 24px;
   }
 }
 
-/* ── Character Float Animation ── */
+/* ── Animations ─────────────────────────────────────────────────── */
+
 @keyframes float {
-  0%, 100% { transform: translateY(0); }
-  50%       { transform: translateY(-6px); }
+  0%, 100% { transform: translateY(0px); }
+  50%       { transform: translateY(-8px); }
 }
-.animate-float {
-  animation: float 4s ease-in-out infinite;
-}
+.animate-float { animation: float 4s ease-in-out infinite; }
 
-/* ── Pulse Dot ── */
 @keyframes pulse-dot {
-  0%, 100% { opacity: 1; }
-  50%       { opacity: 0.4; }
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.45; transform: scale(0.85); }
 }
-.pulse-dot {
-  animation: pulse-dot 2s ease-in-out infinite;
-}
+.pulse-dot { animation: pulse-dot 2s ease-in-out infinite; }
 
-/* ── Scan Line (QR/scan overlay) ── */
 @keyframes scan-line {
-  0%   { top: 0; }
-  100% { top: calc(100% - 2px); }
+  0%   { top: 0%; opacity: 1; }
+  90%  { opacity: 1; }
+  100% { top: calc(100% - 2px); opacity: 0; }
 }
 .scan-line {
   position: absolute;
   left: 0; right: 0;
   height: 2px;
-  background: linear-gradient(90deg, transparent, var(--accent-cyan), transparent);
+  background: linear-gradient(90deg, transparent 0%, var(--accent-cyan) 40%, #fff 50%, var(--accent-cyan) 60%, transparent 100%);
   animation: scan-line 2.4s linear infinite;
   pointer-events: none;
 }
 
-/* ── Progress Bar Shine ── */
-@keyframes shine {
-  0%   { transform: translateX(-100%); }
-  100% { transform: translateX(400%); }
+@keyframes btn-sweep {
+  0%   { left: -60%; opacity: 1; }
+  100% { left: 120%; opacity: 0; }
 }
 
-/* ── Fonts ── */
-.font-jp    { font-family: 'Shippori Mincho', 'Noto Serif JP', serif; }
-.font-kanji { font-family: 'Noto Sans JP', 'Noto Sans SC', sans-serif; }
-.font-mono  { font-family: 'IBM Plex Mono', 'Roboto Mono', monospace; }
+/* Card entrance ─── triggered by .animate-in class added via JS */
+@keyframes card-in {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.card-in {
+  animation: card-in 0.4s ease forwards;
+  opacity: 0;
+}
+
+/* Title fade-scale in ─── */
+@keyframes title-in {
+  from { opacity: 0; transform: scale(1.04); }
+  to   { opacity: 1; transform: scale(1); }
+}
+.title-in { animation: title-in 0.7s ease forwards; }
+
+/* Slide up for hero content ─── */
+@keyframes slide-up {
+  from { opacity: 0; transform: translateY(20px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.slide-up { animation: slide-up 0.6s ease forwards; }
+
+/* ── Scrollbar ──────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.35); }
+
+/* ── Utility overrides ──────────────────────────────────────────── */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }

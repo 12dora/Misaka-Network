@@ -15,7 +15,7 @@ function SectionHeader({ kanji, title, furigana }: { kanji: string; title: strin
         <MisakaKanjiBlock char={kanji} size="lg" />
         <h2>{title}</h2>
       </div>
-      <p className="furigana ml-[calc(2rem+0.6rem)]">{furigana}</p>
+      <p className="furigana">{furigana}</p>
       <div className="accent-line" />
     </div>
   )
@@ -24,24 +24,24 @@ function SectionHeader({ kanji, title, furigana }: { kanji: string; title: strin
 // ── Characters Section ────────────────────────────────────────────
 function CharacterSection() {
   return (
-    <section id="characters" className="px-8 py-14">
+    <section id="characters" className="px-5 md:px-8 py-14">
       <SectionHeader kanji="体" title="实验体档案" furigana="実験体ファイル" />
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6 max-w-3xl">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 max-w-3xl">
         {CHARACTERS.map(c => (
-          <MisakaCard key={c.nodeId} padding="none" className="overflow-hidden hover:-translate-y-1 hover:shadow-float transition-all duration-200">
-            {/* Illustration area */}
+          <MisakaCard
+            key={c.nodeId}
+            padding="none"
+            className="overflow-hidden hover:-translate-y-1 transition-all duration-200"
+          >
             <div
-              className="h-40 flex items-center justify-center relative"
-              style={{
-                background: 'linear-gradient(180deg, var(--bg-soft), var(--bg-primary))',
-              }}
+              className="h-36 flex items-center justify-center relative"
+              style={{ background: 'linear-gradient(180deg, var(--bg-soft), var(--bg-primary))' }}
             >
               <MisakaKanjiBlock char={c.kanji} size="xl" className="opacity-80" />
               <div className="absolute bottom-3 right-4 font-jp text-xs text-[var(--text-on-blue-2)]">
                 {c.furigana}
               </div>
             </div>
-            {/* Info */}
             <div className="p-5">
               <div className="flex items-center gap-2 mb-2">
                 <MisakaKanjiBlock char={c.kanji} size="sm" />
@@ -55,7 +55,10 @@ function CharacterSection() {
               </div>
               <p className="font-kanji text-xs text-[var(--text-on-white-2)] leading-relaxed">{c.desc}</p>
               {c.quote && (
-                <p className="font-jp text-sm text-[var(--text-on-white)] mt-3 leading-relaxed border-l-2 pl-3" style={{ borderColor: 'var(--accent-cyan)' }}>
+                <p
+                  className="font-jp text-sm text-[var(--text-on-white)] mt-3 leading-relaxed border-l-2 pl-3"
+                  style={{ borderColor: 'var(--accent-cyan)' }}
+                >
                   「{c.quote}」
                 </p>
               )}
@@ -74,8 +77,8 @@ function EasterEggSection() {
   const [queryResult, setQueryResult] = useState<string | null>(null)
 
   function randomQuote() {
-    const next = QUOTES[Math.floor(Math.random() * QUOTES.length)]
-    setQuote(next)
+    const idx  = Math.floor(Math.random() * QUOTES.length)
+    setQuote(QUOTES[idx])
   }
 
   function queryNode() {
@@ -88,7 +91,7 @@ function EasterEggSection() {
   }
 
   return (
-    <section id="easter-eggs" className="px-8 py-14">
+    <section id="easter-eggs" className="px-5 md:px-8 py-14">
       <SectionHeader kanji="戯" title="彩蛋功能" furigana="おまけ機能" />
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6 max-w-5xl">
 
@@ -122,6 +125,7 @@ function EasterEggSection() {
               placeholder="1~20001"
               value={nodeQuery}
               onChange={e => setNodeQuery(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && queryNode()}
               className="flex-1 px-3 py-2 rounded-lg text-sm font-mono focus:outline-none"
               style={{ border: '1px solid var(--border-card)', background: 'var(--surface)', color: 'var(--text-on-white)' }}
             />
@@ -130,7 +134,7 @@ function EasterEggSection() {
           {queryResult && (
             <div
               className="rounded-lg p-3 font-kanji text-xs text-[var(--text-on-white)] leading-relaxed"
-              style={{ background: 'var(--surface-tint)' }}
+              style={{ background: 'var(--surface-tint)', whiteSpace: 'pre-wrap' }}
             >
               {queryResult}
             </div>
@@ -138,7 +142,7 @@ function EasterEggSection() {
         </MisakaCard>
 
         {/* Lore Log */}
-        <MisakaCard padding="md" className="flex flex-col overflow-hidden">
+        <MisakaCard padding="md" className="flex flex-col">
           <div className="flex items-center gap-2 mb-4">
             <MisakaKanjiBlock char="録" size="sm" />
             <span className="font-kanji font-bold text-sm text-[var(--text-on-white)]">网络日志</span>
@@ -165,26 +169,87 @@ function EasterEggSection() {
 export default function ACGN() {
   return (
     <div className="min-h-screen" style={{ background: 'var(--bg-primary)' }}>
-      {/* Hero */}
+
+      {/* ── Mobile Hero ───────────────────────────────────────────── */}
+      <section className="md:hidden flex flex-col pt-16">
+        <div className="relative w-full overflow-visible flex-shrink-0" style={{ height: '38vw', maxHeight: 210 }}>
+          <img
+            src={HERO_CHARACTER}
+            alt="御坂美琴"
+            className="animate-float select-none pointer-events-none"
+            style={{
+              position: 'absolute',
+              bottom: 0,
+              left: '50%',
+              transform: 'translateX(-50%)',
+              height: '200%',
+              objectFit: 'contain',
+              objectPosition: 'bottom center',
+            }}
+            draggable={false}
+          />
+          <div
+            className="absolute inset-0 pointer-events-none"
+            style={{ background: 'linear-gradient(to bottom, var(--bg-primary) 0%, transparent 40%)' }}
+          />
+        </div>
+        <div className="flex flex-col items-center px-5 pt-4 pb-8 gap-4">
+          <img
+            src={HERO_TITLE}
+            alt="とある科学 御坂网络"
+            className="select-none pointer-events-none"
+            style={{ width: 'min(240px, 68vw)', filter: 'drop-shadow(0 4px 12px rgba(0,0,0,0.22))' }}
+            draggable={false}
+          />
+          <p className="font-jp text-sm text-[var(--text-on-blue-2)] text-center leading-loose">
+            连接全部御坂妹妹的脑量子波共享网络<br />
+            <span className="text-xs">全ての御坂妹妹を繋ぐ脳量子波ネットワーク</span>
+          </p>
+          <MisakaButton
+            variant="pill"
+            size="sm"
+            onClick={() => document.getElementById('about')?.scrollIntoView({ behavior: 'smooth' })}
+          >
+            了解更多
+          </MisakaButton>
+        </div>
+      </section>
+
+      {/* ── Desktop Hero (44/56) ──────────────────────────────────── */}
       <section
-        className="relative grid overflow-hidden"
-        style={{ gridTemplateColumns: '44% 1fr', minHeight: 'min(80vh, 680px)', paddingTop: 64 }}
+        className="relative hidden md:grid overflow-hidden"
+        style={{
+          gridTemplateColumns: '44% 1fr',
+          minHeight: 'min(80vh, 680px)',
+          paddingTop: 64,
+        }}
       >
         <div className="relative flex items-end justify-center">
           <img
             src={HERO_CHARACTER}
             alt="御坂美琴"
             className="animate-float select-none pointer-events-none"
-            style={{ maxHeight: 'calc(min(80vh, 680px) - 64px)', width: '100%', objectFit: 'contain', objectPosition: 'bottom center' }}
+            style={{
+              maxHeight: 'calc(min(80vh, 680px) - 64px)',
+              width: '100%',
+              objectFit: 'contain',
+              objectPosition: 'bottom center',
+            }}
             draggable={false}
           />
         </div>
-        <div className="flex flex-col justify-center pr-12 pl-8 gap-6" style={{ paddingBottom: '3rem', paddingTop: '2rem' }}>
+        <div
+          className="flex flex-col justify-center pr-12 pl-8 gap-6"
+          style={{ paddingBottom: '3rem', paddingTop: '2rem' }}
+        >
           <img
             src={HERO_TITLE}
             alt="とある科学 御坂网络"
             className="select-none pointer-events-none"
-            style={{ width: 'clamp(240px, 28vw, 400px)', filter: 'drop-shadow(0 6px 16px rgba(0,0,0,0.18))' }}
+            style={{
+              width: 'clamp(240px, 28vw, 400px)',
+              filter: 'drop-shadow(0 6px 16px rgba(0,0,0,0.18))',
+            }}
             draggable={false}
           />
           <p className="font-jp text-lg text-[var(--text-on-blue)] leading-loose">
@@ -192,19 +257,27 @@ export default function ACGN() {
             <span className="text-sm text-[var(--text-on-blue-2)]">全ての御坂妹妹を繋ぐ脳量子波ネットワーク</span>
           </p>
           <div className="flex gap-3">
-            <MisakaButton variant="pill" size="sm" onClick={() => document.getElementById('about')?.scrollIntoView({ behavior: 'smooth' })}>
+            <MisakaButton
+              variant="pill"
+              size="sm"
+              onClick={() => document.getElementById('about')?.scrollIntoView({ behavior: 'smooth' })}
+            >
               了解更多
             </MisakaButton>
           </div>
         </div>
         <div
           className="absolute inset-0 pointer-events-none"
-          style={{ left: '44%', backgroundImage: 'radial-gradient(circle, rgba(255,255,255,0.06) 1px, transparent 1px)', backgroundSize: '24px 24px' }}
+          style={{
+            left: '44%',
+            backgroundImage: 'radial-gradient(circle, rgba(255,255,255,0.06) 1px, transparent 1px)',
+            backgroundSize: '24px 24px',
+          }}
         />
       </section>
 
-      {/* About */}
-      <section id="about" className="px-8 py-14">
+      {/* ── About ────────────────────────────────────────────────── */}
+      <section id="about" className="px-5 md:px-8 py-14">
         <SectionHeader kanji="設" title="关于御坂网络" furigana="みさかネットワークについて" />
         <MisakaCard padding="lg" className="max-w-3xl">
           <div className="font-kanji text-base text-[var(--text-on-white)] leading-[1.85] space-y-4">
@@ -230,10 +303,10 @@ export default function ACGN() {
       <CharacterSection />
       <EasterEggSection />
 
-      {/* Footer */}
+      {/* ── Footer ───────────────────────────────────────────────── */}
       <footer
         id="credits"
-        className="px-8 py-14 text-center"
+        className="px-6 py-14 text-center"
         style={{ background: 'var(--bg-deep)' }}
       >
         <MisakaKanjiBlock char="敬" size="xl" className="mx-auto mb-6" />
@@ -250,7 +323,7 @@ export default function ACGN() {
             · 所有版权归原作者所有 All Rights Reserved to Original Creators
           </p>
         </div>
-        <div className="flex justify-center gap-4 mt-8">
+        <div className="flex flex-wrap justify-center gap-3 mt-8">
           {['GitHub', '反馈', '服务条款', '隐私政策'].map(label => (
             <button key={label} className="nav-pill text-xs py-1.5 px-4">{label}</button>
           ))}

@@ -19,7 +19,7 @@ const MOCK_TRANSFERS: Transfer[] = [
   },
   {
     id: 't2', direction: 'recv', peerNodeId: 8821, fileName: '设定集.zip',
-    fileSize: 85000000, progress: 1,   speedBps: 0, status: 'completed', startedAt: Date.now() - 120000,
+    fileSize: 85000000, progress: 1, speedBps: 0, status: 'completed', startedAt: Date.now() - 120000,
   },
 ]
 
@@ -50,17 +50,13 @@ function NodeRadar({ peers, selected, onSelect }: {
   onSelect: (id: number) => void
 }) {
   return (
-    <div className="flex flex-col gap-4 overflow-y-auto">
-      {/* Section header */}
-      <div className="flex items-center gap-2 mb-2">
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center gap-2 mb-1">
         <MisakaKanjiBlock char="点" size="sm" />
         <span className="font-kanji font-bold text-white text-sm">节点雷达</span>
         <span className="font-jp text-xs text-[var(--text-on-blue-2)] ml-1">ノードレーダー</span>
       </div>
-      <div
-        className="w-12 h-0.5 ml-[calc(1.25rem+0.5rem)]"
-        style={{ background: 'var(--accent-cyan)' }}
-      />
+      <div className="w-12 h-0.5 ml-[calc(1.25rem+0.5rem)]" style={{ background: 'var(--accent-cyan)' }} />
 
       {peers.length === 0 ? (
         <MisakaCard padding="md" className="text-center">
@@ -79,7 +75,7 @@ function NodeRadar({ peers, selected, onSelect }: {
             <MisakaCard
               key={peer.nodeId}
               padding="sm"
-              className={`cursor-pointer hover:-translate-y-0.5 hover:shadow-float transition-all duration-150 relative ${isSelected ? 'ring-2 ring-[var(--bg-deep)]' : ''}`}
+              className={`cursor-pointer hover:-translate-y-0.5 transition-all duration-150 relative ${isSelected ? 'ring-2 ring-[var(--bg-deep)]' : ''}`}
               style={isSelected ? { background: 'var(--surface-tint)' } : {}}
               onClick={() => onSelect(peer.nodeId)}
             >
@@ -119,8 +115,10 @@ function TransferChannel({ selectedPeer }: { selectedPeer: Peer | null }) {
     return (
       <MisakaCard
         padding="none"
-        className={`flex flex-col items-center justify-center h-full min-h-[400px] transition-all duration-200 ${isDragOver ? 'ring-2 ring-[var(--accent-cyan)] -translate-y-1' : ''}`}
-        style={isDragOver ? { background: 'var(--surface-tint)', borderStyle: 'solid', borderColor: 'var(--accent-cyan)' } : { borderStyle: 'dashed' }}
+        className={`flex flex-col items-center justify-center h-full min-h-[340px] transition-all duration-200 ${isDragOver ? 'ring-2 ring-[var(--accent-cyan)] -translate-y-1' : ''}`}
+        style={isDragOver
+          ? { background: 'var(--surface-tint)', borderStyle: 'solid', borderColor: 'var(--accent-cyan)' }
+          : { borderStyle: 'dashed' }}
         onDragOver={e => { e.preventDefault(); setDragOver(true) }}
         onDragLeave={() => setDragOver(false)}
         onDrop={e => { e.preventDefault(); setDragOver(false) }}
@@ -128,15 +126,13 @@ function TransferChannel({ selectedPeer }: { selectedPeer: Peer | null }) {
         <MisakaKanjiBlock char="同" size="xl" className="mb-4" />
         <p className="font-kanji font-bold text-lg text-[var(--text-on-white)] mb-1">拖拽文件到此处</p>
         <p className="font-jp text-sm text-[var(--text-on-white-2)] mb-3">ファイルをドロップ</p>
-        <p className="font-kanji text-sm text-[var(--text-on-white-2)]">或点击选择文件</p>
         <p className="font-kanji text-xs text-[var(--text-muted)] mt-6">── 请先从左侧选择目标节点 ──</p>
       </MisakaCard>
     )
   }
 
   return (
-    <MisakaCard padding="none" className="flex flex-col h-full min-h-[400px]">
-      {/* Info bar */}
+    <MisakaCard padding="none" className="flex flex-col h-full min-h-[340px]">
       <div
         className="px-5 py-3 border-b"
         style={{ background: 'var(--surface-tint)', borderColor: 'var(--border-card)', borderRadius: '1rem 1rem 0 0' }}
@@ -149,26 +145,20 @@ function TransferChannel({ selectedPeer }: { selectedPeer: Peer | null }) {
         </div>
       </div>
 
-      {/* Drop zone */}
       <div
-        className={`flex-1 flex flex-col items-center justify-center gap-3 p-6 transition-colors ${isDragOver ? '' : ''}`}
+        className="flex-1 flex flex-col items-center justify-center gap-3 p-6"
         style={isDragOver ? { background: 'var(--surface-tint)' } : {}}
         onDragOver={e => { e.preventDefault(); setDragOver(true) }}
         onDragLeave={() => setDragOver(false)}
         onDrop={e => { e.preventDefault(); setDragOver(false) }}
       >
-        <MisakaButton variant="pill" size="md" className="w-60">
-          📁 拖拽 / 点击选择文件
-        </MisakaButton>
-        <MisakaButton variant="pill" size="md" className="w-60">
-          📂 选择文件夹
-        </MisakaButton>
+        <MisakaButton variant="pill" size="md" className="w-56">📁 拖拽 / 点击选择文件</MisakaButton>
+        <MisakaButton variant="pill" size="md" className="w-56">📂 选择文件夹</MisakaButton>
       </div>
 
-      {/* Messages */}
       <div
         className="border-t p-4 flex flex-col gap-2"
-        style={{ borderColor: 'var(--border-card)', maxHeight: 180, overflowY: 'auto' }}
+        style={{ borderColor: 'var(--border-card)', maxHeight: 160, overflowY: 'auto' }}
       >
         <div className="font-kanji text-xs font-semibold text-[var(--text-on-white-2)] mb-1">会话信道</div>
         <div className="font-kanji text-xs text-[var(--text-on-white-2)]">
@@ -177,7 +167,6 @@ function TransferChannel({ selectedPeer }: { selectedPeer: Peer | null }) {
         </div>
       </div>
 
-      {/* Input */}
       <div
         className="border-t p-3 flex gap-2"
         style={{ borderColor: 'var(--border-card)', borderRadius: '0 0 1rem 1rem' }}
@@ -186,11 +175,7 @@ function TransferChannel({ selectedPeer }: { selectedPeer: Peer | null }) {
           type="text"
           placeholder="输入消息…"
           className="flex-1 px-3 py-2 rounded-lg text-sm font-kanji focus:outline-none"
-          style={{
-            border: '1px solid var(--border-card)',
-            background: 'var(--surface)',
-            color: 'var(--text-on-white)',
-          }}
+          style={{ border: '1px solid var(--border-card)', background: 'var(--surface)', color: 'var(--text-on-white)' }}
         />
         <MisakaButton variant="primary" size="sm">发送</MisakaButton>
       </div>
@@ -201,8 +186,8 @@ function TransferChannel({ selectedPeer }: { selectedPeer: Peer | null }) {
 // ── TaskPanel ─────────────────────────────────────────────────────
 function TaskPanel({ transfers }: { transfers: Transfer[] }) {
   return (
-    <div className="flex flex-col gap-4 overflow-y-auto">
-      <div className="flex items-center gap-2 mb-2">
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center gap-2 mb-1">
         <MisakaKanjiBlock char="流" size="sm" />
         <span className="font-kanji font-bold text-white text-sm">传输面板</span>
         <span className="font-jp text-xs text-[var(--text-on-blue-2)] ml-1">タスクパネル</span>
@@ -220,7 +205,6 @@ function TaskPanel({ transfers }: { transfers: Transfer[] }) {
           <div className="font-kanji text-xs text-[var(--text-on-white-2)] mb-2 truncate">
             {t.fileName} · {formatBytes(t.fileSize)}
           </div>
-
           {t.status === 'transferring' && (
             <>
               <MisakaProgressBar value={t.progress} className="mb-1.5" />
@@ -234,14 +218,12 @@ function TaskPanel({ transfers }: { transfers: Transfer[] }) {
               </div>
             </>
           )}
-
           {t.status === 'completed' && (
             <div className="flex items-center gap-2 mt-1">
               <span style={{ color: 'var(--state-success)' }} className="font-mono text-xs">✓ 已完成</span>
               <MisakaButton variant="pill" size="sm" className="ml-auto text-xs py-1 px-3">打开</MisakaButton>
             </div>
           )}
-
           {t.status === 'failed' && (
             <div className="flex items-center gap-2 mt-1">
               <span style={{ color: 'var(--state-danger)' }} className="font-mono text-xs">✗ 失败</span>
@@ -260,32 +242,93 @@ function TaskPanel({ transfers }: { transfers: Transfer[] }) {
   )
 }
 
+// ── Mobile Tab Bar ────────────────────────────────────────────────
+type TabId = 'radar' | 'channel' | 'tasks'
+const TABS: { id: TabId; kanji: string; label: string }[] = [
+  { id: 'radar',   kanji: '点', label: '节点' },
+  { id: 'channel', kanji: '道', label: '信道' },
+  { id: 'tasks',   kanji: '流', label: '任务' },
+]
+
 // ── Page ──────────────────────────────────────────────────────────
 export default function Network() {
   const [selectedId, setSelectedId] = useState<number | null>(null)
+  const [activeTab, setActiveTab]   = useState<TabId>('radar')
   const selectedPeer = MOCK_PEERS.find(p => p.nodeId === selectedId) ?? null
+
+  function handleSelectPeer(id: number) {
+    setSelectedId(id)
+    setActiveTab('channel')
+  }
 
   return (
     <div className="min-h-screen pt-16" style={{ background: 'var(--bg-primary)' }}>
+
+      {/* ── Desktop: 3-column grid ─────────────────────────────────── */}
       <div
-        className="grid h-[calc(100vh-64px)] gap-6 p-6"
+        className="hidden md:grid h-[calc(100vh-64px)] gap-6 p-6"
         style={{ gridTemplateColumns: '1fr 2fr 1fr' }}
       >
-        {/* NodeRadar */}
         <div className="overflow-y-auto">
-          <NodeRadar
-            peers={MOCK_PEERS}
-            selected={selectedId}
-            onSelect={setSelectedId}
-          />
+          <NodeRadar peers={MOCK_PEERS} selected={selectedId} onSelect={setSelectedId} />
         </div>
-
-        {/* TransferChannel */}
         <TransferChannel selectedPeer={selectedPeer} />
-
-        {/* TaskPanel */}
         <div className="overflow-y-auto">
           <TaskPanel transfers={MOCK_TRANSFERS} />
+        </div>
+      </div>
+
+      {/* ── Mobile: tab layout ────────────────────────────────────── */}
+      <div className="md:hidden flex flex-col" style={{ minHeight: 'calc(100svh - 64px)' }}>
+        {/* Tab bar */}
+        <div
+          className="flex border-b"
+          style={{
+            background: 'rgba(14,42,107,0.85)',
+            backdropFilter: 'blur(12px)',
+            borderColor: 'rgba(255,255,255,0.12)',
+          }}
+        >
+          {TABS.map(({ id, kanji, label }) => {
+            const active = activeTab === id
+            return (
+              <button
+                key={id}
+                onClick={() => setActiveTab(id)}
+                className="flex-1 flex flex-col items-center justify-center gap-1 py-3 cursor-pointer transition-colors"
+                style={{
+                  border: 'none',
+                  background: 'transparent',
+                  borderBottom: active ? '2px solid var(--accent-cyan)' : '2px solid transparent',
+                }}
+              >
+                <MisakaKanjiBlock
+                  char={kanji}
+                  size="sm"
+                  className={`transition-opacity ${active ? 'opacity-100' : 'opacity-50'}`}
+                />
+                <span
+                  className="font-kanji text-xs"
+                  style={{ color: active ? 'var(--text-on-blue)' : 'var(--text-muted)' }}
+                >
+                  {label}
+                </span>
+              </button>
+            )
+          })}
+        </div>
+
+        {/* Tab panel */}
+        <div className="flex-1 overflow-y-auto p-4">
+          {activeTab === 'radar' && (
+            <NodeRadar peers={MOCK_PEERS} selected={selectedId} onSelect={handleSelectPeer} />
+          )}
+          {activeTab === 'channel' && (
+            <TransferChannel selectedPeer={selectedPeer} />
+          )}
+          {activeTab === 'tasks' && (
+            <TaskPanel transfers={MOCK_TRANSFERS} />
+          )}
         </div>
       </div>
     </div>

@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useHomeStore } from '@/store/home'
 import MisakaCard from '@/components/ui/MisakaCard'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
@@ -29,12 +29,25 @@ const STAT_CARDS = [
 
 export default function StatsDashboard() {
   const { stats, fetchStats } = useHomeStore()
+  const [visible, setVisible] = useState(false)
+  const gridRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     fetchStats()
     const timer = setInterval(fetchStats, 10_000)
     return () => clearInterval(timer)
   }, [fetchStats])
+
+  useEffect(() => {
+    const el = gridRef.current
+    if (!el) return
+    const observer = new IntersectionObserver(
+      ([entry]) => { if (entry.isIntersecting) { setVisible(true); observer.disconnect() } },
+      { threshold: 0.1 }
+    )
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [])
 
   const cpuPct = Math.max(0, Math.min(100, stats.cpuLoadPercent))
 
@@ -51,14 +64,18 @@ export default function StatsDashboard() {
       </div>
 
       {/* Stats Grid */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5 max-w-5xl">
-        {STAT_CARDS.map(card => {
+      <div ref={gridRef} className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5 max-w-5xl">
+        {STAT_CARDS.map((card, idx) => {
           const value = stats[card.key as keyof typeof stats] as number
           return (
             <MisakaCard
               key={card.kanji}
               padding="md"
               className="group hover:-translate-y-1 hover:shadow-float transition-all duration-200 cursor-default"
+              style={{
+                opacity: visible ? undefined : 0,
+                animation: visible ? `card-in 0.45s ease ${idx * 0.07}s forwards` : 'none',
+              }}
             >
               <div className="flex items-start justify-between mb-3">
                 <MisakaKanjiBlock char={card.kanji} size="sm" />
