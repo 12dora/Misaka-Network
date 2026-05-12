@@ -49,8 +49,8 @@
 - ☑ NodeRadar
 - ☑ TransferChannel（拖拽 + 选择文件）
 - ☑ TaskPanel
-- ☐ 接收确认 Modal
-- ☐ 移动端 Tab 布局
+- ☑ 接收确认 Modal
+- ☑ 移动端 Tab 布局
 
 ### WebRTC 传输（参考 06-webrtc-transfer.md）
 - ☐ Peer connection 工厂
@@ -93,7 +93,7 @@
 
 ## 当前会话焦点
 
-后端安全加固完成：速率限制 + IP 追踪 + WS zod 校验 + 上报接口 + 锁定自动解锁
+网络页收尾：接收确认 Modal + 移动端 Tab 布局 + 底部操作栏
 
 ## 已知问题
 
