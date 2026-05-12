@@ -4,6 +4,8 @@ import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
 import MisakaStatusBadge from '@/components/ui/MisakaStatusBadge'
 import MisakaProgressBar from '@/components/ui/MisakaProgressBar'
+import QRModal from '@/components/features/QRModal'
+import ReceiveConfirmModal from '@/components/features/ReceiveConfirmModal'
 import type { Peer, Transfer } from '@/types'
 
 // ── Placeholder data ──────────────────────────────────────────────
@@ -250,10 +252,52 @@ const TABS: { id: TabId; kanji: string; label: string }[] = [
   { id: 'tasks',   kanji: '流', label: '任务' },
 ]
 
+// ── Mobile bottom action bar ──────────────────────────────────────
+function MobileBottomBar({ onShowQR }: { onShowQR: () => void }) {
+  return (
+    <div
+      className="flex items-center justify-around"
+      style={{
+        height: 96,
+        background: 'rgba(14,42,107,0.92)',
+        backdropFilter: 'blur(12px)',
+        borderTop: '1px solid rgba(255,255,255,0.1)',
+      }}
+    >
+      {[
+        { kanji: '件', label: '文件', onClick: () => {} },
+        { kanji: '言', label: '消息', onClick: () => {} },
+        { kanji: '码', label: 'QR',   onClick: onShowQR },
+      ].map(({ kanji, label, onClick }) => (
+        <button
+          key={kanji}
+          onClick={onClick}
+          className="flex flex-col items-center gap-1 px-6 py-2 cursor-pointer"
+          style={{ border: 'none', background: 'transparent' }}
+        >
+          <MisakaKanjiBlock char={kanji} size="sm" />
+          <span className="font-kanji text-[11px] text-[var(--text-on-blue-2)]">{label}</span>
+        </button>
+      ))}
+    </div>
+  )
+}
+
+// Dummy incoming transfer for demo
+const DEMO_INCOMING = {
+  sourceNodeId: 8821,
+  fileName: '実験報告.pdf',
+  fileSize: 13000000,
+  channelType: 'stun',
+  fileHash: 'a3f8c2d1e5b7',
+} as const
+
 // ── Page ──────────────────────────────────────────────────────────
 export default function Network() {
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [activeTab, setActiveTab]   = useState<TabId>('radar')
+  const [showQR, setShowQR]         = useState(false)
+  const [showReceive, setShowReceive] = useState(false)
   const selectedPeer = MOCK_PEERS.find(p => p.nodeId === selectedId) ?? null
 
   function handleSelectPeer(id: number) {
@@ -272,7 +316,15 @@ export default function Network() {
         <div className="overflow-y-auto">
           <NodeRadar peers={MOCK_PEERS} selected={selectedId} onSelect={setSelectedId} />
         </div>
-        <TransferChannel selectedPeer={selectedPeer} />
+        <div className="flex flex-col gap-4">
+          <TransferChannel selectedPeer={selectedPeer} />
+          {/* Demo: trigger receive modal */}
+          {selectedPeer && (
+            <MisakaButton variant="pill" size="sm" onClick={() => setShowReceive(true)}>
+              [DEMO] 模拟接收确认
+            </MisakaButton>
+          )}
+        </div>
         <div className="overflow-y-auto">
           <TaskPanel transfers={MOCK_TRANSFERS} />
         </div>
@@ -324,13 +376,40 @@ export default function Network() {
             <NodeRadar peers={MOCK_PEERS} selected={selectedId} onSelect={handleSelectPeer} />
           )}
           {activeTab === 'channel' && (
-            <TransferChannel selectedPeer={selectedPeer} />
+            <div className="flex flex-col gap-4">
+              <TransferChannel selectedPeer={selectedPeer} />
+              {selectedPeer && (
+                <MisakaButton variant="pill" size="sm" onClick={() => setShowReceive(true)}>
+                  [DEMO] 模拟接收确认
+                </MisakaButton>
+              )}
+            </div>
           )}
           {activeTab === 'tasks' && (
             <TaskPanel transfers={MOCK_TRANSFERS} />
           )}
         </div>
+
+        {/* Bottom action bar */}
+        <MobileBottomBar onShowQR={() => setShowQR(true)} />
       </div>
+
+      {/* Modals */}
+      {showQR && (
+        <QRModal
+          nodeId={8821}
+          passCode="485291"
+          onClose={() => setShowQR(false)}
+        />
+      )}
+      {showReceive && (
+        <ReceiveConfirmModal
+          transfer={DEMO_INCOMING}
+          onAccept={() => setShowReceive(false)}
+          onReject={() => setShowReceive(false)}
+          onBlock={() => setShowReceive(false)}
+        />
+      )}
     </div>
   )
 }
