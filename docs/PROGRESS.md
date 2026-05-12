@@ -11,44 +11,44 @@
 ## 整体进度
 
 ### 项目初始化
-- ☐ 信令服务器项目脚手架（Node.js + ws）
-- ☐ 前端项目脚手架（Vite + React + TS + Tailwind）
-- ☐ 设计 token 配置（颜色/字体/间距）
-- ☐ 基础 UI 组件库（MisakaButton/Card/Input）
-- ☐ 路由配置
+- ☑ 信令服务器项目脚手架（Node.js + ws）
+- ☑ 前端项目脚手架（Vite + React + TS + Tailwind）
+- ☑ 设计 token 配置（颜色/字体/间距）
+- ☑ 基础 UI 组件库（MisakaButton/Card/Input/KanjiBlock/ProgressBar/StatusBadge）
+- ☑ 路由配置
 
 ### 信令服务器（参考 07-signaling-server.md）
-- ☐ REST `/api/register`
-- ☐ REST `/api/release`
-- ☐ REST `/api/verify-passcode`
-- ☐ REST `/api/stats`
-- ☐ WebSocket 鉴权与 JOIN_CHANNEL
-- ☐ SIGNAL_SDP / SIGNAL_ICE 转发
-- ☐ 活动流广播
-- ☐ QR token 接口（/api/qr-token, /api/qr-redeem）
-- ☐ 30 分钟会话清理任务
+- ☑ REST `/api/register`
+- ☑ REST `/api/release`
+- ☑ REST `/api/verify-passcode`
+- ☑ REST `/api/stats`
+- ☑ WebSocket 鉴权与 JOIN_CHANNEL
+- ☑ SIGNAL_SDP / SIGNAL_ICE 转发
+- ☑ 活动流广播
+- ☑ QR token 接口（/api/qr-token, /api/qr-redeem）
+- ☑ 30 分钟会话清理任务
 - ☐ 限流与防护
 
 ### 身份系统（参考 05-auth-identity.md）
-- ☐ 客户端身份生成
-- ☐ sessionStorage 持久化
-- ☐ 编号冲突重试
-- ☐ 通行码错误锁定
-- ☐ 会话恢复
+- ☑ 客户端身份生成
+- ☑ sessionStorage 持久化
+- ☑ 编号冲突重试
+- ☑ 通行码错误锁定（服务端）
+- ☑ 会话恢复
 
 ### 首页（参考 02-pages-home.md）
-- ☐ TopNav
-- ☐ LoginCard（未登录态）
-- ☐ LoginCard（已登录态）
-- ☐ StatsDashboard
-- ☐ ActivityStream
-- ☐ QuickJoin
+- ☑ TopNav
+- ☑ LoginCard（未登录态）
+- ☑ LoginCard（已登录态）
+- ☑ StatsDashboard
+- ☑ ActivityStream
+- ☑ QuickJoin
 
 ### 网络页（参考 03-pages-network.md）
-- ☐ 三栏布局框架
-- ☐ NodeRadar
-- ☐ TransferChannel（拖拽 + 选择文件）
-- ☐ TaskPanel
+- ☑ 三栏布局框架
+- ☑ NodeRadar
+- ☑ TransferChannel（拖拽 + 选择文件）
+- ☑ TaskPanel
 - ☐ 接收确认 Modal
 - ☐ 移动端 Tab 布局
 
@@ -63,11 +63,11 @@
 - ☐ AES-GCM 应用层加密
 
 ### ACGN 页（参考 04-pages-acgn.md）
-- ☐ 静态文案
-- ☐ 角色卡片
-- ☐ 妹妹语录生成器
-- ☐ 实验体编号查询
-- ☐ 致敬声明页脚
+- ☑ 静态文案
+- ☑ 角色卡片
+- ☑ 妹妹语录生成器
+- ☑ 实验体编号查询
+- ☑ 致敬声明页脚
 
 ### QR 系统（参考 08-qr-system.md）
 - ☐ QR 生成（节点 QR）
@@ -93,16 +93,18 @@
 
 ## 当前会话焦点
 
-> （此处由编码 AI 在每次开始时填写本次要做的具体任务）
+MVP v1 初始实现（本次完成）：脚手架 + 全部 UI 框架 + 信令服务器核心逻辑 + 身份系统
 
 ## 已知问题
 
-> （此处由编码 AI 记录待解决的 bug 或技术债，每条一行）
+- Network 页 NodeRadar/TransferChannel/TaskPanel 当前使用 mock 数据，需接入 WebRTC 信令
+- 接收确认 Modal 未实现
+- 移动端 Tab 布局未实现
+- 信令服务器无限流与防护
 
 ## 决策记录
 
-> （此处记录关键技术决策，每条一行）
-
-例如：
 - 2026-05-12: 采用 ws 而非 socket.io，减少依赖
 - 2026-05-12: chunk size 定为 64KB，平衡内存与吞吐
+- 2026-05-12: 设计 token 用 CSS custom properties + Tailwind extend，而非 Tailwind 原生值
+- 2026-05-12: lore.ts 写死彩蛋数据，无需后端

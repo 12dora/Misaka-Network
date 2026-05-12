@@ -1,0 +1,215 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Design Tokens ── */
+:root {
+  /* Backgrounds */
+  --bg-primary:    #1A4FC4;
+  --bg-deep:       #0E2A6B;
+  --bg-soft:       #2A63D8;
+
+  /* Surfaces */
+  --surface:       #FFFFFF;
+  --surface-cream: #F5EFE6;
+  --surface-tint:  #EAF1FF;
+
+  /* Accents */
+  --accent-cyan:   #5BB3FF;
+  --accent-ribbon: #E8C5C0;
+
+  /* State */
+  --state-success: #00C28A;
+  --state-warn:    #FFB23D;
+  --state-danger:  #FF5670;
+
+  /* Text */
+  --text-on-blue:    #FFFFFF;
+  --text-on-blue-2:  #C7DBFF;
+  --text-on-white:   #0E2A6B;
+  --text-on-white-2: #4A5A85;
+  --text-muted:      #8FA3CC;
+
+  /* Borders & Shadows */
+  --border-card:   #D6E0F2;
+  --border-strong: #0E2A6B;
+  --shadow-card:   0 10px 30px -12px rgba(14, 42, 107, 0.25);
+  --shadow-float:  0 20px 50px -20px rgba(14, 42, 107, 0.35);
+}
+
+/* ── Base ── */
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: 'Noto Sans SC', 'Noto Sans JP', system-ui, sans-serif;
+  background: var(--bg-primary);
+  color: var(--text-on-blue);
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+}
+
+/* ── Utility Classes ── */
+@layer components {
+  /* Kanji Block */
+  .kanji-block {
+    display: inline-grid;
+    place-items: center;
+    width: 1.2em;
+    height: 1.2em;
+    background: var(--bg-deep);
+    color: var(--surface);
+    font-family: 'Noto Sans JP', 'Noto Sans SC', sans-serif;
+    font-weight: 800;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+
+  /* White Card */
+  .misaka-card {
+    background: var(--surface);
+    border: 1px solid var(--border-card);
+    border-radius: 1rem;
+    box-shadow: var(--shadow-card);
+  }
+
+  /* Nav Pill */
+  .nav-pill {
+    background: var(--surface);
+    color: var(--text-on-white);
+    border-radius: 9999px;
+    padding: 0.5rem 1.4rem;
+    font-weight: 600;
+    font-size: 0.9rem;
+    box-shadow: var(--shadow-card);
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+    border: none;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .nav-pill:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-float);
+  }
+  .nav-pill.active {
+    background: var(--bg-deep);
+    color: var(--surface);
+  }
+
+  /* Primary Button */
+  .btn-primary {
+    background: var(--bg-deep);
+    color: var(--surface);
+    border-radius: 0.75rem;
+    padding: 0.85rem 1.5rem;
+    font-weight: 600;
+    font-family: 'Noto Sans SC', sans-serif;
+    font-size: 1rem;
+    width: 100%;
+    border: none;
+    cursor: pointer;
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+    position: relative;
+    overflow: hidden;
+  }
+  .btn-primary:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-float);
+  }
+  .btn-primary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+  }
+
+  /* Ghost Button (on blue bg) */
+  .btn-ghost {
+    background: transparent;
+    color: var(--surface);
+    border: 1px solid rgba(255, 255, 255, 0.5);
+    border-radius: 9999px;
+    padding: 0.5rem 1.2rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s, border-color 0.2s;
+  }
+  .btn-ghost:hover {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.8);
+  }
+
+  /* Section Header */
+  .section-header {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-bottom: 2rem;
+  }
+  .section-header .title-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  .section-header h2 {
+    font-family: 'Noto Sans JP', 'Noto Sans SC', sans-serif;
+    font-weight: 700;
+    font-size: 1.6rem;
+    color: var(--text-on-blue);
+    margin: 0;
+  }
+  .section-header .furigana {
+    font-family: 'Shippori Mincho', serif;
+    font-size: 0.85rem;
+    color: var(--text-on-blue-2);
+  }
+  .section-header .accent-line {
+    width: 80px;
+    height: 2px;
+    background: var(--accent-cyan);
+    border-radius: 1px;
+    margin-left: calc(1.2em + 0.6rem);
+  }
+}
+
+/* ── Character Float Animation ── */
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50%       { transform: translateY(-6px); }
+}
+.animate-float {
+  animation: float 4s ease-in-out infinite;
+}
+
+/* ── Pulse Dot ── */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}
+.pulse-dot {
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+
+/* ── Scan Line (QR/scan overlay) ── */
+@keyframes scan-line {
+  0%   { top: 0; }
+  100% { top: calc(100% - 2px); }
+}
+.scan-line {
+  position: absolute;
+  left: 0; right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--accent-cyan), transparent);
+  animation: scan-line 2.4s linear infinite;
+  pointer-events: none;
+}
+
+/* ── Progress Bar Shine ── */
+@keyframes shine {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(400%); }
+}
+
+/* ── Fonts ── */
+.font-jp    { font-family: 'Shippori Mincho', 'Noto Serif JP', serif; }
+.font-kanji { font-family: 'Noto Sans JP', 'Noto Sans SC', sans-serif; }
+.font-mono  { font-family: 'IBM Plex Mono', 'Roboto Mono', monospace; }
