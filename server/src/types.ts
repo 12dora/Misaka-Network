@@ -11,6 +11,7 @@ export interface NodeSession {
   failedAttempts: number
   lockedUntil: number
   joinedAt: number
+  ip: string
 }
 
 export interface QrTokenRecord {
@@ -22,6 +23,15 @@ export interface QrTokenRecord {
   createdAt: number
   expiresAt: number
   used: boolean
+}
+
+export interface ReportRecord {
+  id: string
+  sourceNodeId: number
+  targetNodeId: number
+  reason: 'spam' | 'malicious' | 'harassment' | 'other'
+  reporterIp: string
+  reportedAt: number
 }
 
 export interface ActivityEvent {
