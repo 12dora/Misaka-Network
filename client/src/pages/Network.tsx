@@ -8,6 +8,7 @@ import QRModal from '@/components/features/QRModal'
 import ReceiveConfirmModal from '@/components/features/ReceiveConfirmModal'
 import { useNetworkStore } from '@/store/network'
 import { useAuthStore } from '@/store/auth'
+import { apiUrl } from '@/config'
 import { humanizeError } from '@/lib/transfer'
 import type { Peer, Transfer } from '@/types'
 
@@ -32,11 +33,13 @@ function formatSpeed(bps: number) {
 }
 
 // ── NodeRadar ─────────────────────────────────────────────────────
-function NodeRadar({ peers, selected, onSelect, onSend }: {
+function NodeRadar({ peers, selected, onSelect, onSend, onShowQR, onCopyLink }: {
   peers: Peer[]
   selected: number | null
   onSelect: (id: number) => void
   onSend: (id: number) => void
+  onShowQR: () => void
+  onCopyLink: () => void
 }) {
   return (
     <div className="flex flex-col gap-4">
@@ -53,8 +56,8 @@ function NodeRadar({ peers, selected, onSelect, onSend }: {
           <p className="font-kanji text-sm text-[var(--text-on-white)] mb-1">网络中暂无其他实验体</p>
           <p className="font-jp text-xs text-[var(--text-on-white-2)] mb-4">他にネットワーク参加者なし</p>
           <div className="flex gap-2">
-            <MisakaButton variant="pill" size="sm" fullWidth>显示我的 QR</MisakaButton>
-            <MisakaButton variant="pill" size="sm" fullWidth>复制链接</MisakaButton>
+            <MisakaButton variant="pill" size="sm" fullWidth onClick={onShowQR}>显示我的 QR</MisakaButton>
+            <MisakaButton variant="pill" size="sm" fullWidth onClick={onCopyLink}>复制链接</MisakaButton>
           </div>
         </MisakaCard>
       ) : (
@@ -473,9 +476,36 @@ export default function Network() {
   const [activeTab, setActiveTab] = useState<TabId>('radar')
   const [showQR, setShowQR]   = useState(false)
   const [verifyError, setVerifyError] = useState<string | null>(null)
+  const [toast, setToast] = useState<string | null>(null)
 
   const auth = useAuthStore()
   const store = useNetworkStore()
+
+  async function handleCopyLink() {
+    if (!auth.session?.token) return
+    try {
+      const url = new URL(apiUrl('/api/qr-token'), location.origin)
+      if (auth.identity.passCode) url.searchParams.set('passCode', auth.identity.passCode)
+      const res = await fetch(url.toString(), {
+        headers: { Authorization: `Bearer ${auth.session.token}` },
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json() as { qrToken: string; channelId: string }
+      const params = new URLSearchParams({
+        type: 'node',
+        id: String(auth.identity.nodeId),
+        t: data.qrToken,
+      })
+      const link = `${location.origin}/join?${params.toString()}`
+      await navigator.clipboard.writeText(link)
+      // Owner needs to be in the QR channel for the scanner to land into the same channel
+      if (store.wsConnected) store.joinChannel(data.channelId)
+      setToast('链接已复制到剪贴板')
+    } catch (e) {
+      setToast(`复制失败：${String(e)}`)
+    }
+    setTimeout(() => setToast(null), 2400)
+  }
 
   // Init store on mount
   useEffect(() => {
@@ -551,6 +581,8 @@ export default function Network() {
             selected={store.selectedPeerId}
             onSelect={handleSelectPeer}
             onSend={handleSend}
+            onShowQR={() => setShowQR(true)}
+            onCopyLink={handleCopyLink}
           />
         </div>
         <TransferChannel
@@ -619,6 +651,8 @@ export default function Network() {
               selected={store.selectedPeerId}
               onSelect={handleSelectPeer}
               onSend={handleSend}
+              onShowQR={() => setShowQR(true)}
+              onCopyLink={handleCopyLink}
             />
           )}
           {activeTab === 'channel' && (
@@ -650,6 +684,14 @@ export default function Network() {
         <div className="fixed top-20 left-1/2 -translate-x-1/2 z-[120] px-4 py-2 rounded-lg text-sm font-kanji"
           style={{ background: 'var(--state-danger)', color: '#fff' }}>
           {verifyError}
+        </div>
+      )}
+
+      {/* Toast */}
+      {toast && (
+        <div className="fixed bottom-24 md:bottom-8 left-1/2 -translate-x-1/2 z-[120] px-4 py-2 rounded-lg text-sm font-kanji shadow-lg"
+          style={{ background: 'var(--bg-deep)', color: '#fff' }}>
+          {toast}
         </div>
       )}
 

@@ -52,13 +52,15 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
         setQrToken(data.qrToken)
         setExpiresAt(data.expiresAt)
 
-        // Join the QR channel so both parties end up in the same channel
+        // Join the QR channel so a scanner can find this owner.
+        // Only switch channels live when already connected — otherwise the
+        // user is still on /login and will join the default passcode-cluster
+        // channel when they enter /network. (Stashing the QR channel in
+        // sessionStorage would silently isolate the owner from the cluster,
+        // breaking same-passcode discovery across browsers.)
         const ns = useNetworkStore.getState()
         if (ns.wsConnected) {
           ns.joinChannel(data.channelId)
-        } else {
-          // Store for later — network store will pick it up on init
-          sessionStorage.setItem('misaka.qrChannel', data.channelId)
         }
       }
     } catch { /* ignore */ }
