@@ -83,6 +83,7 @@ export async function sendFile(
   peerNodeId: number,
   existingRecord?: TransferRecord, // for resume
   callbacks?: SendCallbacks,
+  peerReceivedChunks?: number[], // actual chunks the receiver reports having
 ): Promise<void> {
   const fileHash = existingRecord?.fileHash ?? await computeFileHash(file)
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
@@ -102,8 +103,19 @@ export async function sendFile(
   }
   await saveTransfer(record)
 
+  // Build skip set from peer's actual bitmap (preferred), fall back to local record
+  let skipSet: Set<number>
+  if (peerReceivedChunks && peerReceivedChunks.length > 0) {
+    skipSet = new Set(peerReceivedChunks)
+  } else if (existingRecord) {
+    const savedIndexes = await getSavedChunkIndexes(transferId)
+    skipSet = new Set(savedIndexes)
+  } else {
+    skipSet = new Set()
+  }
+
   // Send metadata (skip if resuming — peer already has it)
-  if (!existingRecord) {
+  if (!peerReceivedChunks && !existingRecord) {
     dc.send(JSON.stringify({
       type: 'meta',
       transferId,
@@ -115,14 +127,28 @@ export async function sendFile(
     } satisfies MetaMessage))
   }
 
-  const savedIndexes = existingRecord ? await getSavedChunkIndexes(transferId) : []
-  const skipSet = new Set(existingRecord?.receivedChunks ?? savedIndexes)
-
   let sent = skipSet.size
   callbacks?.onProgress?.(sent, totalChunks)
 
   for (let i = 0; i < totalChunks; i++) {
     if (skipSet.has(i)) continue
+
+    // Check pause/cancel signals
+    const signal = transferSignals.get(transferId)
+    if (signal?.cancelled) {
+      await updateTransfer(transferId, { status: 'failed' })
+      return
+    }
+    if (signal?.paused) {
+      await updateTransfer(transferId, { status: 'paused' })
+      await waitWhilePaused(transferId)
+      const s2 = transferSignals.get(transferId)
+      if (s2?.cancelled) {
+        await updateTransfer(transferId, { status: 'failed' })
+        return
+      }
+      await updateTransfer(transferId, { status: 'active' })
+    }
 
     const start = i * CHUNK_SIZE
     const end = Math.min(start + CHUNK_SIZE, file.size)
@@ -153,9 +179,11 @@ export async function sendFile(
     sent++
     callbacks?.onProgress?.(sent, totalChunks)
 
-    // Persist chunk in IndexedDB
+    // Persist chunk locally for crash recovery fallback
     await saveChunk(transferId, i, encrypted)
-    await updateTransfer(transferId, { receivedChunks: [...skipSet, ...range(0, i + 1)].filter(x => skipSet.has(x) || x <= i) })
+    // Track which chunks we've sent this session
+    record.receivedChunks = [...new Set([...record.receivedChunks, i])]
+    await updateTransfer(transferId, { receivedChunks: record.receivedChunks })
   }
 
   await updateTransfer(transferId, { status: 'completed' })
@@ -166,7 +194,6 @@ export async function sendFile(
 export interface ReceiveCallbacks {
   onMeta?: (meta: MetaMessage) => void
   onProgress?: (received: number, total: number) => void
-  onComplete?: (file: File) => void
   onError?: (error: string) => void
 }
 
@@ -224,7 +251,7 @@ export async function receiveChunk(
   iv: Uint8Array<ArrayBuffer>,
   encrypted: ArrayBuffer,
   callbacks?: ReceiveCallbacks,
-) {
+): Promise<{ ack: AckMessage; decrypted: ArrayBuffer } | undefined> {
   const session = receiveSessions.get(transferId)
   if (!session) return
 
@@ -250,12 +277,10 @@ export async function receiveChunk(
 
   callbacks?.onProgress?.(session.received.size, session.totalChunks)
 
-  // Return ACK to sender
   return {
-    type: 'ack' as const,
-    transferId,
-    index: header.index,
-  } satisfies AckMessage
+    ack: { type: 'ack', transferId, index: header.index },
+    decrypted,
+  }
 }
 
 export async function assembleFile(transferId: string): Promise<File> {
@@ -307,6 +332,17 @@ export async function buildResumeRequest(transferId: string): Promise<ResumeRequ
 
 // ── Flow control ─────────────────────────────────────────────────────
 
+function waitWhilePaused(transferId: string): Promise<void> {
+  return new Promise(resolve => {
+    const check = () => {
+      const s = transferSignals.get(transferId)
+      if (!s || !s.paused) resolve()
+      else setTimeout(check, 200)
+    }
+    check()
+  })
+}
+
 function waitForBuffer(dc: RTCDataChannel): Promise<void> {
   return new Promise(resolve => {
     if (dc.bufferedAmount <= HIGH_WATER_MARK) {
@@ -323,10 +359,49 @@ function waitForBuffer(dc: RTCDataChannel): Promise<void> {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-function range(start: number, end: number): number[] {
-  const arr: number[] = []
-  for (let i = start; i < end; i++) arr.push(i)
-  return arr
+// ── Transfer control signals ──────────────────────────────────────────
+
+interface TransferSignal {
+  paused: boolean
+  cancelled: boolean
+}
+
+const transferSignals = new Map<string, TransferSignal>()
+
+function getSignal(transferId: string): TransferSignal {
+  let s = transferSignals.get(transferId)
+  if (!s) {
+    s = { paused: false, cancelled: false }
+    transferSignals.set(transferId, s)
+  }
+  return s
+}
+
+export function pauseTransfer(transferId: string) {
+  getSignal(transferId).paused = true
+}
+
+export function resumeTransfer(transferId: string) {
+  getSignal(transferId).paused = false
+}
+
+export function cancelTransfer(transferId: string) {
+  const s = getSignal(transferId)
+  s.cancelled = true
+  s.paused = false // unblock any waiting
+  transferSignals.delete(transferId)
+}
+
+export function humanizeError(error: Error | string, channelType?: string): string {
+  const msg = typeof error === 'string' ? error : error.message
+  if (msg.includes('超时') || msg.includes('timeout')) {
+    if (channelType === 'stun') return '连接超时 — 尝试在设置中开启 TURN 中继以穿越防火墙'
+    return '连接超时 — 请检查网络或稍后重试'
+  }
+  if (msg.includes('加密') || msg.includes('AES') || msg.includes('key')) return '加密协商失败，请重新连接后重试'
+  if (msg.includes('checksum')) return '数据校验失败，文件可能已损坏'
+  if (msg.includes('DataChannel')) return '数据信道断开 — 尝试更换信道类型'
+  return msg || '传输失败，请检查网络连接后重试'
 }
 
 export function createTransferId(): string {
@@ -335,4 +410,149 @@ export function createTransferId(): string {
 
 export async function checkForResumableTransfers(): Promise<TransferRecord[]> {
   return getActiveTransfers()
+}
+
+// ── OPFS disk-backed receive (all modern browsers) ────────────────────
+// Uses navigator.storage.getDirectory() to write chunks to disk as they
+// arrive, avoiding the all-in-memory Blob assembly. Available in Chrome
+// 86+, Safari 15.2+, Firefox 111+. Falls back to IndexedDB + Blob for
+// very old browsers.
+
+export interface OPFSReceiveHandle {
+  writable: FileSystemWritableFileStream
+  fileHandle: FileSystemFileHandle
+  written: Set<number>
+  totalChunks: number
+  fileName: string
+}
+
+const opfsHandles = new Map<string, OPFSReceiveHandle>()
+
+export function supportsOPFS(): boolean {
+  return typeof navigator !== 'undefined' && 'storage' in navigator && 'getDirectory' in navigator.storage
+}
+
+export async function createOPFSReceiveFile(
+  transferId: string,
+  fileName: string,
+  totalChunks: number,
+): Promise<OPFSReceiveHandle> {
+  const root = await navigator.storage.getDirectory()
+  const dir = await root.getDirectoryHandle('misaka-transfers', { create: true })
+  const fileHandle = await dir.getFileHandle(`${transferId}-${fileName}`, { create: true })
+  const writable = await fileHandle.createWritable({ keepExistingData: false })
+  const handle: OPFSReceiveHandle = { writable, fileHandle, written: new Set(), totalChunks, fileName }
+  opfsHandles.set(transferId, handle)
+  return handle
+}
+
+export function getOPFSHandle(transferId: string): OPFSReceiveHandle | undefined {
+  return opfsHandles.get(transferId)
+}
+
+export async function writeChunkToOPFS(
+  transferId: string,
+  index: number,
+  data: ArrayBuffer,
+): Promise<void> {
+  const handle = opfsHandles.get(transferId)
+  if (!handle) return
+  const offset = index * CHUNK_SIZE
+  await handle.writable.write({ type: 'write', position: offset, data: new Uint8Array(data) })
+  handle.written.add(index)
+}
+
+export async function getOPFSFile(transferId: string): Promise<File> {
+  const handle = opfsHandles.get(transferId)
+  if (!handle) throw new Error('No OPFS handle')
+  await handle.writable.close()
+  const file = await handle.fileHandle.getFile()
+  opfsHandles.delete(transferId)
+  return file
+}
+
+export async function cleanupOPFS(transferId: string) {
+  const handle = opfsHandles.get(transferId)
+  if (handle) {
+    handle.writable.close().catch(() => {})
+    opfsHandles.delete(transferId)
+  }
+  try {
+    const root = await navigator.storage.getDirectory()
+    const dir = await root.getDirectoryHandle('misaka-transfers', { create: false })
+    // Find and remove the OPFS file for this transfer
+    for await (const [name] of dir as any) {
+      if (name.startsWith(transferId)) {
+        await dir.removeEntry(name).catch(() => {})
+      }
+    }
+  } catch { /* directory may not exist */ }
+}
+
+// ── File System Access API streaming write (Chromium) ──────────────────
+
+export interface FileWriteHandle {
+  writable: FileSystemWritableFileStream
+  fileHandle: FileSystemFileHandle
+  written: Set<number>
+  totalChunks: number
+}
+
+const writeHandles = new Map<string, FileWriteHandle>()
+
+export function supportsFileSystemAccess(): boolean {
+  return typeof window !== 'undefined' && 'showSaveFilePicker' in window
+}
+
+export async function requestWriteHandle(
+  transferId: string,
+  suggestedName: string,
+  totalChunks: number,
+): Promise<FileWriteHandle> {
+  // Use type assertion for File System Access API (not in all TS libs)
+  const ext = suggestedName.split('.').pop() ?? 'bin'
+  const fileHandle = await (window as any).showSaveFilePicker({
+    suggestedName,
+    types: [{ description: suggestedName, accept: { 'application/octet-stream': [`.${ext}`] } }],
+  }) as FileSystemFileHandle
+  const writable = await fileHandle.createWritable()
+  const handle: FileWriteHandle = { writable, fileHandle, written: new Set(), totalChunks }
+  writeHandles.set(transferId, handle)
+  return handle
+}
+
+export function getWriteHandle(transferId: string): FileWriteHandle | undefined {
+  return writeHandles.get(transferId)
+}
+
+export async function streamChunkToDisk(
+  transferId: string,
+  index: number,
+  data: ArrayBuffer,
+): Promise<void> {
+  const handle = writeHandles.get(transferId)
+  if (!handle) return
+  const offset = index * CHUNK_SIZE
+  await handle.writable.write({ type: 'write', position: offset, data: new Uint8Array(data) })
+  handle.written.add(index)
+}
+
+export async function finalizeStreamedFile(transferId: string): Promise<File> {
+  const handle = writeHandles.get(transferId)
+  if (!handle) throw new Error('No write handle')
+
+  await handle.writable.close()
+  writeHandles.delete(transferId)
+
+  // Return a File from the saved handle for hash verification
+  const file = await handle.fileHandle.getFile()
+  return file
+}
+
+export function cancelStreamWrite(transferId: string) {
+  const handle = writeHandles.get(transferId)
+  if (handle) {
+    handle.writable.close().catch(() => {})
+    writeHandles.delete(transferId)
+  }
 }

@@ -1,7 +1,7 @@
 import { WebSocketServer, WebSocket } from 'ws'
 import { IncomingMessage } from 'http'
 import { z } from 'zod'
-import { nodes, channels } from './store.js'
+import { nodes, channels, updatePeakConcurrent } from './store.js'
 import { broadcast } from './activity.js'
 import { authMiddleware } from './http.js'
 import type { NodeSession } from './types.js'
@@ -88,6 +88,7 @@ export function setupWS(wss: WebSocketServer) {
           myNodeId: session.nodeId,
           sessionExpiresAt: Date.now() + 30 * 60 * 1000,
         })
+        updatePeakConcurrent()
         return
       }
 
@@ -113,6 +114,7 @@ export function setupWS(wss: WebSocketServer) {
       }
 
       broadcast({ type: 'leave', nodeId: session.nodeId, message: `御坂 ${session.nodeId} 号通信终止` })
+        updatePeakConcurrent()
     })
 
     ws.on('error', () => { /* swallow */ })

@@ -13,10 +13,12 @@ export interface Session {
 // ── Network Stats ─────────────────────────────────────────────────
 export interface NetworkStats {
   onlineNodes: number
+  peakConcurrent: number
   totalTransfers: number
   totalBytes: number
   activeChannels: number
   uptimeLongestMs: number
+  uptimeSeconds: number
   cpuLoadPercent: number
 }
 
@@ -32,7 +34,7 @@ export interface ActivityEvent {
 }
 
 // ── Node / Peer ───────────────────────────────────────────────────
-export type NodeStatus = 'online' | 'transferring' | 'connecting' | 'unauthorized' | 'offline'
+export type NodeStatus = 'online' | 'transferring' | 'connecting' | 'reconnecting' | 'unauthorized' | 'offline'
 
 export interface Peer {
   nodeId: number
@@ -91,4 +93,5 @@ export type WSServerMessage =
   | { t: 'PEER_LEFT'; nodeId: number }
   | { t: 'ACTIVITY'; event: ActivityEvent }
   | { t: 'PONG' }
+  | { t: 'SERVER_SHUTDOWN'; reason: string }
   | { t: 'ERROR'; code: string; message: string }

@@ -8,6 +8,7 @@ import QRModal from '@/components/features/QRModal'
 import ReceiveConfirmModal from '@/components/features/ReceiveConfirmModal'
 import { useNetworkStore } from '@/store/network'
 import { useAuthStore } from '@/store/auth'
+import { humanizeError } from '@/lib/transfer'
 import type { Peer, Transfer } from '@/types'
 
 function channelLabel(t: Peer['channelType']) {
@@ -172,12 +173,14 @@ function TransferChannel({
   onVerifyPassCode,
   onRejectIncoming,
   onSendFile,
+  onSendFileToAll,
 }: {
   selectedPeer: Peer | null
   incomingRequest: { fromNodeId: number } | null
   onVerifyPassCode: (code: string) => void
   onRejectIncoming: () => void
   onSendFile: (file: File) => void
+  onSendFileToAll: (file: File) => void
 }) {
   const [isDragOver, setDragOver] = useState(false)
   const [passCode, setPassCode] = useState('')
@@ -276,6 +279,17 @@ function TransferChannel({
         <div className="font-kanji text-xs text-[var(--text-on-white-2)] mt-0.5">
           {channelLabel(selectedPeer.channelType)} · DTLS + AES-GCM
         </div>
+        {selectedPeer.status === 'reconnecting' && (
+          <div className="flex items-center gap-1.5 mt-2 px-2 py-1 rounded text-[10px]" style={{ background: 'rgba(255,193,7,0.12)', color: 'var(--state-warn)' }}>
+            <MisakaStatusBadge status="reconnecting" />
+            <span className="font-kanji">正在尝试重新协商连接…</span>
+          </div>
+        )}
+        {selectedPeer.status === 'offline' && (
+          <div className="flex items-center gap-1.5 mt-2 px-2 py-1 rounded text-[10px]" style={{ background: 'rgba(239,68,68,0.1)', color: 'var(--state-danger)' }}>
+            <span className="font-kanji">连接已断开 — 请在设置中开启 TURN 中继或检查网络</span>
+          </div>
+        )}
       </div>
 
       {/* Drop zone */}
@@ -292,14 +306,27 @@ function TransferChannel({
         >
           📁 拖拽 / 点击选择文件
         </MisakaButton>
-        <MisakaButton variant="pill" size="md" className="w-56">
-          📂 选择文件夹
+        <MisakaButton
+          variant="pill" size="md" className="w-56"
+          onClick={() => document.getElementById('fanout-file-input')?.click()}
+        >
+          📡 群发文件到全部节点
         </MisakaButton>
         <input
           ref={fileInputRef}
           type="file"
           className="hidden"
           onChange={handleFileChange}
+        />
+        <input
+          id="fanout-file-input"
+          type="file"
+          className="hidden"
+          onChange={(e) => {
+            const file = e.target.files?.[0]
+            if (file) onSendFileToAll(file)
+            e.target.value = ''
+          }}
         />
       </div>
 
@@ -313,7 +340,12 @@ function TransferChannel({
 }
 
 // ── TaskPanel ─────────────────────────────────────────────────────
-function TaskPanel({ transfers }: { transfers: Transfer[] }) {
+function TaskPanel({ transfers, onPause, onResume, onCancel }: {
+  transfers: Transfer[]
+  onPause: (id: string) => void
+  onResume: (id: string, peerId: number) => void
+  onCancel: (id: string) => void
+}) {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center gap-2 mb-1">
@@ -334,7 +366,7 @@ function TaskPanel({ transfers }: { transfers: Transfer[] }) {
           <div className="font-kanji text-xs text-[var(--text-on-white-2)] mb-2 truncate">
             {t.fileName} · {formatBytes(t.fileSize)}
           </div>
-          {t.status === 'transferring' && (
+          {(t.status === 'transferring' || t.status === 'reconnecting') && (
             <>
               <MisakaProgressBar value={t.progress} className="mb-1.5" />
               <div className="flex justify-between text-[10px] font-mono text-[var(--text-on-white-2)]">
@@ -342,14 +374,28 @@ function TaskPanel({ transfers }: { transfers: Transfer[] }) {
                 <span>{formatSpeed(t.speedBps)}</span>
               </div>
               <div className="flex gap-1.5 mt-2">
-                <MisakaButton variant="pill" size="sm" className="flex-1 text-xs py-1">⏸ 暂停</MisakaButton>
-                <MisakaButton variant="pill" size="sm" className="flex-1 text-xs py-1">✕ 取消</MisakaButton>
+                <MisakaButton variant="pill" size="sm" className="flex-1 text-xs py-1" onClick={() => onPause(t.id)}>⏸ 暂停</MisakaButton>
+                <MisakaButton variant="pill" size="sm" className="flex-1 text-xs py-1" onClick={() => onCancel(t.id)}>✕ 取消</MisakaButton>
+              </div>
+            </>
+          )}
+          {t.status === 'paused' && (
+            <>
+              <MisakaProgressBar value={t.progress} className="mb-1.5 opacity-50" />
+              <div className="flex justify-between text-[10px] font-mono text-[var(--text-on-white-2)]">
+                <span style={{ color: 'var(--state-warn)' }}>{Math.round(t.progress * 100)}%</span>
+                <span style={{ color: 'var(--text-muted)' }}>已暂停</span>
+              </div>
+              <div className="flex gap-1.5 mt-2">
+                <MisakaButton variant="primary" size="sm" className="flex-1 text-xs py-1" onClick={() => onResume(t.id, t.peerNodeId)}>▶ 继续</MisakaButton>
+                <MisakaButton variant="pill" size="sm" className="flex-1 text-xs py-1" onClick={() => onCancel(t.id)}>✕ 取消</MisakaButton>
               </div>
             </>
           )}
           {t.status === 'pending' && (
             <div className="flex items-center gap-2 mt-1">
               <span style={{ color: 'var(--text-muted)' }} className="font-mono text-xs">⏳ 等待中</span>
+              <MisakaButton variant="pill" size="sm" className="ml-auto text-xs py-1 px-3" onClick={() => onCancel(t.id)}>✕ 取消</MisakaButton>
             </div>
           )}
           {t.status === 'completed' && (
@@ -359,10 +405,17 @@ function TaskPanel({ transfers }: { transfers: Transfer[] }) {
             </div>
           )}
           {t.status === 'failed' && (
-            <div className="flex items-center gap-2 mt-1">
-              <span style={{ color: 'var(--state-danger)' }} className="font-mono text-xs">✗ 失败</span>
-              <MisakaButton variant="pill" size="sm" className="ml-auto text-xs py-1 px-3">重试</MisakaButton>
-            </div>
+            <>
+              <div className="flex items-center gap-2 mt-1">
+                <span style={{ color: 'var(--state-danger)' }} className="font-mono text-xs">✗ 失败</span>
+                <MisakaButton variant="pill" size="sm" className="ml-auto text-xs py-1 px-3" onClick={() => onResume(t.id, t.peerNodeId)}>重试</MisakaButton>
+              </div>
+              {t.error && (
+                <div className="mt-1 text-[10px] font-kanji" style={{ color: 'var(--text-on-white-2)' }}>
+                  {humanizeError(t.error)}
+                </div>
+              )}
+            </>
           )}
         </MisakaCard>
       ))}
@@ -466,6 +519,14 @@ export default function Network() {
     }
   }
 
+  async function handleSendFileToAll(file: File) {
+    try {
+      await store.sendFileToAll(file)
+    } catch (e) {
+      console.error('Fanout send failed:', e)
+    }
+  }
+
   const peerEntity = store.peers.find(p => p.nodeId === store.selectedPeerId) ?? null
 
   const receiveModalMeta = store.incomingMeta ? {
@@ -498,9 +559,15 @@ export default function Network() {
           onVerifyPassCode={handleVerify}
           onRejectIncoming={handleRejectIncoming}
           onSendFile={handleSendFile}
+          onSendFileToAll={handleSendFileToAll}
         />
         <div className="overflow-y-auto">
-          <TaskPanel transfers={store.transfers} />
+          <TaskPanel
+            transfers={store.transfers}
+            onPause={(id) => store.pauseTransfer(id)}
+            onResume={(id, peerId) => store.resumeTransfer(id, peerId)}
+            onCancel={(id) => store.cancelTransferAction(id)}
+          />
         </div>
       </div>
 
@@ -561,10 +628,16 @@ export default function Network() {
               onVerifyPassCode={handleVerify}
               onRejectIncoming={handleRejectIncoming}
               onSendFile={handleSendFile}
+              onSendFileToAll={handleSendFileToAll}
             />
           )}
           {activeTab === 'tasks' && (
-            <TaskPanel transfers={store.transfers} />
+            <TaskPanel
+              transfers={store.transfers}
+              onPause={(id) => store.pauseTransfer(id)}
+              onResume={(id, peerId) => store.resumeTransfer(id, peerId)}
+              onCancel={(id) => store.cancelTransferAction(id)}
+            />
           )}
         </div>
 

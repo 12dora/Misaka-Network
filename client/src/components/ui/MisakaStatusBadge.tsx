@@ -9,6 +9,7 @@ const config: Record<NodeStatus, { color: string; label: string }> = {
   online:        { color: 'var(--state-success)', label: '脑波同步中' },
   transferring:  { color: 'var(--accent-cyan)',   label: '数据流注入中' },
   connecting:    { color: 'var(--state-warn)',    label: '信道协商中' },
+  reconnecting:  { color: 'var(--state-warn)',    label: '重新协商中' },
   unauthorized:  { color: 'var(--state-danger)',  label: '通行码错误' },
   offline:       { color: 'var(--text-muted)',    label: '通信终止' },
 }

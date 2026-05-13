@@ -33,7 +33,7 @@ ACGN            世界观 + 角色档案 + 彩蛋 + 致敬声明
 | QR | `qrcode` 生成 / BarcodeDetector + jsQR 降级 |
 | 本地存储 | IndexedDB (`idb`) |
 | 信令 | Node.js + `ws` 单文件 |
-| 部署 | 前端 Cloudflare Pages / Vercel；信令 Fly.io / Railway |
+| 部署 | 前端 GitHub Pages；信令 Railway / 自托管 |
 
 ## 核心交互流程
 

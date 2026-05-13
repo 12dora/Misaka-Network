@@ -31,3 +31,36 @@ startCleanupTask()
 httpServer.listen(PORT, () => {
   console.log(`御坂信令服务器 listening on :${PORT}`)
 })
+
+// Graceful shutdown: notify all connected nodes before exiting
+function gracefulShutdown(signal: string) {
+  console.log(`\n收到 ${signal}，正在通知所有节点并关闭...`)
+
+  // 1. Broadcast SHUTDOWN to every connected client
+  const shutdownMsg = JSON.stringify({ t: 'SERVER_SHUTDOWN', reason: '服务器维护中，请稍后重连' })
+  for (const client of wss.clients) {
+    if (client.readyState === 1) {
+      client.send(shutdownMsg)
+    }
+  }
+
+  // 2. Close all WS connections with code 1001 (going away)
+  for (const client of wss.clients) {
+    client.close(1001, 'SERVER_SHUTDOWN')
+  }
+
+  // 3. Stop accepting new connections, then exit
+  httpServer.close(() => {
+    console.log('信令服务器已安全关闭')
+    process.exit(0)
+  })
+
+  // Force exit after 5s if connections don't drain
+  setTimeout(() => {
+    console.log('强制退出')
+    process.exit(1)
+  }, 5000)
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
+process.on('SIGINT', () => gracefulShutdown('SIGINT'))
