@@ -111,7 +111,7 @@ function PasscodeCard({ visible, animated, idx }: { visible: boolean; animated: 
         padding="md"
         className="flex flex-col items-center text-center hover:-translate-y-1 hover:shadow-float transition-all duration-200"
         style={{
-          opacity: visible ? undefined : 0,
+          opacity: !visible ? 0 : animated ? 0 : undefined,
           animation: animated ? `card-in 0.45s ease ${idx * 0.1}s forwards` : 'none',
         }}
       >
@@ -139,8 +139,8 @@ function PasscodeCard({ visible, animated, idx }: { visible: boolean; animated: 
       padding="md"
       className="flex flex-col items-center text-center"
       style={{
-        opacity: visible ? undefined : 0,
-        animation: visible ? `card-in 0.45s ease ${idx * 0.1}s forwards` : 'none',
+        opacity: !visible ? 0 : animated ? 0 : undefined,
+        animation: animated ? `card-in 0.45s ease ${idx * 0.1}s forwards` : 'none',
       }}
     >
       <PasscodeIcon />
@@ -244,7 +244,7 @@ export default function QuickJoin() {
           padding="md"
           className="flex flex-col items-center text-center hover:-translate-y-1 hover:shadow-float transition-all duration-200"
           style={{
-            opacity: visible ? undefined : 0,
+            opacity: !visible ? 0 : animated ? 0 : undefined,
             animation: animated ? 'card-in 0.45s ease 0s forwards' : 'none',
           }}
         >
@@ -268,7 +268,7 @@ export default function QuickJoin() {
           padding="md"
           className="flex flex-col items-center text-center hover:-translate-y-1 hover:shadow-float transition-all duration-200"
           style={{
-            opacity: visible ? undefined : 0,
+            opacity: !visible ? 0 : animated ? 0 : undefined,
             animation: animated ? 'card-in 0.45s ease 0.2s forwards' : 'none',
           }}
         >

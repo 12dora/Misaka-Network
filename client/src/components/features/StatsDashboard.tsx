@@ -88,7 +88,7 @@ export default function StatsDashboard() {
               padding="md"
               className="group hover:-translate-y-1 hover:shadow-float transition-all duration-200 cursor-default"
               style={{
-                opacity: visible ? undefined : 0,
+                opacity: !visible ? 0 : animated ? 0 : undefined,
                 animation: animated ? `card-in 0.45s ease ${idx * 0.07}s forwards` : 'none',
               }}
             >
