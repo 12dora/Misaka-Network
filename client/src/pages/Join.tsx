@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import { useAuthStore } from '@/store/auth'
+import { apiUrl } from '@/config'
 
 export default function Join() {
   const [params] = useSearchParams()
@@ -57,7 +58,7 @@ export default function Join() {
 
       // Call qr-redeem
       try {
-        const res = await fetch('/api/qr-redeem', {
+        const res = await fetch(apiUrl('/api/qr-redeem'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),

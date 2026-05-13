@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useHomeStore } from '@/store/home'
 import MisakaCard from '@/components/ui/MisakaCard'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
@@ -30,6 +30,7 @@ const STAT_CARDS = [
 export default function StatsDashboard() {
   const { stats, fetchStats } = useHomeStore()
   const [visible, setVisible] = useState(false)
+  const [animated, setAnimated] = useState(false)
   const gridRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -38,11 +39,25 @@ export default function StatsDashboard() {
     return () => clearInterval(timer)
   }, [fetchStats])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const el = gridRef.current
     if (!el) return
+
+    const rect = el.getBoundingClientRect()
+    if (rect.top < window.innerHeight && rect.bottom > 0) {
+      // Already in viewport — show immediately, no entrance animation
+      setVisible(true)
+      return
+    }
+
     const observer = new IntersectionObserver(
-      ([entry]) => { if (entry.isIntersecting) { setVisible(true); observer.disconnect() } },
+      ([entry]) => {
+        if (entry.isIntersecting) {
+          setVisible(true)
+          setAnimated(true)
+          observer.disconnect()
+        }
+      },
       { threshold: 0.1 }
     )
     observer.observe(el)
@@ -74,7 +89,7 @@ export default function StatsDashboard() {
               className="group hover:-translate-y-1 hover:shadow-float transition-all duration-200 cursor-default"
               style={{
                 opacity: visible ? undefined : 0,
-                animation: visible ? `card-in 0.45s ease ${idx * 0.07}s forwards` : 'none',
+                animation: animated ? `card-in 0.45s ease ${idx * 0.07}s forwards` : 'none',
               }}
             >
               <div className="flex items-start justify-between mb-3">
