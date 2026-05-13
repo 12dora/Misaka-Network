@@ -4,8 +4,8 @@ import StatsDashboard from '@/components/features/StatsDashboard'
 import ActivityStream from '@/components/features/ActivityStream'
 import QuickJoin from '@/components/features/QuickJoin'
 
-const HERO_CHARACTER = '/assets/misaka.webp'
-const HERO_TITLE     = '/assets/misaka-title.webp'
+const HERO_CHARACTER = import.meta.env.BASE_URL + 'assets/misaka.webp'
+const HERO_TITLE     = import.meta.env.BASE_URL + 'assets/misaka-title.webp'
 
 export default function Home() {
   const isConnected = useAuthStore(s => s.isConnected)
