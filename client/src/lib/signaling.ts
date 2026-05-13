@@ -14,17 +14,17 @@ let reconnectAttempts = 0
 
 export function onMessage(handler: MessageHandler) {
   handlers.add(handler)
-  return () => handlers.delete(handler)
+  return () => { handlers.delete(handler) }
 }
 
 export function onConnect(handler: ConnectionHandler) {
   connectHandlers.add(handler)
-  return () => connectHandlers.delete(handler)
+  return () => { connectHandlers.delete(handler) }
 }
 
 export function onDisconnect(handler: ConnectionHandler) {
   disconnectHandlers.add(handler)
-  return () => disconnectHandlers.delete(handler)
+  return () => { disconnectHandlers.delete(handler) }
 }
 
 export function connect(t: string) {
