@@ -70,13 +70,13 @@
 - ☑ 致敬声明页脚
 
 ### QR 系统（参考 08-qr-system.md）
-- ☐ QR 生成（节点 QR）
-- ☐ 显示我的 QR 弹窗
-- ☐ 扫码 UI（BarcodeDetector）
-- ☐ jsQR 降级
-- ☐ 自动接入流程
-- ☐ 文件 QR
-- ☐ 批次 QR
+- ☑ QR 生成（节点 QR）
+- ☑ 显示我的 QR 弹窗
+- ☑ 扫码 UI（BarcodeDetector）
+- ☑ jsQR 降级
+- ☑ 自动接入流程
+- ☑ 文件 QR
+- ☑ 批次 QR
 
 ### TURN 设置（参考 09-turn-settings.md）
 - ☐ 设置页 UI
@@ -93,13 +93,13 @@
 
 ## 当前会话焦点
 
-WebRTC 传输层完成：Peer 工厂 → DataChannel → 分片 → ACK → hash 校验 → IndexedDB → 断点续传 → AES-GCM
+QR 系统完成：QR 生成（节点/文件/批次）+ 扫码（BarcodeDetector/jsQR）+ 自动接入流程
 
 ## 已知问题
 
 - WebRTC 信令需两端同时在线端到端测试
 - 接收端 DataChannel 消息监听器有重复绑定风险（已通过 addEventListener + onmessage 规避）
-- QR 系统 / TURN 设置 / 黑名单 / ToS 尚未实现
+- TURN 设置 / 黑名单 / ToS 尚未实现
 
 ## 决策记录
 

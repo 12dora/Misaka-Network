@@ -2,6 +2,8 @@ import { useState } from 'react'
 import { Link, useLocation } from 'react-router-dom'
 import { useAuthStore } from '@/store/auth'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
+import QRModal from '@/components/features/QRModal'
+import ScanModal from '@/components/features/ScanModal'
 
 const LINKS = [
   { to: '/',        label: '首页',  kanji: '首' },
@@ -12,7 +14,10 @@ const LINKS = [
 export default function TopNav() {
   const location   = useLocation()
   const isConnected = useAuthStore(s => s.isConnected)
+  const identity    = useAuthStore(s => s.identity)
   const [menuOpen, setMenuOpen] = useState(false)
+  const [showQR, setShowQR]     = useState(false)
+  const [showScan, setShowScan] = useState(false)
 
   function isActive(to: string) {
     return to === '/' ? location.pathname === '/' : location.pathname.startsWith(to)
@@ -53,8 +58,19 @@ export default function TopNav() {
           ))}
         </div>
 
-        {/* Right: status + mobile menu */}
+        {/* Right: QR / scan / status / mobile menu */}
         <div className="flex items-center gap-3">
+          {isConnected && (
+            <>
+              <button className="nav-pill text-sm !px-3" onClick={() => setShowQR(true)}>
+                🔲 我的 QR
+              </button>
+              <button className="nav-pill text-sm !px-3" onClick={() => setShowScan(true)}>
+                📷 扫描
+              </button>
+            </>
+          )}
+
           {/* Status */}
           <span className="flex items-center gap-1.5 text-xs font-mono text-[var(--text-on-blue-2)]">
             <span
@@ -126,7 +142,29 @@ export default function TopNav() {
               </div>
             </Link>
           ))}
+          {isConnected && (
+            <div className="flex gap-2 p-4">
+              <button className="nav-pill text-sm flex-1" onClick={() => { setMenuOpen(false); setShowQR(true) }}>
+                🔲 我的 QR
+              </button>
+              <button className="nav-pill text-sm flex-1" onClick={() => { setMenuOpen(false); setShowScan(true) }}>
+                📷 扫描
+              </button>
+            </div>
+          )}
         </div>
+      )}
+
+      {/* Modals */}
+      {showQR && (
+        <QRModal
+          nodeId={identity.nodeId}
+          passCode={identity.passCode}
+          onClose={() => setShowQR(false)}
+        />
+      )}
+      {showScan && (
+        <ScanModal onClose={() => setShowScan(false)} />
       )}
     </>
   )
