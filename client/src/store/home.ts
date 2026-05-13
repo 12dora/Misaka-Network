@@ -4,10 +4,12 @@ import { apiUrl } from '@/config'
 
 const EMPTY_STATS: NetworkStats = {
   onlineNodes: 0,
+  peakConcurrent: 0,
   totalTransfers: 0,
   totalBytes: 0,
   activeChannels: 0,
   uptimeLongestMs: 0,
+  uptimeSeconds: 0,
   cpuLoadPercent: 0,
 }
 

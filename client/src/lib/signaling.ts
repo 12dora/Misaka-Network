@@ -11,6 +11,7 @@ let disconnectHandlers = new Set<ConnectionHandler>()
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 let token = ''
 let reconnectAttempts = 0
+let serverShutdown = false
 
 export function onMessage(handler: MessageHandler) {
   handlers.add(handler)
@@ -30,6 +31,7 @@ export function onDisconnect(handler: ConnectionHandler) {
 export function connect(t: string) {
   token = t
   reconnectAttempts = 0
+  serverShutdown = false
   doConnect()
 }
 
@@ -56,6 +58,7 @@ function doConnect() {
   ws.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data as string) as WSServerMessage
+      if (msg.t === 'SERVER_SHUTDOWN') serverShutdown = true
       handlers.forEach(h => h(msg))
     } catch {
       // ignore invalid messages
@@ -64,7 +67,7 @@ function doConnect() {
 }
 
 function scheduleReconnect() {
-  if (reconnectTimer) return
+  if (reconnectTimer || serverShutdown) return
   const delays = [1000, 2000, 4000, 8000, 16000] // max 5 attempts with exponential backoff
   const delay = delays[Math.min(reconnectAttempts, delays.length - 1)]
   reconnectAttempts++
@@ -72,6 +75,17 @@ function scheduleReconnect() {
     reconnectTimer = null
     doConnect()
   }, delay)
+}
+
+// Network change auto-reconnect
+if (typeof window !== 'undefined') {
+  window.addEventListener('online', () => {
+    if (token && !isConnected()) {
+      reconnectAttempts = 0
+      serverShutdown = false
+      doConnect()
+    }
+  })
 }
 
 export function disconnect() {

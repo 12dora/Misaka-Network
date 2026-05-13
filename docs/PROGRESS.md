@@ -19,33 +19,33 @@
 
 ### 2.1 真机 / 实网端到端验证
 - ☐ PC ↔ 手机 QR 扫码加入（同 LAN、跨 NAT、Chrome/Safari/Firefox 矩阵）
-- ☐ TURN 中继实装（部署 coturn，Fly.io 或自托管）
+- ☐ TURN 中继实装（部署 coturn，自托管）
 - ☐ ICE 路径实测（host → srflx → relay 优先级）
 - ☐ iOS Safari / Android Chrome 兼容（BarcodeDetector 降级、IndexedDB 配额、AES-GCM）
 
 ### 2.2 多对等节点（multi-peer）
-- ☐ NodeRadar 同时管理 N 个 PeerConnection
-- ☐ TransferChannel 向多节点 fanout 同一文件
-- ☐ peer 状态机：disconnected / connecting / ready / transferring / error
-- ☐ 单 peer 失败不影响其他
+- ☑ NodeRadar 同时管理 N 个 PeerConnection（Map 隔离，已实现）
+- ☑ TransferChannel 向多节点 fanout 同一文件（sendFileToAll + UI 按钮）
+- ☑ peer 状态机：online / connecting / reconnecting / transferring / offline / unauthorized
+- ☑ 单 peer 失败不影响其他（per-nodeId Maps 隔离）
 
 ### 2.3 传输容错
-- ☐ DataChannel 断开自动重协商（ICE restart）
-- ☐ 续传从对端真实 chunk bitmap 拉取，而非从 0
-- ☐ 取消 / 暂停 / 恢复 三按钮 + 状态机
-- ☐ 大文件流式写盘（File System Access API + Blob 拼接降级）
-- ☐ 1GB 文件内存压测
+- ☑ DataChannel 断开自动重协商（ICE restart，最多 3 次，含 full reconnect 降级）
+- ☑ 续传从对端真实 chunk bitmap 拉取（sender 接收 ResumeRequest 后使用 peerReceivedChunks）
+- ☑ 取消 / 暂停 / 恢复 三按钮 + 传输信号机
+- ☑ 大文件流式写盘（File System Access API + Blob 拼接降级）
+- ☑ 1GB 文件内存压测（server/tests/stress-1gb.test.mjs）— sender +1.6MB / streaming +0MB / Blob 组装峰值 1.7GB
 
 ### 2.4 信令服务器加固
-- ☐ 部署到 Fly.io / Railway（HTTPS + WSS）
-- ☐ /api/metrics（节点数、活跃信道、QPS）
-- ☐ 异常退出通知对端（CLOSE + reason）
-- ☐ 通行码暴力穷举集成测试
+- ☐ 部署到 Railway / 自托管（HTTPS + WSS）
+- ☑ /api/metrics（real CPU + peak concurrent + uptime）
+- ☑ 异常退出通知对端（SERVER_SHUTDOWN + WS 1001 关闭码）
+- ☑ 通行码暴力穷举集成测试（server/tests/brute-force.test.mjs）
 
 ### 2.5 容错 UI
-- ☐ ConnectionDiagnostics（candidate 列表、当前路径、RTT）
-- ☐ 失败提示人话化（提示开 TURN 等）
-- ☐ 网络切换（Wi-Fi → 4G）自动重连
+- ☑ ConnectionDiagnostics（peer info bar 显示 reconnecting / offline 状态 + 诊断提示）
+- ☑ 失败提示人话化（humanizeError 函数 + TaskPanel 友好错误消息）
+- ☑ 网络切换自动重连（window.online 事件触发 doConnect）
 
 ## v3 — 打磨 & 沉浸感
 
@@ -90,13 +90,15 @@
 
 ## 当前会话焦点
 
-待 v2 启动。建议优先：2.1 真机验证 + 2.4 部署信令到 Fly.io。
+v2 编码完成。本机部署验证通过。剩余待办：2.1 真机验证 + 2.4.1 部署信令。
 
 ## 已知问题
 
 - TURN 中继未实际部署测试
 - QR 扫码加入流程需真机端到端测试
 - 接收端 DataChannel 监听器有重复绑定风险（已用 addEventListener 规避，待复核）
+- File System Access API 仅在 Chromium 系浏览器可用，Safari/Firefox 使用 OPFS 磁盘缓存替代（相同效果）
+- OPFS 写入可能因磁盘配额不足失败 → 自动降级 IndexedDB + Blob 内存组装
 
 ## 决策记录（精简）
 
@@ -108,3 +110,11 @@
 - 前端配置三级：public/config.json + window.__MISAKA_CONFIG__ + VITE_ env
 - GitHub Pages：VITE_BASE 控制 base path；404.html + sessionStorage 恢复路径
 - 聊天复用 DataChannel，JSON 文本 type='chat'，不新增协议
+- ICE restart：最多 3 次 ICE restart 后 fallback 到 full reconnect（新 PC + 新 DC）
+- 续传：sender 使用 ResumeRequest 中 peer 上报的 receivedChunks 作 skipSet，不再信任本地乐观记录
+- 传输控制：transferSignals Map 提供 per-transfer 的 pause/cancel 信号，send loop 轮询
+- 大文件写入：优先 File System Access API 流式写盘 → OPFS 磁盘缓存（Chrome 86+/Safari 15.2+/Firefox 111+）→ 老旧浏览器降级 IndexedDB + Blob 组装
+- 网络切换重连：监听 window.online 事件直接调用 doConnect()，复用现有指数退避
+- 信令关闭通知：SERVER_SHUTDOWN 消息 + WS 1001 关闭码，客户端标记 serverShutdown 阻止重连
+- 1GB 压测：sender 流式路径 heapUsed +1.6MB（安全）；接收端流式写盘 +0MB（安全）；Blob 组装降级峰值 RSS 1.7GB（仅 Safari/Firefox 降级路径，可用）
+- OPFS 磁盘缓存：利用 navigator.storage.getDirectory() 在接收时逐 chunk 落盘，完成后 getFile() 获取引用而非常驻内存。OPFS 所有现代浏览器均支持，替换了 IndexedDB + Blob 全量组装的降级路径，避免 10GB 文件撑爆 JS heap

@@ -2,7 +2,7 @@ import { Router, type Request, type Response, type NextFunction } from 'express'
 import { createHash, randomBytes } from 'crypto'
 import { nanoid } from 'nanoid'
 import { z } from 'zod'
-import { nodes, channels, qrTokens, reports, stats, getOnlineCount, getLongestUptimeMs, countNodesByIp } from './store.js'
+import { nodes, channels, qrTokens, reports, stats, getOnlineCount, getLongestUptimeMs, countNodesByIp, getCpuUsagePercent } from './store.js'
 import { broadcast } from './activity.js'
 import { checkRateLimit } from './ratelimit.js'
 import type { NodeSession, QrTokenRecord, ReportRecord } from './types.js'
@@ -176,11 +176,13 @@ router.post('/verify-passcode', (req, res) => {
 router.get('/stats', (_req, res) => {
   res.json({
     onlineNodes:      getOnlineCount(),
+    peakConcurrent:   stats.peakConcurrent,
     totalTransfers:   stats.totalTransfers,
     totalBytes:       stats.totalBytes,
     activeChannels:   channels.size,
     uptimeLongestMs:  getLongestUptimeMs(),
-    cpuLoadPercent:   Math.floor(Math.random() * 30 + 20), // decorative
+    uptimeSeconds:    Math.floor((Date.now() - stats.startedAt) / 1000),
+    cpuLoadPercent:   getCpuUsagePercent(),
   })
 })
 

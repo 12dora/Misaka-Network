@@ -119,7 +119,7 @@ interface NodeSession {
 
 ## 部署
 
-Fly.io / Railway / Render。端口 8080。环境变量：
+Railway / Render / 自托管。端口 8080。环境变量：
 - `PORT`
 - `STUN_ONLY=true` 禁用 WebSocket 中继
 - `MAX_NODES` 节点上限

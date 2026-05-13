@@ -18,13 +18,24 @@ function formatDuration(ms: number) {
   return `${h}h ${m}m`
 }
 
+function formatUptime(sec: number) {
+  if (sec === 0) return '—'
+  const d = Math.floor(sec / 86400)
+  const h = Math.floor((sec % 86400) / 3600)
+  if (d > 0) return `${d}d ${h}h`
+  const m = Math.floor((sec % 3600) / 60)
+  if (h > 0) return `${h}h ${m}m`
+  return `${m}m`
+}
+
 const STAT_CARDS = [
   { kanji: '同', label: '在线实验体数',     furigana: 'オンライン数',   key: 'onlineNodes',      format: (v: number) => v.toLocaleString(),    unit: '节点' },
+  { kanji: '峰', label: '峰值并发连接',     furigana: 'ピーク同時接続', key: 'peakConcurrent',   format: (v: number) => v.toLocaleString(),    unit: '节点' },
   { kanji: '流', label: '累计脑波同步次数', furigana: '累計シンクロ数', key: 'totalTransfers',   format: (v: number) => v.toLocaleString(),    unit: '次' },
   { kanji: '量', label: '累计数据通量',     furigana: '累積データ量',   key: 'totalBytes',       format: (v: number) => formatBytes(v),        unit: '' },
   { kanji: '链', label: '当前活跃信道',     furigana: '活性チャンネル', key: 'activeChannels',   format: (v: number) => v.toLocaleString(),    unit: '条' },
-  { kanji: '域', label: '节点覆盖区域',     furigana: 'ノードカバー範囲', key: 'onlineNodes',    format: (v: number) => Math.min(v, 30).toString(), unit: '区域' },
-  { kanji: '稳', label: '最长稳定时长',     furigana: '最長稼働時間',   key: 'uptimeLongestMs', format: (v: number) => formatDuration(v),      unit: '' },
+  { kanji: '稳', label: '最长节点在线',     furigana: '最長ノード稼働', key: 'uptimeLongestMs', format: (v: number) => formatDuration(v),      unit: '' },
+  { kanji: '時', label: '信令服务运行时间', furigana: 'サーバー稼働時間', key: 'uptimeSeconds',  format: (v: number) => formatUptime(v),        unit: '' },
 ]
 
 export default function StatsDashboard() {

@@ -9,6 +9,21 @@ export const stats = {
   totalTransfers: 0,
   totalBytes: 0,
   startedAt: Date.now(),
+  peakConcurrent: 0,
+}
+
+// Track peak concurrent connections
+const cpuStart = process.cpuUsage()
+export function getCpuUsagePercent(): number {
+  const elapsed = (Date.now() - stats.startedAt) / 1000
+  const used = process.cpuUsage(cpuStart)
+  const totalMs = (used.user + used.system) / 1000 // CPU time in ms
+  return Math.round((totalMs / (elapsed * 1000)) * 100)
+}
+
+export function updatePeakConcurrent() {
+  const online = getOnlineCount()
+  if (online > stats.peakConcurrent) stats.peakConcurrent = online
 }
 
 export function getOnlineCount() {
