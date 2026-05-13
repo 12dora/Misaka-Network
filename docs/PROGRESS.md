@@ -79,27 +79,27 @@
 - ☑ 批次 QR
 
 ### TURN 设置（参考 09-turn-settings.md）
-- ☐ 设置页 UI
-- ☐ TURN 配置 localStorage
-- ☐ 连接测试功能
-- ☐ 集成到 ICE 配置
+- ☑ 设置页 UI
+- ☑ TURN 配置 localStorage
+- ☑ 连接测试功能
+- ☑ 集成到 ICE 配置
 
 ### 安全（参考 10-security-privacy.md）
 - ☑ 通行码 hash
 - ☑ 节点锁定机制
-- ☐ 黑名单 localStorage（客户端）
+- ☑ 黑名单 localStorage
 - ☑ 上报接口
-- ☐ ToS / Privacy 页（客户端）
+- ☑ ToS / Privacy 页
 
 ## 当前会话焦点
 
-QR 系统完成：QR 生成（节点/文件/批次）+ 扫码（BarcodeDetector/jsQR）+ 自动接入流程
+TURN 设置 + 安全收尾：设置页 UI + 黑名单 + ToS/Privacy 页 — MVP v1 全部完成
 
 ## 已知问题
 
 - WebRTC 信令需两端同时在线端到端测试
 - 接收端 DataChannel 消息监听器有重复绑定风险（已通过 addEventListener + onmessage 规避）
-- TURN 设置 / 黑名单 / ToS 尚未实现
+- TURN 中继未实际部署测试
 
 ## 决策记录
 
