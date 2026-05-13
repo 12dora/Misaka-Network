@@ -1,129 +1,110 @@
 # 开发进度追踪
 
-> **本文件由编码 AI 维护**。每次会话开始时读取，结束前更新。
-> 
-> 规则：保持简洁。每个模块用 ☐/◐/☑ 标记。不要写长篇日志，只写「现在到哪了」。
+> 本文件由编码 AI 维护。每次会话开始读，结束前更新。
+> ☐ 未开始 / ◐ 进行中 / ☑ 已完成。只写「现在到哪了」，不写日志。
 
 ## 当前里程碑
 
-**MVP v1**
+**v2 — 生产就绪 & 鲁棒性**
 
-## 整体进度
+## v1 — MVP（完成）
 
-### 项目初始化
-- ☑ 信令服务器项目脚手架（Node.js + ws）
-- ☑ 前端项目脚手架（Vite + React + TS + Tailwind）
-- ☑ 设计 token 配置（颜色/字体/间距）
-- ☑ 基础 UI 组件库（MisakaButton/Card/Input/KanjiBlock/ProgressBar/StatusBadge）
-- ☑ 路由配置
+☑ 信令服务器 / 身份 / 首页 / 网络页 / WebRTC 传输（加密 + 续传） / ACGN / QR 三类 / TURN 设置 / 安全（通行码 hash、黑名单、上报、ToS&Privacy） / 聊天 / GitHub Pages 部署
 
-### 信令服务器（参考 07-signaling-server.md）
-- ☑ REST `/api/register`
-- ☑ REST `/api/release`
-- ☑ REST `/api/verify-passcode`
-- ☑ REST `/api/stats`
-- ☑ WebSocket 鉴权与 JOIN_CHANNEL
-- ☑ SIGNAL_SDP / SIGNAL_ICE 转发
-- ☑ 活动流广播
-- ☑ QR token 接口（/api/qr-token, /api/qr-redeem）
-- ☑ 30 分钟会话清理任务
-- ☑ 限流与防护
+> 详细模块勾选见 git log d858a4e 之前。代码已落地，未真机验证。
 
-### 身份系统（参考 05-auth-identity.md）
-- ☑ 客户端身份生成
-- ☑ sessionStorage 持久化
-- ☑ 编号冲突重试
-- ☑ 通行码错误锁定（服务端）
-- ☑ 会话恢复
+## v2 — 生产就绪 & 鲁棒性
 
-### 首页（参考 02-pages-home.md）
-- ☑ TopNav
-- ☑ LoginCard（未登录态）
-- ☑ LoginCard（已登录态）
-- ☑ StatsDashboard
-- ☑ ActivityStream
-- ☑ QuickJoin
+☑ QA bug 修复完成（BUG-1 ~ BUG-8）— 见 docs/bug.md
 
-### 网络页（参考 03-pages-network.md）
-- ☑ 三栏布局框架
-- ☑ NodeRadar
-- ☑ TransferChannel（拖拽 + 选择文件）
-- ☑ TaskPanel
-- ☑ 接收确认 Modal
-- ☑ 移动端 Tab 布局
+### 2.1 真机 / 实网端到端验证
+- ☐ PC ↔ 手机 QR 扫码加入（同 LAN、跨 NAT、Chrome/Safari/Firefox 矩阵）
+- ☐ TURN 中继实装（部署 coturn，Fly.io 或自托管）
+- ☐ ICE 路径实测（host → srflx → relay 优先级）
+- ☐ iOS Safari / Android Chrome 兼容（BarcodeDetector 降级、IndexedDB 配额、AES-GCM）
 
-### WebRTC 传输（参考 06-webrtc-transfer.md）
-- ☑ Peer connection 工厂
-- ☑ DataChannel 建立
-- ☑ 文件分片发送
-- ☑ chunk 接收 + ACK
-- ☑ 整文件 hash 校验
-- ☑ IndexedDB 进度持久化
-- ☑ 断点续传
-- ☑ AES-GCM 应用层加密
+### 2.2 多对等节点（multi-peer）
+- ☐ NodeRadar 同时管理 N 个 PeerConnection
+- ☐ TransferChannel 向多节点 fanout 同一文件
+- ☐ peer 状态机：disconnected / connecting / ready / transferring / error
+- ☐ 单 peer 失败不影响其他
 
-### ACGN 页（参考 04-pages-acgn.md）
-- ☑ 静态文案
-- ☑ 角色卡片
-- ☑ 妹妹语录生成器
-- ☑ 实验体编号查询
-- ☑ 致敬声明页脚
+### 2.3 传输容错
+- ☐ DataChannel 断开自动重协商（ICE restart）
+- ☐ 续传从对端真实 chunk bitmap 拉取，而非从 0
+- ☐ 取消 / 暂停 / 恢复 三按钮 + 状态机
+- ☐ 大文件流式写盘（File System Access API + Blob 拼接降级）
+- ☐ 1GB 文件内存压测
 
-### QR 系统（参考 08-qr-system.md）
-- ☑ QR 生成（节点 QR）
-- ☑ 显示我的 QR 弹窗
-- ☑ 扫码 UI（BarcodeDetector）
-- ☑ jsQR 降级
-- ☑ 自动接入流程
-- ☑ 文件 QR
-- ☑ 批次 QR
+### 2.4 信令服务器加固
+- ☐ 部署到 Fly.io / Railway（HTTPS + WSS）
+- ☐ /api/metrics（节点数、活跃信道、QPS）
+- ☐ 异常退出通知对端（CLOSE + reason）
+- ☐ 通行码暴力穷举集成测试
 
-### TURN 设置（参考 09-turn-settings.md）
-- ☑ 设置页 UI
-- ☑ TURN 配置 localStorage
-- ☑ 连接测试功能
-- ☑ 集成到 ICE 配置
+### 2.5 容错 UI
+- ☐ ConnectionDiagnostics（candidate 列表、当前路径、RTT）
+- ☐ 失败提示人话化（提示开 TURN 等）
+- ☐ 网络切换（Wi-Fi → 4G）自动重连
 
-### 安全（参考 10-security-privacy.md）
-- ☑ 通行码 hash
-- ☑ 节点锁定机制
-- ☑ 黑名单 localStorage
-- ☑ 上报接口
-- ☑ ToS / Privacy 页
+## v3 — 打磨 & 沉浸感
 
-### 聊天系统
-- ☑ DataChannel 文本消息收发
-- ☑ 会话信道 UI 绑定
-- ☑ 消息时间戳与自动滚动
+### 3.1 NodeRadar 可视化
+- ☐ Canvas 极坐标雷达（替换列表）
+- ☐ 距离 = ICE RTT，角度 = 节点编号 mod 360
+- ☐ 扫描线（节制，不走赛博风）
+- ☐ Hover peer 详情卡
 
-### GitHub Pages 部署
-- ☑ 运行时配置文件（public/config.json + src/config.ts）
-- ☑ Vite base 路径支持
-- ☑ SPA 路由回退（404.html → sessionStorage 恢复）
-- ☑ GitHub Actions 自动部署（push → gh-pages）
+### 3.2 传输历史
+- ☐ IndexedDB schema：transfers 表
+- ☐ Network 页「历史」Tab
+- ☐ 再传 / 查看本地副本 / 删除
+- ☐ 隐私开关：关闭记录
+
+### 3.3 PWA
+- ☐ Service Worker（app shell 离线）
+- ☐ Manifest + 图标
+- ☐ Installable 提示
+- ☐ Background Sync 评估
+
+### 3.4 主题 & 视觉
+- ☐ 浅 / 深 / 妹妹色三主题
+- ☐ 设置面板主题切换
+- ☐ Reduced-motion 兼容
+- ☐ 字体子集化
+
+### 3.5 彩蛋 & 沉浸
+- ☐ 关键编号（10032 / 9982 / 20001）特殊提示
+- ☐ 妹妹语录穿插 ActivityStream
+- ☐ 音效（扫码 / 完成 / 错误，可关）
+- ☐ ACGN 世界观长文 + 时间线
+
+### 3.6 i18n（可选）
+- ☐ 中 / 日 / 英
+- ☐ 设计 token 术语表分语言
+
+### 3.7 性能
+- ☐ 路由级懒加载 + bundle 拆分
+- ☐ Lighthouse 90+
+- ☐ 大文件 hash 走 Web Worker
 
 ## 当前会话焦点
 
-Bug 修复：通行码 UX + 对等节点发现（通行码 hash channel）+ TopNav 权限 + 卡片闪烁修复 + 聊天系统 + GitHub Pages 部署 — MVP v1 打磨
+待 v2 启动。建议优先：2.1 真机验证 + 2.4 部署信令到 Fly.io。
 
 ## 已知问题
 
-- 接收端 DataChannel 消息监听器有重复绑定风险（已通过 addEventListener + onmessage 规避）
 - TURN 中继未实际部署测试
-- QR 扫码加入流程需端到端测试（需两端在同一局域网或 TURN）
+- QR 扫码加入流程需真机端到端测试
+- 接收端 DataChannel 监听器有重复绑定风险（已用 addEventListener 规避，待复核）
 
-## 决策记录
+## 决策记录（精简）
 
-- 2026-05-12: 采用 ws 而非 socket.io，减少依赖
-- 2026-05-12: chunk size 定为 64KB，平衡内存与吞吐
-- 2026-05-12: 设计 token 用 CSS custom properties + Tailwind extend，而非 Tailwind 原生值
-- 2026-05-12: lore.ts 写死彩蛋数据，无需后端
-- 2026-05-12: 速率限制用滑动窗口（Map<ip, {count, resetAt}>），不引入外部依赖
-- 2026-05-12: 上报记录内存保留 1 小时，不做持久化
-- 2026-05-13: chunk 加密格式 iv(12B) + encrypted 打包为一个 binary message，避免两帧对齐问题
-- 2026-05-13: DataChannel 文本头+二进制体的双消息模式，靠 ordered SCTP 保证顺序
-- 2026-05-13: ECDH 密钥协商在 DataChannel open 后第一个消息交换，30s 超时
-- 2026-05-13: 对等节点发现改为通行码 hash channel（SHA-256(passcode).substring(0,16)），相同通行码自动互发现；QR 码创建专用 channel 覆盖默认值
-- 2026-05-13: 前端配置系统采用 public/config.json + window.__MISAKA_CONFIG__ 运行时覆盖 + VITE_ 环境变量三级优先级，适配 GitHub Pages 无后端场景
-- 2026-05-13: GitHub Pages 部署使用 VITE_BASE 环境变量设置 base path，SPA 路由通过 404.html + sessionStorage 恢复原路径
-- 2026-05-13: 聊天系统复用已建立的 DataChannel，JSON 文本消息 type='chat'，不新增信令协议消息类型
+- ws 而非 socket.io；chunk 64KB；设计 token 走 CSS vars + Tailwind extend
+- 服务端全内存，无持久化；速率限制滑动窗口；上报保留 1h
+- chunk 加密：iv(12B) + ciphertext 单帧；DataChannel 文本头 + 二进制体双消息
+- ECDH 在 DataChannel open 后第一帧交换，30s 超时
+- 对等发现：SHA-256(passcode).slice(0,16) 作 channel；QR 可覆盖
+- 前端配置三级：public/config.json + window.__MISAKA_CONFIG__ + VITE_ env
+- GitHub Pages：VITE_BASE 控制 base path；404.html + sessionStorage 恢复路径
+- 聊天复用 DataChannel，JSON 文本 type='chat'，不新增协议

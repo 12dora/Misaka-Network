@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { useHomeStore } from '@/store/home'
 import { useAuthStore } from '@/store/auth'
-import { wsUrl } from '@/config'
+import { onMessage } from '@/lib/signaling'
 import type { ActivityEvent } from '@/types'
 
 const TYPE_COLOR: Record<ActivityEvent['type'], string> = {
@@ -21,22 +21,11 @@ export default function ActivityStream() {
   const session = useAuthStore(s => s.session)
   const scrollRef = useRef<HTMLDivElement>(null)
 
-  // WebSocket activity subscription
   useEffect(() => {
     if (!session) return
-    const url = `${wsUrl()}?token=${session.token}`
-    const ws = new WebSocket(url)
-
-    ws.onmessage = (evt) => {
-      try {
-        const msg = JSON.parse(evt.data as string)
-        if (msg.t === 'ACTIVITY') {
-          addActivity(msg.event as ActivityEvent)
-        }
-      } catch {}
-    }
-
-    return () => { ws.close() }
+    return onMessage((msg) => {
+      if (msg.t === 'ACTIVITY') addActivity(msg.event as ActivityEvent)
+    })
   }, [session, addActivity])
 
   // Auto scroll to left on new activity

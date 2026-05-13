@@ -42,7 +42,9 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
     if (!session?.token) return
     setLoading(true)
     try {
-      const res = await fetch('/api/qr-token', {
+      const qrUrl = new URL('/api/qr-token', location.origin)
+      if (passCode) qrUrl.searchParams.set('passCode', passCode)
+      const res = await fetch(qrUrl.toString(), {
         headers: { Authorization: `Bearer ${session.token}` },
       })
       if (res.ok) {
