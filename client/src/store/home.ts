@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import type { NetworkStats, ActivityEvent } from '@/types'
+import { apiUrl } from '@/config'
 
 const EMPTY_STATS: NetworkStats = {
   onlineNodes: 0,
@@ -26,7 +27,7 @@ export const useHomeStore = create<HomeState>((set) => ({
   async fetchStats() {
     set({ statsLoading: true })
     try {
-      const res = await fetch('/api/stats')
+      const res = await fetch(apiUrl('/api/stats'))
       if (res.ok) {
         const data = await res.json() as NetworkStats
         set({ stats: data })

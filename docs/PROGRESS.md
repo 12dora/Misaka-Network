@@ -91,15 +91,26 @@
 - ☑ 上报接口
 - ☑ ToS / Privacy 页
 
+### 聊天系统
+- ☑ DataChannel 文本消息收发
+- ☑ 会话信道 UI 绑定
+- ☑ 消息时间戳与自动滚动
+
+### GitHub Pages 部署
+- ☑ 运行时配置文件（public/config.json + src/config.ts）
+- ☑ Vite base 路径支持
+- ☑ SPA 路由回退（404.html → sessionStorage 恢复）
+- ☑ GitHub Actions 自动部署（push → gh-pages）
+
 ## 当前会话焦点
 
-TURN 设置 + 安全收尾：设置页 UI + 黑名单 + ToS/Privacy 页 — MVP v1 全部完成
+Bug 修复：通行码 UX + 对等节点发现（通行码 hash channel）+ TopNav 权限 + 卡片闪烁修复 + 聊天系统 + GitHub Pages 部署 — MVP v1 打磨
 
 ## 已知问题
 
-- WebRTC 信令需两端同时在线端到端测试
 - 接收端 DataChannel 消息监听器有重复绑定风险（已通过 addEventListener + onmessage 规避）
 - TURN 中继未实际部署测试
+- QR 扫码加入流程需端到端测试（需两端在同一局域网或 TURN）
 
 ## 决策记录
 
@@ -112,3 +123,7 @@ TURN 设置 + 安全收尾：设置页 UI + 黑名单 + ToS/Privacy 页 — MVP 
 - 2026-05-13: chunk 加密格式 iv(12B) + encrypted 打包为一个 binary message，避免两帧对齐问题
 - 2026-05-13: DataChannel 文本头+二进制体的双消息模式，靠 ordered SCTP 保证顺序
 - 2026-05-13: ECDH 密钥协商在 DataChannel open 后第一个消息交换，30s 超时
+- 2026-05-13: 对等节点发现改为通行码 hash channel（SHA-256(passcode).substring(0,16)），相同通行码自动互发现；QR 码创建专用 channel 覆盖默认值
+- 2026-05-13: 前端配置系统采用 public/config.json + window.__MISAKA_CONFIG__ 运行时覆盖 + VITE_ 环境变量三级优先级，适配 GitHub Pages 无后端场景
+- 2026-05-13: GitHub Pages 部署使用 VITE_BASE 环境变量设置 base path，SPA 路由通过 404.html + sessionStorage 恢复原路径
+- 2026-05-13: 聊天系统复用已建立的 DataChannel，JSON 文本消息 type='chat'，不新增信令协议消息类型

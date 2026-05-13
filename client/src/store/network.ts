@@ -1,5 +1,6 @@
 import { create } from 'zustand'
-import type { Peer, Transfer, NodeStatus } from '@/types'
+import type { Peer, Transfer, NodeStatus, ChannelMessage } from '@/types'
+import { apiUrl } from '@/config'
 import {
   connect as wsConnect, disconnect as wsDisconnect, send as wsSend,
   onMessage, onConnect, onDisconnect,
@@ -30,23 +31,39 @@ interface PendingRequest {
   requestId: string
 }
 
+async function hashPasscode(passCode: string): Promise<string> {
+  const data = new TextEncoder().encode(passCode)
+  const hash = await crypto.subtle.digest('SHA-256', data)
+  return Array.from(new Uint8Array(hash))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('')
+    .substring(0, 16)
+}
+
+function genMsgId(): string {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+}
+
 interface NetworkState {
   wsConnected: boolean
   channelId: string | null
   peers: Peer[]
   selectedPeerId: number | null
   transfers: Transfer[]
+  chatMessages: Record<number, ChannelMessage[]>
   incomingRequest: PendingRequest | null
   incomingMeta: (MetaMessage & { fromNodeId: number }) | null
   connectedPeers: Set<number>
 
   init: (token: string) => void
   destroy: () => void
+  joinChannel: (channelId: string) => void
   selectPeer: (id: number | null) => void
   requestConnection: (targetNodeId: number) => Promise<void>
   verifyAndConnect: (passCode: string) => Promise<void>
   rejectIncoming: () => void
   sendFile: (file: File) => Promise<void>
+  sendChatMessage: (peerId: number, text: string) => void
   acceptTransfer: () => Promise<void>
   rejectTransfer: () => void
   blockPeer: (nodeId: number) => void
@@ -58,6 +75,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
   peers: [],
   selectedPeerId: null,
   transfers: [],
+  chatMessages: {},
   incomingRequest: null,
   incomingMeta: null,
   connectedPeers: new Set(),
@@ -66,7 +84,25 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     onMessage(async (msg) => {
       switch (msg.t) {
         case 'WELCOME': {
-          const chId = `batch-${msg.myNodeId}-${Date.now()}`
+          // Priority: 1) QR join (scanner), 2) QR owner channel, 3) passcode-derived
+          const joinRaw = sessionStorage.getItem('misaka.join')
+          const qrChId = sessionStorage.getItem('misaka.qrChannel')
+          let chId: string | undefined
+          if (joinRaw) {
+            try {
+              const ctx = JSON.parse(joinRaw) as { channelId?: string }
+              chId = ctx.channelId
+            } catch { /* ignore */ }
+          }
+          if (!chId && qrChId) {
+            chId = qrChId
+            sessionStorage.removeItem('misaka.qrChannel')
+          }
+          if (!chId) {
+            const passCode = useAuthStore.getState().identity.passCode
+            const h = await hashPasscode(passCode || '000000')
+            chId = `cluster-${h}`
+          }
           wsSend({ t: 'JOIN_CHANNEL', channelId: chId })
           set({ wsConnected: true, channelId: chId })
           break
@@ -90,14 +126,18 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
         }
 
         case 'PEER_LEFT': {
-          set(s => ({
-            peers: s.peers.map(p => p.nodeId === msg.nodeId ? { ...p, status: 'offline' as const } : p),
-            connectedPeers: (() => {
-              const next = new Set(s.connectedPeers)
-              next.delete(msg.nodeId)
-              return next
-            })(),
-          }))
+          set(s => {
+            const { [msg.nodeId]: _, ...rest } = s.chatMessages
+            return {
+              peers: s.peers.map(p => p.nodeId === msg.nodeId ? { ...p, status: 'offline' as const } : p),
+              chatMessages: rest,
+              connectedPeers: (() => {
+                const next = new Set(s.connectedPeers)
+                next.delete(msg.nodeId)
+                return next
+              })(),
+            }
+          })
           cleanupPeerConnection(msg.nodeId)
           break
         }
@@ -139,7 +179,12 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
       cleanupPeerConnection(id)
     }
     resetCrypto()
-    set({ wsConnected: false, channelId: null, peers: [], selectedPeerId: null, transfers: [], incomingRequest: null, incomingMeta: null, connectedPeers: new Set() })
+    set({ wsConnected: false, channelId: null, peers: [], selectedPeerId: null, transfers: [], chatMessages: {}, incomingRequest: null, incomingMeta: null, connectedPeers: new Set() })
+  },
+
+  joinChannel(channelId: string) {
+    wsSend({ t: 'JOIN_CHANNEL', channelId })
+    set({ channelId })
   },
 
   selectPeer(id) {
@@ -161,7 +206,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     const req = state.incomingRequest
     if (!req || !auth.session) return
 
-    const res = await fetch('/api/verify-passcode', {
+    const res = await fetch(apiUrl('/api/verify-passcode'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -303,6 +348,24 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
       cancelReceive(meta.transferId)
       set({ incomingMeta: null })
     }
+  },
+
+  sendChatMessage(peerId, text) {
+    const dc = dataChannels.get(peerId)
+    if (!dc || dc.readyState !== 'open') return
+
+    const msg: ChannelMessage = {
+      id: genMsgId(),
+      type: 'text',
+      content: text,
+      timestamp: Date.now(),
+    }
+    dc.send(JSON.stringify({ type: 'chat', id: msg.id, content: msg.content, timestamp: msg.timestamp }))
+
+    set(s => {
+      const msgs = [...(s.chatMessages[peerId] ?? []), msg]
+      return { chatMessages: { ...s.chatMessages, [peerId]: msgs } }
+    })
   },
 
   blockPeer(nodeId) {
@@ -538,6 +601,20 @@ function setupDataChannel(dc: RTCDataChannel, peerNodeId: number) {
 
         if (msg.type === 'chunk') {
           lastChunkHeader = msg as ChunkHeader
+          return
+        }
+
+        if (msg.type === 'chat') {
+          const chatMsg: ChannelMessage = {
+            id: msg.id || genMsgId(),
+            type: 'text',
+            content: msg.content || msg.text || '',
+            timestamp: msg.timestamp || Date.now(),
+          }
+          useNetworkStore.setState(s => {
+            const msgs = [...(s.chatMessages[peerNodeId] ?? []), chatMsg]
+            return { chatMessages: { ...s.chatMessages, [peerNodeId]: msgs } }
+          })
           return
         }
 

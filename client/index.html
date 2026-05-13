@@ -28,6 +28,13 @@
 </head>
 <body>
   <div id="root"></div>
+  <!-- SPA redirect recovery (GitHub Pages 404 → index redirect) -->
+  <script>
+    (function(){
+      var r = sessionStorage.getItem('misaka-redirect');
+      if (r) { sessionStorage.removeItem('misaka-redirect'); history.replaceState(null,'',r); }
+    })();
+  </script>
   <script type="module" src="/src/main.tsx"></script>
 </body>
 </html>

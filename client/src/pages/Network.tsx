@@ -100,6 +100,71 @@ function NodeRadar({ peers, selected, onSelect, onSend }: {
   )
 }
 
+// ── Channel Chat ───────────────────────────────────────────────────
+function ChannelChat({ peerNodeId }: { peerNodeId: number }) {
+  const messages = useNetworkStore(s => s.chatMessages[peerNodeId] ?? [])
+  const bottomRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages])
+
+  return (
+    <div
+      className="border-t p-4 flex flex-col gap-2"
+      style={{ borderColor: 'var(--border-card)', maxHeight: 160, overflowY: 'auto' }}
+    >
+      <div className="font-kanji text-xs font-semibold text-[var(--text-on-white-2)] mb-1">会话信道</div>
+      {messages.length === 0 ? (
+        <div className="font-kanji text-xs text-[var(--text-on-white-2)]">
+          <span className="font-mono mr-2 text-[var(--accent-cyan)]">▸</span>
+          [已连接] 人格连接已建立
+        </div>
+      ) : (
+        messages.map(m => (
+          <div key={m.id} className="font-kanji text-xs text-[var(--text-on-white)]">
+            <span className="font-mono mr-2 text-[var(--accent-cyan)]">▸</span>
+            <span className="text-[var(--text-on-white-2)] text-[10px] mr-1">
+              {new Date(m.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
+            </span>
+            {m.content}
+          </div>
+        ))
+      )}
+      <div ref={bottomRef} />
+    </div>
+  )
+}
+
+function ChatInput({ peerNodeId }: { peerNodeId: number }) {
+  const [text, setText] = useState('')
+  const sendChatMessage = useNetworkStore(s => s.sendChatMessage)
+
+  function handleSend() {
+    if (!text.trim()) return
+    sendChatMessage(peerNodeId, text.trim())
+    setText('')
+  }
+
+  return (
+    <div
+      className="border-t p-3 flex gap-2"
+      style={{ borderColor: 'var(--border-card)', borderRadius: '0 0 1rem 1rem' }}
+    >
+      <input
+        type="text"
+        placeholder="输入消息…"
+        value={text}
+        onChange={e => setText(e.target.value)}
+        onKeyDown={e => { if (e.key === 'Enter') handleSend() }}
+        className="flex-1 px-3 py-2 rounded-lg text-sm font-kanji focus:outline-none"
+        style={{ border: '1px solid var(--border-card)', background: 'var(--surface)', color: 'var(--text-on-white)' }}
+      />
+      <MisakaButton variant="primary" size="sm" onClick={handleSend}>发送</MisakaButton>
+    </div>
+  )
+}
+
 // ── TransferChannel ───────────────────────────────────────────────
 function TransferChannel({
   selectedPeer,
@@ -239,30 +304,10 @@ function TransferChannel({
       </div>
 
       {/* Channel messages */}
-      <div
-        className="border-t p-4 flex flex-col gap-2"
-        style={{ borderColor: 'var(--border-card)', maxHeight: 160, overflowY: 'auto' }}
-      >
-        <div className="font-kanji text-xs font-semibold text-[var(--text-on-white-2)] mb-1">会话信道</div>
-        <div className="font-kanji text-xs text-[var(--text-on-white-2)]">
-          <span className="font-mono mr-2 text-[var(--accent-cyan)]">▸</span>
-          [已连接] 人格连接已建立
-        </div>
-      </div>
+      <ChannelChat peerNodeId={selectedPeer.nodeId} />
 
       {/* Message input */}
-      <div
-        className="border-t p-3 flex gap-2"
-        style={{ borderColor: 'var(--border-card)', borderRadius: '0 0 1rem 1rem' }}
-      >
-        <input
-          type="text"
-          placeholder="输入消息…"
-          className="flex-1 px-3 py-2 rounded-lg text-sm font-kanji focus:outline-none"
-          style={{ border: '1px solid var(--border-card)', background: 'var(--surface)', color: 'var(--text-on-white)' }}
-        />
-        <MisakaButton variant="primary" size="sm">发送</MisakaButton>
-      </div>
+      <ChatInput peerNodeId={selectedPeer.nodeId} />
     </MisakaCard>
   )
 }

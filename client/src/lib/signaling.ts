@@ -1,4 +1,5 @@
 import type { WSServerMessage, WSMessage } from '@/types'
+import { wsUrl } from '@/config'
 
 type MessageHandler = (msg: WSServerMessage) => void
 type ConnectionHandler = () => void
@@ -35,9 +36,7 @@ export function connect(t: string) {
 function doConnect() {
   if (ws?.readyState === WebSocket.OPEN) return
 
-  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const host = import.meta.env.VITE_WS_URL ?? `${protocol}//${location.host}/ws`
-  const url = `${host}?token=${encodeURIComponent(token)}`
+  const url = `${wsUrl()}?token=${encodeURIComponent(token)}`
 
   ws = new WebSocket(url)
 

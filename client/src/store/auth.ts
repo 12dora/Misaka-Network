@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import type { Identity, Session } from '@/types'
+import { apiUrl } from '@/config'
 
 function randomInt(min: number, max: number) {
   return Math.floor(Math.random() * (max - min + 1)) + min
@@ -10,7 +11,7 @@ function generateIdentity(): Identity {
   if (cached) return JSON.parse(cached) as Identity
   const identity: Identity = {
     nodeId: randomInt(1, 20001),
-    passCode: String(randomInt(0, 999999)).padStart(6, '0'),
+    passCode: '', // blank initially — user must generate or type one
     createdAt: Date.now(),
   }
   sessionStorage.setItem('misaka.identity', JSON.stringify(identity))
@@ -71,7 +72,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
-        const res = await fetch('/api/register', {
+        const res = await fetch(apiUrl('/api/register'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ nodeId: identity.nodeId, passCode: identity.passCode }),
@@ -114,7 +115,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   async disconnect() {
     const { session } = get()
     if (session) {
-      await fetch('/api/release', {
+      await fetch(apiUrl('/api/release'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token: session.token }),

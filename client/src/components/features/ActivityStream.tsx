@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { useHomeStore } from '@/store/home'
 import { useAuthStore } from '@/store/auth'
+import { wsUrl } from '@/config'
 import type { ActivityEvent } from '@/types'
 
 const TYPE_COLOR: Record<ActivityEvent['type'], string> = {
@@ -23,8 +24,8 @@ export default function ActivityStream() {
   // WebSocket activity subscription
   useEffect(() => {
     if (!session) return
-    const wsUrl = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws?token=${session.token}`
-    const ws = new WebSocket(wsUrl)
+    const url = `${wsUrl()}?token=${session.token}`
+    const ws = new WebSocket(url)
 
     ws.onmessage = (evt) => {
       try {
