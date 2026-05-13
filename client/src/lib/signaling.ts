@@ -36,11 +36,10 @@ export function connect(t: string) {
 function doConnect() {
   if (ws?.readyState === WebSocket.OPEN) return
 
-  const url = `${wsUrl()}?token=${encodeURIComponent(token)}`
-
-  ws = new WebSocket(url)
+  ws = new WebSocket(wsUrl())
 
   ws.onopen = () => {
+    ws!.send(JSON.stringify({ t: 'AUTH', token }))
     reconnectAttempts = 0
     connectHandlers.forEach(h => h())
   }

@@ -283,6 +283,9 @@ router.post('/report', (req, res) => {
   }
   if (!sourceSession) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
 
+  // Cannot report self
+  if (sourceSession.nodeId === targetNodeId) { res.status(400).json({ error: 'CANNOT_REPORT_SELF' }); return }
+
   // Target must exist
   if (!nodes.has(targetNodeId)) { res.status(404).json({ error: 'NODE_NOT_FOUND' }); return }
 
@@ -320,3 +323,8 @@ export function authMiddleware(token: string): NodeSession | null {
   }
   return null
 }
+
+// Catch-all for unknown /api routes — always return JSON
+router.all('*', (_req, res) => {
+  res.status(404).json({ error: 'NOT_FOUND' })
+})

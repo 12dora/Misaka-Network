@@ -10,6 +10,7 @@ const MAX_CHANNELS_PER_NODE = 3
 const MAX_MESSAGE_SIZE = 64 * 1024
 
 const wsMessageSchema = z.discriminatedUnion('t', [
+  z.object({ t: z.literal('AUTH'),          token:        z.string() }),
   z.object({ t: z.literal('JOIN_CHANNEL'),  channelId:    z.string().min(1).max(64) }),
   z.object({ t: z.literal('LEAVE_CHANNEL') }),
   z.object({ t: z.literal('CONNECT_REQ'),  targetNodeId: z.number().int().min(1).max(20001) }),
@@ -46,24 +47,7 @@ function countChannelsForNode(nodeId: number): number {
 
 export function setupWS(wss: WebSocketServer) {
   wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
-    // Check message size before parsing
-    const url = new URL(req.url ?? '', 'http://localhost')
-    const token = url.searchParams.get('token')
-    if (!token) { ws.close(4001, 'MISSING_TOKEN'); return }
-
-    const session = authMiddleware(token)
-    if (!session) { ws.close(4002, 'INVALID_TOKEN'); return }
-
-    // Attach socket and update IP
-    session.socket = ws
-    session.lastSeen = Date.now()
-    session.ip = getWSIP(req)
-
-    send(ws, {
-      t: 'WELCOME',
-      myNodeId: session.nodeId,
-      sessionExpiresAt: Date.now() + 30 * 60 * 1000,
-    })
+    let session: NodeSession | null = null
 
     ws.on('message', (raw) => {
       // Enforce max message size
@@ -83,11 +67,36 @@ export function setupWS(wss: WebSocketServer) {
         return
       }
 
+      // First message must be AUTH
+      if (!session) {
+        if (msg.t !== 'AUTH') {
+          ws.close(4001, 'AUTH_REQUIRED')
+          return
+        }
+        const s = authMiddleware(msg.token)
+        if (!s) {
+          ws.close(4002, 'INVALID_TOKEN')
+          return
+        }
+        s.socket = ws
+        s.lastSeen = Date.now()
+        s.ip = getWSIP(req)
+        session = s
+
+        send(ws, {
+          t: 'WELCOME',
+          myNodeId: session.nodeId,
+          sessionExpiresAt: Date.now() + 30 * 60 * 1000,
+        })
+        return
+      }
+
       session.lastSeen = Date.now()
       handleMessage(ws, session, msg)
     })
 
     ws.on('close', () => {
+      if (!session) return
       session.socket = null
       session.lastSeen = Date.now()
 

@@ -8,14 +8,21 @@ function randomInt(min: number, max: number) {
 
 function generateIdentity(): Identity {
   const cached = sessionStorage.getItem('misaka.identity')
-  if (cached) return JSON.parse(cached) as Identity
+  if (cached) {
+    const { nodeId, createdAt } = JSON.parse(cached) as { nodeId: number; createdAt: number }
+    return { nodeId, passCode: '', createdAt }
+  }
   const identity: Identity = {
     nodeId: randomInt(1, 20001),
-    passCode: '', // blank initially — user must generate or type one
+    passCode: '',
     createdAt: Date.now(),
   }
-  sessionStorage.setItem('misaka.identity', JSON.stringify(identity))
+  sessionStorage.setItem('misaka.identity', JSON.stringify({ nodeId: identity.nodeId, createdAt: identity.createdAt }))
   return identity
+}
+
+function persistIdentity(identity: Identity) {
+  sessionStorage.setItem('misaka.identity', JSON.stringify({ nodeId: identity.nodeId, createdAt: identity.createdAt }))
 }
 
 interface AuthState {
@@ -42,27 +49,25 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   setNodeId(nodeId) {
     const identity = { ...get().identity, nodeId }
-    sessionStorage.setItem('misaka.identity', JSON.stringify(identity))
+    persistIdentity(identity)
     set({ identity, error: null })
   },
 
   setPassCode(passCode) {
     const identity = { ...get().identity, passCode }
-    sessionStorage.setItem('misaka.identity', JSON.stringify(identity))
     set({ identity, error: null })
   },
 
   regenerateNodeId() {
     const nodeId = randomInt(1, 20001)
     const identity = { ...get().identity, nodeId }
-    sessionStorage.setItem('misaka.identity', JSON.stringify(identity))
+    persistIdentity(identity)
     set({ identity, error: null })
   },
 
   regeneratePassCode() {
     const passCode = String(randomInt(0, 999999)).padStart(6, '0')
     const identity = { ...get().identity, passCode }
-    sessionStorage.setItem('misaka.identity', JSON.stringify(identity))
     set({ identity, error: null })
   },
 
@@ -81,7 +86,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         if (res.status === 409) {
           const newNodeId = identity.nodeId + 1 > 20001 ? randomInt(1, 20001) : identity.nodeId + 1
           const newIdentity = { ...identity, nodeId: newNodeId }
-          sessionStorage.setItem('misaka.identity', JSON.stringify(newIdentity))
+          persistIdentity(newIdentity)
           set({ identity: newIdentity })
           continue
         }
