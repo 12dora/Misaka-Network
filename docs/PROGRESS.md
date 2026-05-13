@@ -53,14 +53,14 @@
 - ☑ 移动端 Tab 布局
 
 ### WebRTC 传输（参考 06-webrtc-transfer.md）
-- ☐ Peer connection 工厂
-- ☐ DataChannel 建立
-- ☐ 文件分片发送
-- ☐ chunk 接收 + ACK
-- ☐ 整文件 hash 校验
-- ☐ IndexedDB 进度持久化
-- ☐ 断点续传
-- ☐ AES-GCM 应用层加密
+- ☑ Peer connection 工厂
+- ☑ DataChannel 建立
+- ☑ 文件分片发送
+- ☑ chunk 接收 + ACK
+- ☑ 整文件 hash 校验
+- ☑ IndexedDB 进度持久化
+- ☑ 断点续传
+- ☑ AES-GCM 应用层加密
 
 ### ACGN 页（参考 04-pages-acgn.md）
 - ☑ 静态文案
@@ -93,13 +93,13 @@
 
 ## 当前会话焦点
 
-网络页收尾：接收确认 Modal + 移动端 Tab 布局 + 底部操作栏
+WebRTC 传输层完成：Peer 工厂 → DataChannel → 分片 → ACK → hash 校验 → IndexedDB → 断点续传 → AES-GCM
 
 ## 已知问题
 
-- Network 页 NodeRadar/TransferChannel/TaskPanel 当前使用 mock 数据，需接入 WebRTC 信令
-- 接收确认 Modal 未实现
-- 移动端 Tab 布局未实现
+- WebRTC 信令需两端同时在线端到端测试
+- 接收端 DataChannel 消息监听器有重复绑定风险（已通过 addEventListener + onmessage 规避）
+- QR 系统 / TURN 设置 / 黑名单 / ToS 尚未实现
 
 ## 决策记录
 
@@ -109,3 +109,6 @@
 - 2026-05-12: lore.ts 写死彩蛋数据，无需后端
 - 2026-05-12: 速率限制用滑动窗口（Map<ip, {count, resetAt}>），不引入外部依赖
 - 2026-05-12: 上报记录内存保留 1 小时，不做持久化
+- 2026-05-13: chunk 加密格式 iv(12B) + encrypted 打包为一个 binary message，避免两帧对齐问题
+- 2026-05-13: DataChannel 文本头+二进制体的双消息模式，靠 ordered SCTP 保证顺序
+- 2026-05-13: ECDH 密钥协商在 DataChannel open 后第一个消息交换，30s 超时
