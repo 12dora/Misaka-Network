@@ -4,6 +4,7 @@ import { useAuthStore } from '@/store/auth'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import QRModal from '@/components/features/QRModal'
 import ScanModal from '@/components/features/ScanModal'
+import SettingsModal from '@/components/features/SettingsModal'
 
 const LINKS = [
   { to: '/',        label: '首页',  kanji: '首' },
@@ -16,8 +17,9 @@ export default function TopNav() {
   const isConnected = useAuthStore(s => s.isConnected)
   const identity    = useAuthStore(s => s.identity)
   const [menuOpen, setMenuOpen] = useState(false)
-  const [showQR, setShowQR]     = useState(false)
-  const [showScan, setShowScan] = useState(false)
+  const [showQR, setShowQR]         = useState(false)
+  const [showScan, setShowScan]     = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
 
   function isActive(to: string) {
     return to === '/' ? location.pathname === '/' : location.pathname.startsWith(to)
@@ -70,6 +72,16 @@ export default function TopNav() {
               </button>
             </>
           )}
+
+          {/* Settings */}
+          <button
+            className="w-8 h-8 flex items-center justify-center rounded-full cursor-pointer hover:opacity-70 transition-opacity"
+            style={{ border: 'none', background: 'transparent', fontSize: '1.1rem' }}
+            onClick={() => setShowSettings(true)}
+            aria-label="设置"
+          >
+            ⚙
+          </button>
 
           {/* Status */}
           <span className="flex items-center gap-1.5 text-xs font-mono text-[var(--text-on-blue-2)]">
@@ -165,6 +177,9 @@ export default function TopNav() {
       )}
       {showScan && (
         <ScanModal onClose={() => setShowScan(false)} />
+      )}
+      {showSettings && (
+        <SettingsModal onClose={() => setShowSettings(false)} />
       )}
     </>
   )

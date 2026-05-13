@@ -1,8 +1,4 @@
-export interface TurnServer {
-  urls: string | string[]
-  username?: string
-  credential?: string
-}
+import { getTurnIceServers, loadTurnSettings } from './turn'
 
 const DEFAULT_STUN: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
@@ -37,19 +33,16 @@ export async function getSelectedChannelType(pc: RTCPeerConnection): Promise<Cha
   return null
 }
 
-export function createPeerConnection(turnServers: TurnServer[] = []): RTCPeerConnection {
+export function createPeerConnection(): RTCPeerConnection {
+  const turnSettings = loadTurnSettings()
   const iceServers: RTCIceServer[] = [
     ...DEFAULT_STUN,
-    ...turnServers.map(t => ({
-      urls: typeof t.urls === 'string' ? [t.urls] : t.urls,
-      username: t.username,
-      credential: t.credential,
-    })),
+    ...getTurnIceServers(),
   ]
 
   return new RTCPeerConnection({
     iceServers,
-    iceTransportPolicy: 'all',
+    iceTransportPolicy: turnSettings.forceRelay ? 'relay' : 'all',
   })
 }
 

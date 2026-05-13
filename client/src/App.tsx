@@ -3,6 +3,8 @@ import Home from '@/pages/Home'
 import Network from '@/pages/Network'
 import Join from '@/pages/Join'
 import ACGN from '@/pages/ACGN'
+import Terms from '@/pages/Terms'
+import Privacy from '@/pages/Privacy'
 import TopNav from '@/components/layout/TopNav'
 import { useAuthStore } from '@/store/auth'
 
@@ -23,6 +25,8 @@ export default function App() {
           <ProtectedRoute><Network /></ProtectedRoute>
         } />
         <Route path="/acgn" element={<ACGN />} />
+        <Route path="/tos" element={<Terms />} />
+        <Route path="/privacy" element={<Privacy />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </BrowserRouter>
