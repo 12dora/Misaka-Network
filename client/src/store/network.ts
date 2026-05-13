@@ -97,19 +97,17 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     onMessage(async (msg) => {
       switch (msg.t) {
         case 'WELCOME': {
-          // Priority: 1) QR join (scanner), 2) QR owner channel, 3) passcode-derived
+          // Priority: 1) QR join (scanner lands in a specific channel), 2) passcode-derived cluster.
+          // Clean up any stale qrChannel left behind by older builds — owners now
+          // switch channels live via joinChannel() instead of stashing it here.
+          sessionStorage.removeItem('misaka.qrChannel')
           const joinRaw = sessionStorage.getItem('misaka.join')
-          const qrChId = sessionStorage.getItem('misaka.qrChannel')
           let chId: string | undefined
           if (joinRaw) {
             try {
               const ctx = JSON.parse(joinRaw) as { channelId?: string }
               chId = ctx.channelId
             } catch { /* ignore */ }
-          }
-          if (!chId && qrChId) {
-            chId = qrChId
-            sessionStorage.removeItem('misaka.qrChannel')
           }
           if (!chId) {
             const passCode = useAuthStore.getState().identity.passCode

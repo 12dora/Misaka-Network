@@ -14,11 +14,31 @@ declare class BarcodeDetector {
   detect(image: ImageBitmapSource): Promise<{ rawValue: string }[]>
 }
 
+function describeCameraError(err: unknown): string {
+  if (typeof err === 'object' && err && 'name' in err) {
+    const name = (err as { name: string }).name
+    switch (name) {
+      case 'NotAllowedError':       return '摄像头权限被拒绝，请在浏览器设置中允许'
+      case 'NotFoundError':         return '未检测到摄像头设备'
+      case 'NotReadableError':      return '摄像头被其他应用占用，请先关闭再试'
+      case 'OverconstrainedError':  return '当前设备不支持所选摄像头方向，正在切换…'
+      case 'SecurityError':         return '需要 HTTPS 或 localhost 才能使用摄像头'
+      case 'AbortError':            return '摄像头启动被中断，请重试'
+    }
+    if ('message' in err) return String((err as { message: string }).message)
+  }
+  return String(err)
+}
+
+// Default to user-facing camera (most desktops only have one); user can toggle to rear.
+type FacingMode = 'user' | 'environment'
+
 export default function ScanModal({ onClose }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [hasCamera, setHasCamera] = useState(true)
-  const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment')
+  const [cameraError, setCameraError] = useState<string | null>(null)
+  const [facingMode, setFacingMode] = useState<FacingMode>('user')
   const [detected, setDetected] = useState<string | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const animRef = useRef<number>(0)
@@ -30,20 +50,41 @@ export default function ScanModal({ onClose }: Props) {
 
   async function startCamera() {
     stopCamera()
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setHasCamera(false)
+      setCameraError('此浏览器不支持摄像头 API')
+      return
+    }
+    if (!window.isSecureContext) {
+      setHasCamera(false)
+      setCameraError('需要 HTTPS 或 localhost 才能使用摄像头')
+      return
+    }
+
+    // Use 'ideal' so the browser falls back to any available camera when the
+    // requested facing mode is missing (common on desktops with only a webcam).
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode, width: { ideal: 640 }, height: { ideal: 640 } },
+        video: { facingMode: { ideal: facingMode }, width: { ideal: 640 }, height: { ideal: 640 } },
         audio: false,
       })
       streamRef.current = stream
       if (videoRef.current) {
         videoRef.current.srcObject = stream
-        await videoRef.current.play()
+        try {
+          await videoRef.current.play()
+        } catch {
+          // Some browsers reject play() until user gesture — the video element
+          // will still render frames; ignore so scanning can proceed.
+        }
       }
       setHasCamera(true)
+      setCameraError(null)
       startScanning()
-    } catch {
+    } catch (err) {
       setHasCamera(false)
+      setCameraError(describeCameraError(err))
     }
   }
 
@@ -187,10 +228,15 @@ export default function ScanModal({ onClose }: Props) {
               <div className="scan-line" />
             </>
           ) : (
-            <div className="w-full h-full flex flex-col items-center justify-center gap-2">
+            <div className="w-full h-full flex flex-col items-center justify-center gap-2 px-4 text-center">
               <MisakaKanjiBlock char="禁" size="lg" />
               <p className="font-kanji text-sm text-[var(--text-on-blue-2)]">无法访问摄像头</p>
-              <p className="font-kanji text-xs text-[var(--text-muted)]">请检查权限设置</p>
+              <p className="font-kanji text-xs text-[var(--text-muted)] break-words">
+                {cameraError ?? '请检查权限设置'}
+              </p>
+              <MisakaButton variant="pill" size="sm" onClick={startCamera} className="mt-2">
+                重试
+              </MisakaButton>
             </div>
           )}
           {detected && (
