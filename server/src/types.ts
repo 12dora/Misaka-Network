@@ -20,6 +20,7 @@ export interface QrTokenRecord {
   fileSessionId?: string
   channelId?: string
   type: 'node' | 'file' | 'channel'
+  passCodeHash?: string
   createdAt: number
   expiresAt: number
   used: boolean

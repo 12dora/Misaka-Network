@@ -142,7 +142,10 @@ router.post('/verify-passcode', (req, res) => {
 
   if (!parsed.success) { res.status(400).json({ error: 'INVALID_INPUT' }); return }
 
-  const { targetNodeId, passCode } = parsed.data
+  const { targetNodeId, passCode, sourceToken } = parsed.data
+  const caller = authMiddleware(sourceToken)
+  if (!caller) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
+
   const target = nodes.get(targetNodeId)
   if (!target) { res.status(404).json({ error: 'NODE_NOT_FOUND' }); return }
 
@@ -159,11 +162,13 @@ router.post('/verify-passcode', (req, res) => {
     target.failedAttempts++
     if (target.failedAttempts >= MAX_ATTEMPTS) {
       target.lockedUntil = now + LOCK_DURATION
+      res.status(423).json({ error: 'NODE_LOCKED', unlockAt: target.lockedUntil })
+    } else {
+      res.status(401).json({
+        error: 'WRONG_PASSCODE',
+        attemptsLeft: MAX_ATTEMPTS - target.failedAttempts,
+      })
     }
-    res.status(401).json({
-      error: 'WRONG_PASSCODE',
-      attemptsLeft: Math.max(0, MAX_ATTEMPTS - target.failedAttempts),
-    })
   }
 })
 
@@ -177,6 +182,24 @@ router.get('/stats', (_req, res) => {
     uptimeLongestMs:  getLongestUptimeMs(),
     cpuLoadPercent:   Math.floor(Math.random() * 30 + 20), // decorative
   })
+})
+
+// POST /api/transfer-done
+router.post('/transfer-done', (req, res) => {
+  const parsed = z.object({
+    token: z.string(),
+    bytes: z.number().int().min(0).optional(),
+  }).safeParse(req.body)
+
+  if (!parsed.success) { res.status(400).json({ error: 'INVALID_INPUT' }); return }
+
+  const session = authMiddleware(parsed.data.token)
+  if (!session) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
+
+  stats.totalTransfers++
+  stats.totalBytes += parsed.data.bytes ?? 0
+  broadcast({ type: 'transfer', nodeId: session.nodeId, message: `御坂 ${session.nodeId} 号完成一次传输` })
+  res.status(204).end()
 })
 
 // GET /api/qr-token
@@ -194,11 +217,13 @@ router.get('/qr-token', (req, res) => {
   const qrToken = nanoid(32)
   const channelId = nanoid(8)
   const expiresAt = Date.now() + 5 * 60 * 1000
+  const passCode = req.query.passCode as string | undefined
   const record: QrTokenRecord = {
     token: qrToken,
     ownerNodeId: ownerSession.nodeId,
     type: 'node',
     channelId,
+    passCodeHash: passCode ? hashPassCode(passCode) : undefined,
     createdAt: Date.now(),
     expiresAt,
     used: false,
@@ -220,6 +245,16 @@ router.post('/qr-redeem', (req, res) => {
   const record = qrTokens.get(parsed.data.qrToken)
   if (!record || record.used || Date.now() > record.expiresAt) {
     res.status(400).json({ error: 'INVALID_QR_TOKEN' })
+    return
+  }
+
+  if (record.passCodeHash) {
+    if (hashPassCode(parsed.data.myPassCode) !== record.passCodeHash) {
+      res.status(401).json({ error: 'WRONG_PASSCODE' })
+      return
+    }
+  } else {
+    res.status(403).json({ error: 'QR_REQUIRES_PASSCODE' })
     return
   }
 

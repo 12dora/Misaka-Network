@@ -210,7 +210,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        targetNodeId: auth.identity.nodeId,
+        targetNodeId: req.fromNodeId,
         passCode,
         sourceToken: auth.session.token,
       }),
@@ -256,9 +256,6 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     set(s => ({
       incomingRequest: null,
       connectedPeers: new Set([...s.connectedPeers, fromNodeId]),
-      peers: s.peers.map(p =>
-        p.nodeId === fromNodeId ? { ...p, status: 'transferring' as NodeStatus } : p,
-      ),
     }))
   },
 
@@ -497,6 +494,11 @@ function setupDataChannel(dc: RTCDataChannel, peerNodeId: number) {
   let lastChunkHeader: ChunkHeader | null = null
 
   dc.onopen = async () => {
+    useNetworkStore.setState(s => ({
+      peers: s.peers.map(p =>
+        p.nodeId === peerNodeId ? { ...p, status: 'transferring' as const } : p,
+      ),
+    }))
     const pub = await getMyPublicKey()
     dc.send(JSON.stringify({ type: 'ecdh-pub', pub }))
   }
