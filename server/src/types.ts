@@ -44,6 +44,7 @@ export interface ActivityEvent {
 }
 
 export type WSClientMessage =
+  | { t: 'AUTH'; token: string }
   | { t: 'JOIN_CHANNEL'; channelId: string }
   | { t: 'LEAVE_CHANNEL' }
   | { t: 'CONNECT_REQ'; targetNodeId: number }

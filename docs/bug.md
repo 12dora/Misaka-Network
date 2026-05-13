@@ -52,34 +52,29 @@
 
 **修复:** BUG-3 修复后自然消除（ActivityStream 不再自建 WS）。
 
----
+### ✅ BUG-9 — `GET /api/register` 返回 Express HTML 错误而非 JSON
 
-## 🟡 待修复
+**文件:** `server/src/http.ts`, `server/src/index.ts`  
+**修复:** 在 `/api` 路由末尾和 app 层各加一个 catch-all handler，统一返回 `{"error":"NOT_FOUND"}`。
 
-### BUG-9 — `GET /api/register` 返回 Express HTML 错误而非 JSON
+### ✅ BUG-10 — 通行码明文存储在 `sessionStorage`
 
-- 实际: `<pre>Cannot GET /api/register</pre>` + 404
-- 建议: 加全局 404 / method-not-allowed handler，统一返回 JSON
+**文件:** `client/src/store/auth.ts`  
+**修复:** `persistIdentity` 只持久化 `{ nodeId, createdAt }`，`passCode` 仅保留在 Zustand 内存中。`setPassCode` / `regeneratePassCode` 不再写入 sessionStorage。
 
-### BUG-10 — 通行码明文存储在 `sessionStorage`
+### ✅ BUG-11 — WebSocket token 暴露在 URL query param
 
-**文件:** `client/src/store/auth.ts` 第 50 行
-`sessionStorage.setItem('misaka.identity', JSON.stringify(identity))` 将 `passCode` 原文持久化。同源 JS 或开发者工具可读取。
-**建议:** 只持久化 `nodeId`，passCode 不写入 sessionStorage。
+**文件:** `server/src/ws.ts`, `server/src/types.ts`, `client/src/lib/signaling.ts`, `client/src/types.ts`  
+**修复:** 客户端连接后首条消息发送 `{ t: 'AUTH', token }`，服务端移除 URL query 解析，改为等待 AUTH 消息认证后才分配 session 并发送 WELCOME。
 
-### BUG-11 — WebSocket token 暴露在 URL query param
+### ✅ BUG-12 — 节点可以举报自己
 
-**文件:** `client/src/lib/signaling.ts` 第 39 行 — `?token=...`
-Token 会出现在代理日志、浏览器历史、Referrer 头中。
-**建议:** 握手后通过首条 WS 消息传 token。
-
-### BUG-12 — 节点可以举报自己
-
-**文件:** `server/src/http.ts`，`POST /api/report` 缺少 `sourceSession.nodeId !== targetNodeId` 检查。
+**文件:** `server/src/http.ts`  
+**修复:** `POST /api/report` 新增 `sourceSession.nodeId === targetNodeId` 检查，返回 400 `CANNOT_REPORT_SELF`。
 
 ---
 
-## 测试验证检查清单（已修复项）
+## 测试验证检查清单
 
 ### BUG-1 验证 ✅
 ```bash
@@ -107,11 +102,7 @@ grep -n "new WebSocket" client/src/components/features/ActivityStream.tsx
 ```
 
 ### BUG-4 验证
-手动测试（需两个浏览器 Tab）：
-1. Tab A 注册节点 A（passCode=111111），Tab B 注册节点 B（passCode=222222）
-2. 两者进入 Network 页同一信道
-3. A 向 B 发送 CONNECT_REQ
-4. B 收到请求对话框，输入 A 的 passCode（111111）→ 应成功建立连接
+手动测试（需两个浏览器 Tab）
 
 ### BUG-5 验证 ✅
 ```bash
@@ -124,6 +115,29 @@ Attempt 3: {"error":"NODE_LOCKED","unlockAt":...} ✅
 curl -s -X POST http://localhost:8080/api/transfer-done \
   -H 'Content-Type: application/json' \
   -d '{"token":"<TOKEN>","bytes":1048576}'
-curl -s http://localhost:8080/api/stats
 # totalTransfers: 1, totalBytes: 1048576 ✅
+```
+
+### BUG-9 验证 ✅
+```bash
+curl -s http://localhost:8080/api/register
+# 返回: {"error":"NOT_FOUND"} ✅ (非 HTML)
+```
+
+### BUG-10 验证 ✅
+```bash
+# sessionStorage 'misaka.identity' 中不含 passCode 字段
+```
+
+### BUG-11 验证 ✅
+```bash
+# WebSocket URL 不再包含 ?token= 参数
+grep -n "token" client/src/lib/signaling.ts | grep -v "AUTH\|//"
+```
+
+### BUG-12 验证 ✅
+```bash
+curl -s -X POST http://localhost:8080/api/report \
+  -H 'Content-Type: application/json' \
+  -d '{"targetNodeId":<SAME_ID>,"reason":"spam","sourceToken":"<TOKEN>"}' | grep CANNOT_REPORT_SELF
 ```

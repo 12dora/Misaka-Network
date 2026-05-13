@@ -73,6 +73,7 @@ export interface ChannelMessage {
 
 // ── WebSocket Protocol ────────────────────────────────────────────
 export type WSMessage =
+  | { t: 'AUTH'; token: string }
   | { t: 'JOIN_CHANNEL'; channelId: string }
   | { t: 'LEAVE_CHANNEL' }
   | { t: 'CONNECT_REQ'; targetNodeId: number }
