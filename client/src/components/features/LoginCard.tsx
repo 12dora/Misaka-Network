@@ -22,10 +22,19 @@ export default function LoginCard() {
     if (!isNaN(n) && n >= 1 && n <= 20001) setNodeId(n)
   }
 
+  // Pad passcode to 6 chars with empty strings for display
+  function getPassChars(): string[] {
+    const chars: string[] = []
+    for (let i = 0; i < 6; i++) {
+      chars.push(identity.passCode[i] ?? '')
+    }
+    return chars
+  }
+
   function handlePassDigit(idx: number, val: string) {
     const digit = val.replace(/\D/g, '').slice(-1)
     if (!digit) return
-    const chars = identity.passCode.split('')
+    const chars = getPassChars()
     chars[idx] = digit
     setPassCode(chars.join(''))
     passInputs.current[idx + 1]?.focus()
@@ -33,19 +42,34 @@ export default function LoginCard() {
 
   function handlePassKey(idx: number, e: KeyboardEvent<HTMLInputElement>) {
     if (e.key === 'Backspace') {
-      const chars = identity.passCode.split('')
-      chars[idx] = '0'
-      setPassCode(chars.join(''))
+      const chars = getPassChars()
+      if (chars[idx]) {
+        // Clear current digit and stay
+        chars[idx] = ''
+        setPassCode(chars.join(''))
+      } else if (idx > 0) {
+        // Already empty — move to previous and clear it
+        chars[idx - 1] = ''
+        setPassCode(chars.join(''))
+        passInputs.current[idx - 1]?.focus()
+      }
+      e.preventDefault()
+    } else if (e.key === 'ArrowLeft' && idx > 0) {
       passInputs.current[idx - 1]?.focus()
+    } else if (e.key === 'ArrowRight' && idx < 5) {
+      passInputs.current[idx + 1]?.focus()
     }
   }
 
   function handlePassPaste(e: React.ClipboardEvent) {
     const text = e.clipboardData.getData('text').replace(/\D/g, '').slice(0, 6)
-    if (text.length === 6) {
-      setPassCode(text.padEnd(6, '0'))
+    if (text.length > 0) {
+      setPassCode(text.padEnd(6, ''))
     }
   }
+
+  // Whether passcode is complete (6 digits)
+  const passComplete = /^\d{6}$/.test(identity.passCode)
 
   async function handleConnect() {
     await connect()
@@ -165,7 +189,7 @@ export default function LoginCard() {
           ◇ 通行码
         </label>
         <div className="flex items-center gap-1.5">
-          {identity.passCode.split('').map((digit, i) => (
+          {getPassChars().map((digit, i) => (
             <input
               key={i}
               ref={el => { passInputs.current[i] = el }}
@@ -173,17 +197,21 @@ export default function LoginCard() {
               inputMode="numeric"
               maxLength={1}
               value={digit}
+              placeholder="●"
               onChange={e => handlePassDigit(i, e.target.value)}
               onKeyDown={e => handlePassKey(i, e)}
               onPaste={handlePassPaste}
+              onFocus={e => {
+                e.target.style.borderColor = 'var(--bg-deep)'
+                e.target.select()
+              }}
+              onBlur={e => (e.target.style.borderColor = 'var(--border-card)')}
               className="w-10 h-12 text-center font-mono font-bold text-lg rounded-lg border focus:outline-none transition-colors"
               style={{
                 borderColor: 'var(--border-card)',
                 background: 'var(--surface)',
                 color: 'var(--text-on-white)',
               }}
-              onFocus={e => (e.target.style.borderColor = 'var(--bg-deep)')}
-              onBlur={e => (e.target.style.borderColor = 'var(--border-card)')}
             />
           ))}
           <button
@@ -209,7 +237,7 @@ export default function LoginCard() {
         variant="primary"
         fullWidth
         onClick={handleConnect}
-        disabled={isLoading}
+        disabled={isLoading || !passComplete}
       >
         {isLoading ? '正在接入...' : '接入网络 / CONNECT'}
       </MisakaButton>

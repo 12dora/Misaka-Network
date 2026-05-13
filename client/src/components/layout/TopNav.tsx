@@ -51,13 +51,28 @@ export default function TopNav() {
 
         {/* Desktop nav pills */}
         <div className="hidden sm:flex items-center gap-2">
-          {LINKS.map(({ to, label }) => (
-            <Link key={to} to={to} className="no-underline">
-              <button className={`nav-pill text-sm${isActive(to) ? ' active' : ''}`}>
-                {label}
-              </button>
-            </Link>
-          ))}
+          {LINKS.map(({ to, label }) => {
+            const needsAuth = to === '/network' && !isConnected
+            if (needsAuth) {
+              return (
+                <button
+                  key={to}
+                  className="nav-pill text-sm opacity-40 cursor-not-allowed"
+                  disabled
+                  title="请先接入网络"
+                >
+                  {label}
+                </button>
+              )
+            }
+            return (
+              <Link key={to} to={to} className="no-underline">
+                <button className={`nav-pill text-sm${isActive(to) ? ' active' : ''}`}>
+                  {label}
+                </button>
+              </Link>
+            )
+          })}
         </div>
 
         {/* Right: QR / scan / status / mobile menu */}
@@ -129,31 +144,49 @@ export default function TopNav() {
             borderBottom: '1px solid rgba(255,255,255,0.12)',
           }}
         >
-          {LINKS.map(({ to, label, kanji }) => (
-            <Link
-              key={to}
-              to={to}
-              className="no-underline"
-              onClick={() => setMenuOpen(false)}
-            >
-              <div
-                className="flex items-center gap-3 px-6 py-4 border-b"
-                style={{
-                  borderColor: 'rgba(255,255,255,0.08)',
-                  background: isActive(to) ? 'rgba(255,255,255,0.08)' : 'transparent',
-                }}
+          {LINKS.map(({ to, label, kanji }) => {
+            const needsAuth = to === '/network' && !isConnected
+            if (needsAuth) {
+              return (
+                <div
+                  key={to}
+                  className="flex items-center gap-3 px-6 py-4 border-b opacity-40"
+                  style={{
+                    borderColor: 'rgba(255,255,255,0.08)',
+                  }}
+                >
+                  <MisakaKanjiBlock char={kanji} size="sm" />
+                  <span className="font-kanji font-semibold text-white">{label}</span>
+                  <span className="ml-auto font-kanji text-[10px] text-[var(--text-muted)]">需登录</span>
+                </div>
+              )
+            }
+            return (
+              <Link
+                key={to}
+                to={to}
+                className="no-underline"
+                onClick={() => setMenuOpen(false)}
               >
-                <MisakaKanjiBlock char={kanji} size="sm" />
-                <span className="font-kanji font-semibold text-white">{label}</span>
-                {isActive(to) && (
-                  <span
-                    className="ml-auto w-1.5 h-1.5 rounded-full"
-                    style={{ background: 'var(--accent-cyan)' }}
-                  />
-                )}
-              </div>
-            </Link>
-          ))}
+                <div
+                  className="flex items-center gap-3 px-6 py-4 border-b"
+                  style={{
+                    borderColor: 'rgba(255,255,255,0.08)',
+                    background: isActive(to) ? 'rgba(255,255,255,0.08)' : 'transparent',
+                  }}
+                >
+                  <MisakaKanjiBlock char={kanji} size="sm" />
+                  <span className="font-kanji font-semibold text-white">{label}</span>
+                  {isActive(to) && (
+                    <span
+                      className="ml-auto w-1.5 h-1.5 rounded-full"
+                      style={{ background: 'var(--accent-cyan)' }}
+                    />
+                  )}
+                </div>
+              </Link>
+            )
+          })}
           {isConnected && (
             <div className="flex gap-2 p-4">
               <button className="nav-pill text-sm flex-1" onClick={() => { setMenuOpen(false); setShowQR(true) }}>
