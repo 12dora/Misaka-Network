@@ -192,17 +192,19 @@ router.get('/qr-token', (req, res) => {
   if (!ownerSession) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
 
   const qrToken = nanoid(32)
+  const channelId = nanoid(8)
   const expiresAt = Date.now() + 5 * 60 * 1000
   const record: QrTokenRecord = {
     token: qrToken,
     ownerNodeId: ownerSession.nodeId,
     type: 'node',
+    channelId,
     createdAt: Date.now(),
     expiresAt,
     used: false,
   }
   qrTokens.set(qrToken, record)
-  res.json({ qrToken, expiresAt })
+  res.json({ qrToken, channelId, expiresAt })
 })
 
 // POST /api/qr-redeem

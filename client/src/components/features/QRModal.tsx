@@ -3,6 +3,7 @@ import QRCode from 'qrcode'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
 import { useAuthStore } from '@/store/auth'
+import { useNetworkStore } from '@/store/network'
 
 interface Props {
   nodeId: number
@@ -45,9 +46,18 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
         headers: { Authorization: `Bearer ${session.token}` },
       })
       if (res.ok) {
-        const data = await res.json() as { qrToken: string; expiresAt: number }
+        const data = await res.json() as { qrToken: string; channelId: string; expiresAt: number }
         setQrToken(data.qrToken)
         setExpiresAt(data.expiresAt)
+
+        // Join the QR channel so both parties end up in the same channel
+        const ns = useNetworkStore.getState()
+        if (ns.wsConnected) {
+          ns.joinChannel(data.channelId)
+        } else {
+          // Store for later — network store will pick it up on init
+          sessionStorage.setItem('misaka.qrChannel', data.channelId)
+        }
       }
     } catch { /* ignore */ }
     setLoading(false)
