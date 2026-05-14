@@ -1,49 +1,109 @@
 # 御坂网络 · MISAKA NETWORK
 
-零注册、强隐私、跨设备的 P2P 文件传输 Web APP，以《某科学的超电磁炮》「妹妹网络」为美学骨架。
+浏览器内 P2P 文件传输 Web APP（React + WebRTC + Node.js Signaling）。
 
-## 项目文档导航
+## 仓库结构
 
-所有设计与开发文档在 `docs/` 目录下，**按功能拆分，便于编码 AI 按需读取，避免上下文膨胀**：
-
-| 文档 | 用途 | 何时读取 |
-|---|---|---|
-| `docs/00-overview.md` | 产品定位、信息架构、技术栈 | 项目启动时必读 |
-| `docs/01-design-system.md` | 视觉规范、配色、术语对照表 | 写 UI 时读取 |
-| `docs/02-pages-home.md` | 首页页面规格 | 开发首页时读取 |
-| `docs/03-pages-network.md` | 网络页（核心传输页）规格 | 开发网络页时读取 |
-| `docs/04-pages-acgn.md` | ACGN 世界观页规格 | 开发 ACGN 页时读取 |
-| `docs/05-auth-identity.md` | 登录/身份/会话机制 | 实现登录时读取 |
-| `docs/06-webrtc-transfer.md` | WebRTC 连接、分片、断点续传 | 实现传输时读取 |
-| `docs/07-signaling-server.md` | 信令服务器接口与数据结构 | 实现服务端时读取 |
-| `docs/08-qr-system.md` | QR 扫码三种类型设计 | 实现 QR 功能时读取 |
-| `docs/09-turn-settings.md` | TURN 用户自配置说明 | 实现设置页时读取 |
-| `docs/10-security-privacy.md` | 加密、通行码、黑名单 | 实现安全特性时读取 |
-| `docs/PROGRESS.md` | **开发进度追踪（编码 AI 自动维护）** | 每次会话开始/结束时读写 |
-| `docs/PROMPTS.md` | **给编码 AI 的提示词模板** | 启动编码会话时使用 |
-
-## 目录结构
-
-```
+```text
 misaka-network/
-├── README.md                 # 本文件
-├── docs/                     # 所有设计文档（拆分式）
-├── server/                   # 信令服务器（Node.js）
-│   └── README.md             # 服务端说明
-└── client/                   # 前端 Web APP
-    └── README.md             # 前端说明
+├── client/                 # 前端（Vite + React）
+├── server/                 # 信令服务（Node.js + ws + express）
+├── docs/                   # 设计/架构/进度文档
+├── docker-compose.yml      # 后端 Docker 快速部署
+└── README.md
 ```
 
-## 快速开始
+## 本地开发（前后端）
 
-1. 阅读 `docs/00-overview.md` 了解产品
-2. 阅读 `docs/PROMPTS.md` 获取编码 AI 的启动提示词
-3. 第一次编码会话：让 AI 读 `docs/00-overview.md` + `docs/PROGRESS.md`，然后让它选择从哪个模块开始
-4. 每次会话结束前，让 AI 更新 `docs/PROGRESS.md`
+1) 启动后端
 
-## 设计原则
+```bash
+cd server
+npm install
+npm run dev
+```
 
-- **零服务端文件存储**：文件本体永不上服务器
-- **零注册**：节点编号 + 通行码即用
-- **TURN 自托管**：默认不启用，用户在设置中手动配置
-- **世界观沉浸**：所有 UI 文案符合原著设定
+默认监听 `http://localhost:8080`，WebSocket 为 `ws://localhost:8080/ws`。
+
+2) 启动前端（新终端）
+
+```bash
+cd client
+npm install
+npm run dev
+```
+
+默认访问 `http://localhost:5173`。开发模式下 Vite 已代理 `/api` 和 `/ws` 到 `8080`。
+
+## 后端 Docker 快速部署（推荐）
+
+### 方式 A：docker compose（一条命令）
+
+在仓库根目录执行：
+
+```bash
+docker compose up -d --build
+```
+
+查看状态与日志：
+
+```bash
+docker compose ps
+docker compose logs -f signaling
+```
+
+停止：
+
+```bash
+docker compose down
+```
+
+默认会映射宿主机 `8080:8080`。
+
+### 方式 B：纯 docker 命令
+
+```bash
+docker build -t misaka-signaling ./server
+docker run -d --name misaka-signaling -p 8080:8080 \
+  -e PORT=8080 \
+  -e MAX_NODES=10000 \
+  -e RATE_LIMIT_PER_MIN=60 \
+  misaka-signaling
+```
+
+## 前端部署（静态托管）
+
+前端是纯静态资源，构建后可部署到 Nginx / Cloudflare Pages / Vercel / GitHub Pages。
+
+```bash
+cd client
+npm install
+npm run build
+```
+
+产物在 `client/dist/`。
+
+### 运行时配置（关键）
+
+前端会读取 `client/public/config.json`（构建后位于 `dist/config.json`），用它指向线上后端：
+
+```json
+{
+  "API_BASE": "https://your-domain.com",
+  "WS_URL": "wss://your-domain.com/ws"
+}
+```
+
+这样无需重新打包前端即可切换后端地址。
+
+## 生产部署建议
+
+1. 后端用 Docker 部署在云主机（开放 `8080` 或置于反向代理后）。
+2. 前端部署静态站点。
+3. 生产环境必须使用 HTTPS + WSS（浏览器 WebRTC/权限相关特性更稳定）。
+
+## 文档入口
+
+- 架构总览：`docs/00-overview.md`
+- 当前进度：`docs/PROGRESS.md`
+- 提示词模板：`docs/PROMPTS.md`

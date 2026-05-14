@@ -1,6 +1,7 @@
 import LoginCard from '@/components/features/LoginCard'
 import StatsDashboard from '@/components/features/StatsDashboard'
 import ActivityStream from '@/components/features/ActivityStream'
+import AppFooter from '@/components/ui/AppFooter'
 
 const HERO_CHARACTER = import.meta.env.BASE_URL + 'assets/misaka.webp'
 const HERO_TITLE     = import.meta.env.BASE_URL + 'assets/misaka-title.webp'
@@ -122,23 +123,7 @@ export default function Home() {
       <ActivityStream />
 
       {/* ── Footer ──────────────────────────────────────────────────── */}
-      <footer
-        className="px-6 py-10 text-center"
-        style={{ background: 'var(--bg-deep)' }}
-      >
-        <p className="font-jp text-sm text-[var(--text-on-blue-2)] leading-loose">
-          © Master Huang · Misaka Network
-          <br />
-          <a
-            href="https://github.com/12dora/Misaka-Network"
-            target="_blank"
-            rel="noreferrer"
-            className="text-xs underline decoration-dotted"
-          >
-            GitHub
-          </a>
-        </p>
-      </footer>
+      <AppFooter />
     </div>
   )
 }

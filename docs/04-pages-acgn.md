@@ -71,14 +71,14 @@ Section 间用一条 `2px var(--accent-cyan)` 短光线（120px 宽）+ `kanji-b
 
 ## Footer · 版权信息
 
-固定底部，`--bg-deep` 背景白字。
+固定底部，`--bg-deep` 背景白字。与首页共用 `AppFooter` 组件（`id="credits"` 保留锚点）。
 
 ```
 © Master Huang · Misaka Network
 GitHub
 ```
 
-仅保留作者版权信息与 GitHub 链接（白色胶囊按钮）。
+仅保留作者版权信息与 GitHub 链接，纵向留白使用紧凑模式。
 
 ## 实现要点
 

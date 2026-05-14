@@ -90,7 +90,7 @@
 
 ## 当前会话焦点
 
-网络收敛修复：接收文件卡片去重（单文件单卡片）；节点雷达未读提示与单节点自动展开会话（含动画）；文件接收浏览器通知；全站页脚仅保留作者 Master Huang 与 GitHub 链接。
+部署可运维化：新增后端 Docker 快速部署（Dockerfile + docker-compose），并在 README.md 整理前后端本地开发、Docker 部署、静态前端部署与运行时配置说明。
 
 接收文件改为手动下载：文件接收完成后不再自动触发浏览器下载，而是在聊天框插入文件卡片（显示文件名 + 大小 + "↓ 下载"按钮），点击后才开始下载，下载后按钮变为"✓ 已下载"。
 
@@ -105,6 +105,8 @@
 - QR token 单次使用：同一复制链接完成一次接入后再次打开会提示过期 / 已使用，需要重新生成 QR
 - 浏览器通知依赖用户授权；若用户拒绝，仍可正常收发文件，仅不弹系统通知
 - 页脚规范：各页面底部仅保留 `© Master Huang · Misaka Network` 与 GitHub 链接；设置页 About 同步保持一致
+- 页脚组件化：Home / ACGN 复用同一 `AppFooter` source，后续统一改版仅需改一处
+- Docker 验证依赖本机 daemon；若 `docker.sock` 不可用，将无法本机完成镜像构建与容器启动验证
 
 ## 决策记录（精简）
 
@@ -140,3 +142,4 @@
 - QR join：`/join` 以链接 `id` 覆盖本机 nodeId，`c` 存在时 base64 解码为通行码并自动注册；`c` 缺失或错误时停在通行码输入卡片，不再要求先返回首页注册
 - 接收卡片去重：`deliverCompletedFile` 以 `transferId` 去重，防止同一传输在并发回调下重复插入 file 消息
 - 未读与通知：`unreadByPeer` 记录每节点消息/文件未读数；收到文件时若页面在后台且通知权限已授权，触发系统 Notification
+- 部署标准化：根目录新增 `docker-compose.yml`，后端新增多阶段 `server/Dockerfile`；README 统一提供前后端部署步骤与 `config.json` 运行时后端地址配置方案
