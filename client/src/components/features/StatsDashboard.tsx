@@ -29,13 +29,13 @@ function formatUptime(sec: number) {
 }
 
 const STAT_CARDS = [
-  { kanji: '同', label: '在线实验体数',     furigana: 'オンライン数',   key: 'onlineNodes',      format: (v: number) => v.toLocaleString(),    unit: '节点' },
-  { kanji: '峰', label: '峰值并发连接',     furigana: 'ピーク同時接続', key: 'peakConcurrent',   format: (v: number) => v.toLocaleString(),    unit: '节点' },
-  { kanji: '流', label: '累计脑波同步次数', furigana: '累計シンクロ数', key: 'totalTransfers',   format: (v: number) => v.toLocaleString(),    unit: '次' },
-  { kanji: '量', label: '累计数据通量',     furigana: '累積データ量',   key: 'totalBytes',       format: (v: number) => formatBytes(v),        unit: '' },
-  { kanji: '链', label: '当前活跃信道',     furigana: '活性チャンネル', key: 'activeChannels',   format: (v: number) => v.toLocaleString(),    unit: '条' },
-  { kanji: '稳', label: '最长节点在线',     furigana: '最長ノード稼働', key: 'uptimeLongestMs', format: (v: number) => formatDuration(v),      unit: '' },
-  { kanji: '時', label: '信令服务运行时间', furigana: 'サーバー稼働時間', key: 'uptimeSeconds',  format: (v: number) => formatUptime(v),        unit: '' },
+  { kanji: '同', label: '在线实验体数',     hint: '当前在线节点', key: 'onlineNodes',      format: (v: number) => v.toLocaleString(),    unit: '节点' },
+  { kanji: '峰', label: '峰值并发连接',     hint: '历史最高在线', key: 'peakConcurrent',   format: (v: number) => v.toLocaleString(),    unit: '节点' },
+  { kanji: '流', label: '累计脑波同步次数', hint: '累计传输次数', key: 'totalTransfers',   format: (v: number) => v.toLocaleString(),    unit: '次' },
+  { kanji: '量', label: '累计数据通量',     hint: '累计传输体量', key: 'totalBytes',       format: (v: number) => formatBytes(v),        unit: '' },
+  { kanji: '链', label: '当前活跃信道',     hint: '正在连接的信道', key: 'activeChannels',   format: (v: number) => v.toLocaleString(),    unit: '条' },
+  { kanji: '稳', label: '最长节点在线',     hint: '最长在线时长', key: 'uptimeLongestMs', format: (v: number) => formatDuration(v),      unit: '' },
+  { kanji: '时', label: '信令服务运行时间', hint: '服务运行时长', key: 'uptimeSeconds',  format: (v: number) => formatUptime(v),        unit: '' },
 ]
 
 export default function StatsDashboard() {
@@ -85,7 +85,7 @@ export default function StatsDashboard() {
           <MisakaKanjiBlock char="観" size="lg" />
           <h2>网络运行情报</h2>
         </div>
-        <p className="furigana ml-[calc(2rem+0.6rem)]">ネットワーク観測</p>
+        <p className="furigana ml-[calc(2rem+0.6rem)]">实时服务状态</p>
         <div className="accent-line" />
       </div>
 
@@ -105,7 +105,7 @@ export default function StatsDashboard() {
             >
               <div className="flex items-start justify-between mb-3">
                 <MisakaKanjiBlock char={card.kanji} size="sm" />
-                <span className="font-jp text-xs text-[var(--text-on-white-2)]">{card.furigana}</span>
+                <span className="font-kanji text-xs text-[var(--text-on-white-2)]">{card.hint}</span>
               </div>
               <div className="font-kanji font-bold text-4xl tabular-nums text-[var(--text-on-white)] group-hover:text-[var(--accent-cyan)] transition-colors">
                 {card.format(value)}

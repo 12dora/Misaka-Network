@@ -218,8 +218,8 @@ export default function ScanModal({ onClose }: Props) {
             <div className="font-kanji font-bold text-base text-[var(--text-on-white)]">
               扫描节点 QR
             </div>
-            <div className="font-jp text-xs text-[var(--text-on-white-2)]">
-              スキャン
+            <div className="font-kanji text-xs text-[var(--text-on-white-2)]">
+              扫描或粘贴接入链接
             </div>
           </div>
         </div>

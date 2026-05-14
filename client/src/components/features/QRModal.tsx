@@ -87,9 +87,9 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
   }
 
   const qrLabel = {
-    node: { ja: 'ノード QR', zh: '节点 QR' },
-    file: { ja: 'ファイル QR', zh: '文件 QR' },
-    channel: { ja: 'チャンネル QR', zh: '批次 QR' },
+    node: '节点 QR',
+    file: '文件 QR',
+    channel: '批次 QR',
   }[qrType]
 
   return (
@@ -125,8 +125,8 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
             <div className="font-kanji font-bold text-base text-[var(--text-on-white)]">
               我的接入 QR
             </div>
-            <div className="font-jp text-xs text-[var(--text-on-white-2)]">
-              わたしの {qrLabel.ja}
+            <div className="font-kanji text-xs text-[var(--text-on-white-2)]">
+              用于让其他设备接入当前节点
             </div>
           </div>
         </div>
@@ -136,7 +136,7 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
           className="font-kanji text-[11px] px-2 py-0.5 rounded-full"
           style={{ background: 'var(--surface-tint)', color: 'var(--text-on-white-2)' }}
         >
-          {qrLabel.zh}
+          {qrLabel}
         </span>
 
         {/* QR canvas */}
@@ -167,8 +167,8 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
           <div className="font-kanji font-bold text-sm text-[var(--text-on-white)]">
             御坂 {nodeId} 号
           </div>
-          <div className="font-jp text-xs text-[var(--text-on-white-2)]">
-            みさか {nodeId} ごう
+          <div className="font-kanji text-xs text-[var(--text-on-white-2)]">
+            当前节点
           </div>
         </div>
 

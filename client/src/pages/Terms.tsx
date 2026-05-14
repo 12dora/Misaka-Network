@@ -15,7 +15,7 @@ export default function Terms() {
           style={{ background: 'var(--surface)', color: 'var(--text-on-white)' }}
         >
           <p>
-            御坂网络（Misaka Network，以下简称「本服务」）是 Fan-made 非商业 P2P 文件传输应用，
+            御坂网络（Misaka Network，以下简称「本服务」）是非商业 P2P 文件传输应用，
             定位为《某科学的超电磁炮》同人技术实验项目。
           </p>
 

@@ -146,8 +146,8 @@ export default function Join() {
               <div className="font-kanji font-bold text-lg text-[var(--text-on-white)]">
                 正在接入御坂网络
               </div>
-              <div className="font-jp text-xs text-[var(--text-on-white-2)] mt-1">
-                接続中…
+              <div className="font-kanji text-xs text-[var(--text-on-white-2)] mt-1">
+                正在验证 QR 链接
               </div>
             </div>
             <div className="w-12 h-1 rounded-full animate-pulse" style={{ background: 'var(--accent-cyan)' }} />
@@ -161,8 +161,8 @@ export default function Join() {
               <div className="font-kanji font-bold text-lg text-[var(--text-on-white)]">
                 输入通行码
               </div>
-              <div className="font-jp text-xs text-[var(--text-on-white-2)] mt-1">
-                御坂 {joinInfo.targetNodeId} 号への接続
+              <div className="font-kanji text-xs text-[var(--text-on-white-2)] mt-1">
+                接入御坂 {joinInfo.targetNodeId} 号
               </div>
             </div>
             <input
@@ -196,7 +196,7 @@ export default function Join() {
               <div className="font-kanji font-bold text-lg text-[var(--state-danger)]">
                 接入失败
               </div>
-              <div className="font-jp text-xs text-[var(--text-on-white-2)] mt-1">
+              <div className="font-kanji text-xs text-[var(--text-on-white-2)] mt-1">
                 {errorMsg}
               </div>
             </div>
