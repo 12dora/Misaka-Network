@@ -167,6 +167,15 @@ router.get('/stats', (_req, res) => {
   })
 })
 
+// GET /api/health
+router.get('/health', (_req, res) => {
+  res.json({
+    ok: true,
+    uptimeSeconds: Math.floor((Date.now() - stats.startedAt) / 1000),
+    onlineNodes: getOnlineCount(),
+  })
+})
+
 // POST /api/transfer-done
 router.post('/transfer-done', (req, res) => {
   const parsed = z.object({
