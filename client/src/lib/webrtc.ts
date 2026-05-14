@@ -7,6 +7,10 @@ const DEFAULT_STUN: RTCIceServer[] = [
 
 // ICE candidate pair → channel type
 export type ChannelType = 'direct' | 'stun' | 'relay'
+export interface SelectedIcePath {
+  channelType: ChannelType | null
+  pathText: string
+}
 
 export function candidateType(candidate: RTCIceCandidate): ChannelType | null {
   if (!candidate.candidate) return null
@@ -27,6 +31,39 @@ export async function getSelectedChannelType(pc: RTCPeerConnection): Promise<Cha
         if (local?.candidateType === 'srflx') return 'stun'
         if (local?.candidateType === 'relay') return 'relay'
         return null
+      }
+    }
+  } catch { /* stats may fail */ }
+  return null
+}
+
+function normalizeCandidateType(t?: string): 'host' | 'srflx' | 'relay' | 'unknown' {
+  if (t === 'host' || t === 'srflx' || t === 'relay') return t
+  return 'unknown'
+}
+
+function toChannelType(t: 'host' | 'srflx' | 'relay' | 'unknown'): ChannelType | null {
+  if (t === 'host') return 'direct'
+  if (t === 'srflx') return 'stun'
+  if (t === 'relay') return 'relay'
+  return null
+}
+
+export async function getSelectedIcePath(pc: RTCPeerConnection): Promise<SelectedIcePath | null> {
+  try {
+    const stats = await pc.getStats()
+    for (const report of stats.values()) {
+      if (report.type !== 'candidate-pair' || report.state !== 'succeeded' || !report.nominated) continue
+      const local = stats.get(report.localCandidateId)
+      const remote = stats.get(report.remoteCandidateId)
+      const localType = normalizeCandidateType(local?.candidateType)
+      const remoteType = normalizeCandidateType(remote?.candidateType)
+      const channelType = toChannelType(localType)
+      const localProto = local?.protocol || '?'
+      const remoteProto = remote?.protocol || '?'
+      return {
+        channelType,
+        pathText: `${localType}/${localProto} → ${remoteType}/${remoteProto}`,
       }
     }
   } catch { /* stats may fail */ }
