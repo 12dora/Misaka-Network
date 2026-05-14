@@ -328,24 +328,16 @@ export default function ACGN() {
         className="px-6 py-14 text-center"
         style={{ background: 'var(--bg-deep)' }}
       >
-        <MisakaKanjiBlock char="敬" size="xl" className="mx-auto mb-6" />
-        <div className="font-jp text-sm text-[var(--text-on-blue-2)] leading-loose space-y-2">
-          <p className="text-white text-base font-kanji font-semibold">御坂网络 / MISAKA NETWORK · 粉丝作品</p>
-          <p className="font-jp">みさかネットワーク · ファン制作</p>
-          <p className="mt-4">
-            本作品致敬 <strong className="text-white">镰池和马</strong>、<strong className="text-white">冬川基</strong> 的原作<br />
-            《某科学的超电磁炮》A Certain Scientific Railgun<br />
-            <span className="font-jp">とある科学の超電磁砲</span>
-          </p>
-          <p className="mt-4 text-xs">
-            · 非商业用途 Non-Commercial　· 不存储用户文件 No File Storage<br />
-            · 所有版权归原作者所有 All Rights Reserved to Original Creators
-          </p>
-        </div>
-        <div className="flex flex-wrap justify-center gap-3 mt-8">
-          {['GitHub', '反馈', '服务条款', '隐私政策'].map(label => (
-            <button key={label} className="nav-pill text-xs py-1.5 px-4">{label}</button>
-          ))}
+        <div className="font-jp text-sm text-[var(--text-on-blue-2)] leading-loose">
+          <p className="text-white text-base font-kanji font-semibold mb-3">© Master Huang · Misaka Network</p>
+          <a
+            className="nav-pill text-xs py-1.5 px-4 no-underline"
+            href="https://github.com/12dora/Misaka-Network"
+            target="_blank"
+            rel="noreferrer"
+          >
+            GitHub
+          </a>
         </div>
       </footer>
     </div>

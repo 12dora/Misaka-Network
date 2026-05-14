@@ -9,6 +9,7 @@ import { useNetworkStore } from '@/store/network'
 import { useAuthStore } from '@/store/auth'
 import { apiUrl } from '@/config'
 import { humanizeError } from '@/lib/transfer'
+import { ensureNotificationPermission } from '@/lib/notify'
 import type { Peer, Transfer } from '@/types'
 
 function channelLabel(t: Peer['channelType']) {
@@ -32,9 +33,10 @@ function formatSpeed(bps: number) {
 }
 
 // ── NodeRadar ─────────────────────────────────────────────────────
-function NodeRadar({ peers, selected, onSelect, onShowQR, onCopyLink }: {
+function NodeRadar({ peers, selected, unreadByPeer, onSelect, onShowQR, onCopyLink }: {
   peers: Peer[]
   selected: string | null
+  unreadByPeer: Record<string, { message: number; file: number }>
   onSelect: (sessionId: string) => void
   onShowQR: () => void
   onCopyLink: () => void
@@ -61,6 +63,8 @@ function NodeRadar({ peers, selected, onSelect, onShowQR, onCopyLink }: {
       ) : (
         peers.map(peer => {
           const isSelected = selected === peer.sessionId
+          const unread = unreadByPeer[peer.sessionId]
+          const hasUnread = !!unread && (unread.message > 0 || unread.file > 0)
           // Suffix the last 4 chars of sessionId so multiple devices sharing
           // the same nodeId remain visually distinguishable in the list.
           const sidTag = peer.sessionId.slice(-4)
@@ -81,6 +85,15 @@ function NodeRadar({ peers, selected, onSelect, onShowQR, onCopyLink }: {
                   御坂 {peer.nodeId} 号
                   <span className="ml-1 font-mono text-[10px] text-[var(--text-muted)]">#{sidTag}</span>
                 </span>
+                {hasUnread && (
+                  <span
+                    className="ml-2 inline-flex items-center justify-center min-w-5 h-5 px-1 rounded-full text-[10px] font-mono text-white"
+                    style={{ background: 'var(--state-danger)' }}
+                    title={`未读消息 ${unread.message}，未读文件 ${unread.file}`}
+                  >
+                    {Math.min(99, unread.message + unread.file)}
+                  </span>
+                )}
               </div>
               <div className="pl-2 space-y-0.5 text-xs text-[var(--text-on-white-2)] font-kanji mb-1">
                 <div>▪ {channelLabel(peer.channelType)}</div>
@@ -497,6 +510,7 @@ export default function Network() {
   const [activeTab, setActiveTab] = useState<TabId>('radar')
   const [showQR, setShowQR]   = useState(false)
   const [toast, setToast] = useState<string | null>(null)
+  const [channelOpenedAt, setChannelOpenedAt] = useState(0)
 
   const auth = useAuthStore()
   const store = useNetworkStore()
@@ -506,6 +520,19 @@ export default function Network() {
       store.init(auth.session.token)
     }
   }, [auth.session?.token])
+
+  useEffect(() => {
+    ensureNotificationPermission().catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    if (store.peers.length === 1 && !store.selectedSessionId) {
+      const onlyPeer = store.peers[0]
+      store.selectPeer(onlyPeer.sessionId)
+      setActiveTab('channel')
+      setChannelOpenedAt(Date.now())
+    }
+  }, [store.peers, store.selectedSessionId])
 
   async function handleCopyLink() {
     if (!auth.session?.token) return
@@ -534,6 +561,7 @@ export default function Network() {
   function handleSelectPeer(sessionId: string) {
     store.selectPeer(sessionId)
     setActiveTab('channel')
+    setChannelOpenedAt(Date.now())
   }
 
   function handleStageFile(file: File) {
@@ -557,16 +585,22 @@ export default function Network() {
           <NodeRadar
             peers={store.peers}
             selected={store.selectedSessionId}
+            unreadByPeer={store.unreadByPeer}
             onSelect={handleSelectPeer}
             onShowQR={() => setShowQR(true)}
             onCopyLink={handleCopyLink}
           />
         </div>
-        <TransferChannel
-          selectedPeer={peerEntity}
-          onStageFile={handleStageFile}
-          onSendFileToAll={handleSendFileToAll}
-        />
+        <div
+          key={peerEntity?.sessionId ?? 'empty'}
+          className={channelOpenedAt > 0 ? 'channel-enter' : ''}
+        >
+          <TransferChannel
+            selectedPeer={peerEntity}
+            onStageFile={handleStageFile}
+            onSendFileToAll={handleSendFileToAll}
+          />
+        </div>
         <div className="overflow-y-auto">
           <TaskPanel
             transfers={store.transfers}
@@ -606,19 +640,25 @@ export default function Network() {
         <div className="flex-1 overflow-y-auto p-4">
           {activeTab === 'radar' && (
             <NodeRadar
-              peers={store.peers}
-              selected={store.selectedSessionId}
-              onSelect={handleSelectPeer}
-              onShowQR={() => setShowQR(true)}
-              onCopyLink={handleCopyLink}
+            peers={store.peers}
+            selected={store.selectedSessionId}
+            unreadByPeer={store.unreadByPeer}
+            onSelect={handleSelectPeer}
+            onShowQR={() => setShowQR(true)}
+            onCopyLink={handleCopyLink}
             />
           )}
           {activeTab === 'channel' && (
-            <TransferChannel
-              selectedPeer={peerEntity}
-              onStageFile={handleStageFile}
-              onSendFileToAll={handleSendFileToAll}
-            />
+            <div
+              key={peerEntity?.sessionId ?? 'empty-mobile'}
+              className={channelOpenedAt > 0 ? 'channel-enter' : ''}
+            >
+              <TransferChannel
+                selectedPeer={peerEntity}
+                onStageFile={handleStageFile}
+                onSendFileToAll={handleSendFileToAll}
+              />
+            </div>
           )}
           {activeTab === 'tasks' && (
             <TaskPanel

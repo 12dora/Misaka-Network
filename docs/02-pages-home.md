@@ -8,7 +8,7 @@
 FIRSTFOLD  钴蓝海报 = 左立绘 + 右上胶囊导航 + 右中字标 + 右下登录卡片
 SECOND     网络运行情报（StatsDashboard 6 卡）
 THIRD      实时活动流（ActivityStream 横向滚动）
-FOOTER     致敬声明（复用 ACGN 页脚简版）
+FOOTER     版权信息（作者 + GitHub）
 ```
 
 全页背景 `var(--bg-primary)`。
@@ -105,7 +105,7 @@ Section Header 模式（全站复用）：
 
 ## 4. Footer
 
-ACGN 页脚简版，`--bg-deep` 背景白字。
+仅保留 App 作者版权与 GitHub 链接。
 
 ## 状态管理（Zustand）
 

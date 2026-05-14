@@ -23,6 +23,7 @@ import {
 } from '@/lib/transfer'
 import { getTransfer, getActiveTransfers } from '@/lib/db'
 import { playSound } from '@/lib/sound'
+import { notifyIncomingFile } from '@/lib/notify'
 
 // ── Non-reactive WebRTC state ────────────────────────────────────────
 // All routing is per-session (one device = one sessionId). Multiple devices
@@ -36,6 +37,7 @@ const iceRestartAttempts = new Map<string, number>()
 const MAX_ICE_RESTART_ATTEMPTS = 3
 const sendingFiles = new Map<string, File>()  // transferId → File
 let initialized = false   // see init() — prevents StrictMode double-registration
+const deliveredTransfers = new Set<string>()  // one file card per transferId
 
 // Messages typed before the DC fully opened, flushed in dc.onopen.
 const outgoingQueue = new Map<string, string[]>()
@@ -67,6 +69,7 @@ interface NetworkState {
   chatMessages: Record<string, ChannelMessage[]>   // keyed by peer sessionId
   pendingFiles: Record<string, File>               // peer sessionId -> file awaiting send
   connectedPeers: Set<string>                      // sessionIds with open DC
+  unreadByPeer: Record<string, { message: number; file: number }>
 
   init: (token: string) => void
   destroy: () => void
@@ -92,6 +95,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
   chatMessages: {},
   pendingFiles: {},
   connectedPeers: new Set(),
+  unreadByPeer: {},
 
   init(token: string) {
     // React 18 StrictMode double-mounts effects in dev, which would register
@@ -130,12 +134,14 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
           set(s => {
             const { [sid]: _omit, ...restChat } = s.chatMessages
             const { [sid]: _f, ...restFiles } = s.pendingFiles
+            const { [sid]: _u, ...restUnread } = s.unreadByPeer
             const nextConnected = new Set(s.connectedPeers); nextConnected.delete(sid)
             return {
               peers: s.peers.map(p => p.sessionId === sid ? { ...p, status: 'offline' as const } : p),
               chatMessages: restChat,
               pendingFiles: restFiles,
               connectedPeers: nextConnected,
+              unreadByPeer: restUnread,
               selectedSessionId: s.selectedSessionId === sid ? null : s.selectedSessionId,
             }
           })
@@ -179,12 +185,19 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     set({
       wsConnected: false, mySessionId: null, channelId: null,
       peers: [], selectedSessionId: null, transfers: [],
-      chatMessages: {}, pendingFiles: {}, connectedPeers: new Set(),
+      chatMessages: {}, pendingFiles: {}, connectedPeers: new Set(), unreadByPeer: {},
     })
   },
 
   selectPeer(sessionId) {
-    set({ selectedSessionId: sessionId })
+    if (!sessionId) {
+      set({ selectedSessionId: null })
+      return
+    }
+    set(s => {
+      const { [sessionId]: _seen, ...rest } = s.unreadByPeer
+      return { selectedSessionId: sessionId, unreadByPeer: rest }
+    })
   },
 
   setPendingFile(sessionId, file) {
@@ -672,7 +685,14 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
           }
           useNetworkStore.setState(s => {
             const msgs = [...(s.chatMessages[peerSessionId] ?? []), chatMsg]
-            return { chatMessages: { ...s.chatMessages, [peerSessionId]: msgs } }
+            const shouldMarkUnread = s.selectedSessionId !== peerSessionId
+            const prevUnread = s.unreadByPeer[peerSessionId] ?? { message: 0, file: 0 }
+            return {
+              chatMessages: { ...s.chatMessages, [peerSessionId]: msgs },
+              unreadByPeer: shouldMarkUnread
+                ? { ...s.unreadByPeer, [peerSessionId]: { ...prevUnread, message: prevUnread.message + 1 } }
+                : s.unreadByPeer,
+            }
           })
           return
         }
@@ -721,6 +741,9 @@ async function attemptIceRestart(peerSessionId: string) {
 }
 
 async function deliverCompletedFile(transferId: string, peerSessionId: string) {
+  if (deliveredTransfers.has(transferId)) return
+  deliveredTransfers.add(transferId)
+
   const handle = getWriteHandle(transferId)
   const opfsHandle = getOPFSHandle(transferId)
 
@@ -733,6 +756,7 @@ async function deliverCompletedFile(transferId: string, peerSessionId: string) {
       cleanupTransferRecord(transferId)
     } catch (err) {
       failTransferRecord(transferId, String(err))
+      deliveredTransfers.delete(transferId)
       playSound('error')
     }
   } else if (opfsHandle && opfsHandle.written.size === opfsHandle.totalChunks) {
@@ -745,6 +769,7 @@ async function deliverCompletedFile(transferId: string, peerSessionId: string) {
       cleanupOPFS(transferId).catch(() => {})
     } catch (err) {
       failTransferRecord(transferId, String(err))
+      deliveredTransfers.delete(transferId)
       playSound('error')
       cleanupOPFS(transferId).catch(() => {})
     }
@@ -757,6 +782,7 @@ async function deliverCompletedFile(transferId: string, peerSessionId: string) {
       cleanupTransferRecord(transferId)
     } catch (err) {
       failTransferRecord(transferId, String(err))
+      deliveredTransfers.delete(transferId)
       playSound('error')
     }
   }
@@ -770,8 +796,17 @@ function appendFileChat(peerSessionId: string, fileName: string, fileSize: numbe
   }
   useNetworkStore.setState(s => {
     const msgs = [...(s.chatMessages[peerSessionId] ?? []), m]
-    return { chatMessages: { ...s.chatMessages, [peerSessionId]: msgs } }
+    const shouldMarkUnread = s.selectedSessionId !== peerSessionId
+    const prevUnread = s.unreadByPeer[peerSessionId] ?? { message: 0, file: 0 }
+    return {
+      chatMessages: { ...s.chatMessages, [peerSessionId]: msgs },
+      unreadByPeer: shouldMarkUnread
+        ? { ...s.unreadByPeer, [peerSessionId]: { ...prevUnread, file: prevUnread.file + 1 } }
+        : s.unreadByPeer,
+    }
   })
+  const peerNodeId = useNetworkStore.getState().peers.find(p => p.sessionId === peerSessionId)?.nodeId
+  notifyIncomingFile({ peerNodeId, fileName, fileSize })
 }
 
 function cleanupTransferRecord(transferId: string) {

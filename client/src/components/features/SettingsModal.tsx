@@ -8,6 +8,7 @@ import {
   type TurnServer, type TurnSettings, type Blocklist,
 } from '@/lib/turn'
 import { isSoundEnabled, setSoundEnabled, subscribeSoundPreference, playSound } from '@/lib/sound'
+import { ensureNotificationPermission } from '@/lib/notify'
 
 interface Props {
   onClose: () => void
@@ -334,6 +335,21 @@ export default function SettingsModal({ onClose }: Props) {
                   </MisakaButton>
                 ))}
               </div>
+              <div className="pt-2 border-t" style={{ borderColor: 'var(--border-card)' }}>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-kanji text-xs text-[var(--text-on-white-2)]">文件接收通知</span>
+                  <MisakaButton
+                    variant="pill"
+                    size="sm"
+                    onClick={async () => {
+                      const p = await ensureNotificationPermission()
+                      if (p === 'granted') playSound('complete')
+                    }}
+                  >
+                    授权通知
+                  </MisakaButton>
+                </div>
+              </div>
             </div>
           )}
 
@@ -378,8 +394,15 @@ export default function SettingsModal({ onClose }: Props) {
           {tab === 'about' && (
             <div className="flex flex-col gap-4">
               <div className="font-kanji text-xs text-[var(--text-on-white-2)] leading-relaxed">
-                <p className="mb-2">御坂网络（Misaka Network）— 浏览器内 P2P 文件传输应用。</p>
-                <p className="mb-2">Fan-made 非商业项目，致敬镰池和马、冬川基。</p>
+                <p className="mb-2">© Master Huang · Misaka Network</p>
+                <a
+                  href="https://github.com/12dora/Misaka-Network"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline decoration-dotted"
+                >
+                  GitHub
+                </a>
               </div>
               <div className="flex flex-col gap-2">
                 <MisakaButton variant="pill" size="sm" fullWidth
