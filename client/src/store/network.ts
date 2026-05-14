@@ -6,7 +6,7 @@ import {
 } from '@/lib/signaling'
 import {
   createPeerConnection, createDataChannel, createOffer, createAnswer,
-  applyAnswer, addIceCandidate, getSelectedChannelType,
+  applyAnswer, addIceCandidate, getSelectedChannelType, getSelectedIcePath,
 } from '@/lib/webrtc'
 import {
   generateECDHKeyPair, getMyPublicKey, setPeerPublicKey,
@@ -426,11 +426,18 @@ async function initiateWebRTC(peerSessionId: string) {
     const state = pc.iceConnectionState
     if (state === 'connected' || state === 'completed') {
       iceRestartAttempts.set(peerSessionId, 0)
-      const ct = await getSelectedChannelType(pc)
+      const selectedPath = await getSelectedIcePath(pc)
+      const ct = selectedPath?.channelType ?? await getSelectedChannelType(pc)
       useNetworkStore.setState(s => ({
         peers: s.peers.map(p =>
           p.sessionId === peerSessionId
-            ? { ...p, status: 'transferring' as NodeStatus, channelType: ct ?? 'stun' }
+            ? {
+                ...p,
+                status: 'transferring' as NodeStatus,
+                channelType: ct ?? 'stun',
+                icePath: selectedPath?.pathText,
+                icePathMeasuredAt: selectedPath?.pathText ? Date.now() : p.icePathMeasuredAt,
+              }
             : p,
         ),
         connectedPeers: new Set([...s.connectedPeers, peerSessionId]),
@@ -478,11 +485,18 @@ async function handleRemoteSDP(fromSessionId: string, fromNodeId: number, sdp: R
       const state = pc!.iceConnectionState
       if (state === 'connected' || state === 'completed') {
         iceRestartAttempts.set(fromSessionId, 0)
-        const ct = await getSelectedChannelType(pc!)
+        const selectedPath = await getSelectedIcePath(pc!)
+        const ct = selectedPath?.channelType ?? await getSelectedChannelType(pc!)
         useNetworkStore.setState(s => ({
           peers: s.peers.map(p =>
             p.sessionId === fromSessionId
-              ? { ...p, status: 'transferring' as NodeStatus, channelType: ct ?? 'stun' }
+              ? {
+                  ...p,
+                  status: 'transferring' as NodeStatus,
+                  channelType: ct ?? 'stun',
+                  icePath: selectedPath?.pathText,
+                  icePathMeasuredAt: selectedPath?.pathText ? Date.now() : p.icePathMeasuredAt,
+                }
               : p,
           ),
           connectedPeers: new Set([...s.connectedPeers, fromSessionId]),

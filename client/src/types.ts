@@ -42,6 +42,8 @@ export interface Peer {
   nodeId: number         // user-input identity number — for display
   status: NodeStatus
   channelType: 'direct' | 'stun' | 'relay' | 'ws'
+  icePath?: string
+  icePathMeasuredAt?: number
   joinedAt: number
 }
 
