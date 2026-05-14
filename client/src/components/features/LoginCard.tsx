@@ -310,7 +310,11 @@ export default function LoginCard() {
         >
           <span
             className="grid place-items-center w-10 h-10 rounded-lg shrink-0 font-kanji font-bold"
-            style={{ background: 'var(--bg-deep)', color: '#fff' }}
+            style={{
+              background: 'linear-gradient(145deg, var(--bg-deep), var(--bg-soft))',
+              color: '#fff',
+              boxShadow: '0 8px 18px -10px rgba(14,42,107,0.55)',
+            }}
           >
             読
           </span>

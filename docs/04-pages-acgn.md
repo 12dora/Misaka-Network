@@ -9,7 +9,7 @@ Hero        立绘 + 字标 + 长副标（复用首页 FirstFold 构图）
 Section 1   关于御坂网络 / みさかネットワークについて
 Section 2   实验体档案 / 実験体ファイル
 Section 3   彩蛋功能 / おまけ機能
-Footer      致敬声明
+Footer      版权信息
 ```
 
 Section 间用一条 `2px var(--accent-cyan)` 短光线（120px 宽）+ `kanji-block` 章号分割。
@@ -69,23 +69,16 @@ Section 间用一条 `2px var(--accent-cyan)` 短光线（120px 宽）+ `kanji-b
 - 日期 mono；每行进入时左侧出现 `--accent-cyan` 圆点
 - 列表自动循环滚动（30s 周期，hover 暂停）
 
-## Footer · 致敬声明
+## Footer · 版权信息
 
-固定底部，`--bg-deep` 背景白字。大号 `kanji-block`「敬」居中。
+固定底部，`--bg-deep` 背景白字。
 
 ```
-御坂网络 / MISAKA NETWORK · 粉丝作品
-みさかネットワーク · ファン制作
-
-本作品致敬 镰池和马、冬川基 的原作
-《某科学的超电磁炮》/ A Certain Scientific Railgun / とある科学の超電磁砲
-
-· 非商业用途  · 不存储用户文件  · 所有版权归原作者所有
-
-GitHub · 反馈 · 服务条款 · 隐私政策
+© Master Huang · Misaka Network
+GitHub
 ```
 
-字体 `var(--font-display-jp)` 明朝、行距宽松。底部链接用白色胶囊小按钮。
+仅保留作者版权信息与 GitHub 链接（白色胶囊按钮）。
 
 ## 实现要点
 

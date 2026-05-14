@@ -127,9 +127,16 @@ export default function Home() {
         style={{ background: 'var(--bg-deep)' }}
       >
         <p className="font-jp text-sm text-[var(--text-on-blue-2)] leading-loose">
-          御坂网络 / MISAKA NETWORK · 粉丝作品<br />
-          致敬 镰池和马、冬川基 的原作《某科学的超电磁炮》<br />
-          <span className="text-xs">非商业 · 不存储用户文件 · 所有版权归原作者</span>
+          © Master Huang · Misaka Network
+          <br />
+          <a
+            href="https://github.com/12dora/Misaka-Network"
+            target="_blank"
+            rel="noreferrer"
+            className="text-xs underline decoration-dotted"
+          >
+            GitHub
+          </a>
         </p>
       </footer>
     </div>
