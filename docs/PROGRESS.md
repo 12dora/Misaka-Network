@@ -15,7 +15,7 @@
 
 ## v2 — 生产就绪 & 鲁棒性
 
-☑ QA bug 修复完成（BUG-1 ~ BUG-8）— 见 docs/bug.md
+☑ QA bug 修复完成（BUG-1 ~ BUG-8）— 见 docs/archive/bug.md
 
 ### 2.1 真机 / 实网端到端验证
 - ☑ PC ↔ 手机 QR 扫码加入（已测试）
