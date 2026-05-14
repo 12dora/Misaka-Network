@@ -76,12 +76,12 @@
 
 ### 3.7 性能
 - ☑ 路由级懒加载 + bundle 拆分
-- ◐ Lighthouse 90+（已做性能侧拆包 / worker；需浏览器 Lighthouse 实测）
+- ☑ Lighthouse 90+（2026-05-14 实测 desktop：首页 Performance 99）
 - ☑ 大文件 hash 走 Web Worker
 
 ## 当前会话焦点
 
-ICE 路径实测与部署准备：保留 TURN / ICE / 自托管 / PWA / Lighthouse；已补网络页 ICE 路径可视化（候选类型/协议），待 host/srflx/relay 三场景逐项实测。
+部署准备与实网验证收尾：Lighthouse 已达标；待完成 ICE host/srflx/relay 三场景实测与 TURN 实际部署验证。
 
 ## 已知问题
 
@@ -93,6 +93,7 @@ ICE 路径实测与部署准备：保留 TURN / ICE / 自托管 / PWA / Lighthou
 - File System Access API 仅在 Chromium 系浏览器可用，Safari/Firefox 使用 OPFS 磁盘缓存替代（相同效果）
 - OPFS 写入可能因磁盘配额不足失败 → 自动降级 IndexedDB + Blob 内存组装
 - Lighthouse 90+ 尚未在真实浏览器环境跑分，仅完成代码侧优化与生产构建验证
+- Lighthouse 已完成 desktop 实测；移动端与弱网分数仍建议后续补测（当前项仅以 desktop 达标闭环）
 - QR token 单次使用：同一复制链接完成一次接入后再次打开会提示过期 / 已使用，需要重新生成 QR
 - 浏览器通知依赖用户授权；若用户拒绝，仍可正常收发文件，仅不弹系统通知
 - 页脚规范：各页面底部仅保留 `© Master Huang · Misaka Network` 与 GitHub 链接；设置页 About 同步保持一致
@@ -134,6 +135,7 @@ ICE 路径实测与部署准备：保留 TURN / ICE / 自托管 / PWA / Lighthou
 - PWA 起步：新增 `public/sw.js` 并在 `main.tsx` 注册；采用 app shell 缓存与导航离线回退（`index.html`），静态资源走缓存优先，`/api` 与 `/ws` 始终直连网络
 - PWA 安装链路：新增 `manifest.webmanifest` 并在 `index.html` 挂载；TopNav 监听 `beforeinstallprompt/appinstalled`，在可安装时显示「安装应用」入口
 - Background Sync 评估结论：暂不接入。当前核心是实时信令 + DataChannel 直连，离线队列重放易引入会话时序歧义；保留为后续“非实时任务”能力再评估
+- Lighthouse 达标实测：使用 `vite preview` + Lighthouse desktop preset 对首页跑分；首屏提速主要来自两点——`index.html` 字体请求收敛（移除非首屏 serif 字体）与 Home 首图 `fetchPriority=\"high\" + eager`，最终首页 Performance 99（LCP 0.8s / FCP 0.4s）
 - QR join：`/join` 以链接 `id` 覆盖本机 nodeId，`c` 存在时 base64 解码为通行码并自动注册；`c` 缺失或错误时停在通行码输入卡片，不再要求先返回首页注册
 - 接收卡片去重：`deliverCompletedFile` 以 `transferId` 去重，防止同一传输在并发回调下重复插入 file 消息
 - 未读与通知：`unreadByPeer` 记录每节点消息/文件未读数；收到文件时若页面在后台且通知权限已授权，触发系统 Notification
