@@ -18,6 +18,9 @@ export default function Home() {
             src={HERO_CHARACTER}
             alt="御坂美琴"
             className="animate-float select-none pointer-events-none"
+            loading="eager"
+            fetchPriority="high"
+            decoding="async"
             style={{
               position: 'absolute',
               bottom: 0,
@@ -46,6 +49,9 @@ export default function Home() {
             src={HERO_TITLE}
             alt="とある科学 御坂网络"
             className="select-none pointer-events-none"
+            loading="eager"
+            fetchPriority="high"
+            decoding="async"
             style={{
               width: 'min(260px, 72vw)',
               height: 'auto',
@@ -74,6 +80,9 @@ export default function Home() {
             src={HERO_CHARACTER}
             alt="御坂美琴"
             className="animate-float select-none pointer-events-none"
+            loading="eager"
+            fetchPriority="high"
+            decoding="async"
             style={{
               maxHeight: 'calc(min(100vh, 820px) - 64px)',
               width: '100%',
@@ -94,6 +103,9 @@ export default function Home() {
               src={HERO_TITLE}
               alt="とある科学 御坂网络"
               className="select-none pointer-events-none"
+              loading="eager"
+              fetchPriority="high"
+              decoding="async"
               style={{
                 width: 'clamp(280px, 32vw, 460px)',
                 height: 'auto',
