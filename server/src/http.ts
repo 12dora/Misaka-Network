@@ -2,14 +2,14 @@ import { Router, type Request, type Response, type NextFunction } from 'express'
 import { createHash, randomBytes } from 'crypto'
 import { nanoid } from 'nanoid'
 import { z } from 'zod'
-import { nodes, channels, qrTokens, reports, stats, getOnlineCount, getLongestUptimeMs, countNodesByIp, getCpuUsagePercent } from './store.js'
+import { nodes, channels, qrTokens, reports, stats, getOnlineCount, getLongestUptimeMs, countNodesByIp, getCpuUsagePercent, findSessionByToken } from './store.js'
 import { broadcast } from './activity.js'
 import { checkRateLimit } from './ratelimit.js'
 import type { NodeSession, QrTokenRecord, ReportRecord } from './types.js'
 
 export const router = Router()
 
-const MAX_NODES_PER_IP = 5
+const MAX_NODES_PER_IP = 10
 const MAX_NODES = parseInt(process.env.MAX_NODES ?? '0', 10) || Infinity
 const LOCK_DURATION = 5 * 60 * 1000
 const MAX_ATTEMPTS = 3
@@ -49,53 +49,49 @@ router.post('/register', (req, res) => {
   const { nodeId, passCode } = parsed.data
   const ip = getClientIP(req)
   const now = Date.now()
-  const existing = nodes.get(nodeId)
+  const passCodeHash = hashPassCode(passCode)
 
-  if (existing) {
-    // Check if locked
-    if (now < existing.lockedUntil) {
-      res.status(423).json({ error: 'NODE_LOCKED', unlockAt: existing.lockedUntil })
-      return
-    }
-
-    // Try to resume with same pass code
-    if (existing.passCodeHash === hashPassCode(passCode)) {
-      existing.lastSeen = now
-      existing.token = randomBytes(32).toString('hex')
-      existing.failedAttempts = 0
-      existing.ip = ip
-      res.json({ token: existing.token, expiresAt: now + 30 * 60 * 1000, resumed: true })
-      return
-    }
-
-    // Wrong pass code on existing node
-    existing.failedAttempts++
-    if (existing.failedAttempts >= MAX_ATTEMPTS) {
-      existing.lockedUntil = now + LOCK_DURATION
-      res.status(423).json({ error: 'NODE_LOCKED', unlockAt: existing.lockedUntil })
+  // Identity = (nodeId, passCodeHash). Reject if any session already exists
+  // with the same nodeId but a different passcode — that nodeId is "owned" by
+  // someone else. Otherwise we permit a brand-new session for this identity:
+  // multiple devices may share the same identity (phone + PC1 + PC2) and the
+  // cluster channel relies on that.
+  const sameNodeSessions: NodeSession[] = []
+  for (const s of nodes.values()) {
+    if (s.nodeId === nodeId) sameNodeSessions.push(s)
+  }
+  const lockedSession = sameNodeSessions.find(s => now < s.lockedUntil)
+  if (lockedSession) {
+    res.status(423).json({ error: 'NODE_LOCKED', unlockAt: lockedSession.lockedUntil })
+    return
+  }
+  const conflict = sameNodeSessions.find(s => s.passCodeHash !== passCodeHash)
+  if (conflict) {
+    conflict.failedAttempts++
+    if (conflict.failedAttempts >= MAX_ATTEMPTS) {
+      conflict.lockedUntil = now + LOCK_DURATION
+      res.status(423).json({ error: 'NODE_LOCKED', unlockAt: conflict.lockedUntil })
     } else {
-      res.status(409).json({ error: 'NODE_OCCUPIED' })
+      res.status(409).json({ error: 'NODE_OCCUPIED', message: '该编号已被他人使用' })
     }
     return
   }
 
-  // Global node limit
   if (nodes.size >= MAX_NODES) {
     res.status(503).json({ error: 'NETWORK_FULL', message: '御坂网络已达容量上限' })
     return
   }
-
-  // IP-based node limit
   if (countNodesByIp(ip) >= MAX_NODES_PER_IP) {
     res.status(429).json({ error: 'IP_LIMITED', message: '此 IP 地址节点数已达上限' })
     return
   }
 
-  // New registration
+  const sessionId = nanoid(16)
   const token = randomBytes(32).toString('hex')
   const session: NodeSession = {
+    sessionId,
     nodeId,
-    passCodeHash: hashPassCode(passCode),
+    passCodeHash,
     token,
     socket: null,
     lastSeen: now,
@@ -106,11 +102,38 @@ router.post('/register', (req, res) => {
     joinedAt: now,
     ip,
   }
-  nodes.set(nodeId, session)
+  nodes.set(sessionId, session)
 
   broadcast({ type: 'join', nodeId, message: `御坂 ${nodeId} 号已接入网络` })
 
-  res.json({ token, expiresAt: now + 30 * 60 * 1000, resumed: false })
+  res.json({ sessionId, token, expiresAt: now + 30 * 60 * 1000, resumed: false })
+})
+
+// POST /api/release-by-ip
+// Releases every node currently registered from the caller's IP. Used by the
+// client when the IP node limit is hit so the user can wipe stale sessions
+// (typical for local dev with multiple browsers) and try again.
+router.post('/release-by-ip', (req, res) => {
+  const ip = getClientIP(req)
+  let released = 0
+  for (const [sessionId, session] of nodes) {
+    if (session.ip !== ip) continue
+    if (session.socket) {
+      try { session.socket.close() } catch { /* ignore */ }
+      session.socket = null
+    }
+    if (session.channelId) {
+      const ch = channels.get(session.channelId)
+      if (ch) {
+        ch.delete(sessionId)
+        if (ch.size === 0) channels.delete(session.channelId)
+      }
+    }
+    nodes.delete(sessionId)
+    broadcast({ type: 'leave', nodeId: session.nodeId, message: `御坂 ${session.nodeId} 号通信终止` })
+    released++
+  }
+  res.json({ released })
 })
 
 // POST /api/release
@@ -118,58 +141,16 @@ router.post('/release', (req, res) => {
   const parsed = z.object({ token: z.string() }).safeParse(req.body)
   if (!parsed.success) { res.status(400).json({ error: 'INVALID_INPUT' }); return }
 
-  for (const session of nodes.values()) {
-    if (session.token === parsed.data.token) {
-      if (session.socket) {
-        session.socket.close()
-        session.socket = null
-      }
-      session.lastSeen = Date.now()
-      broadcast({ type: 'leave', nodeId: session.nodeId, message: `御坂 ${session.nodeId} 号通信终止` })
-      break
+  const session = findSessionByToken(parsed.data.token)
+  if (session) {
+    if (session.socket) {
+      session.socket.close()
+      session.socket = null
     }
+    session.lastSeen = Date.now()
+    broadcast({ type: 'leave', nodeId: session.nodeId, message: `御坂 ${session.nodeId} 号通信终止` })
   }
   res.status(204).end()
-})
-
-// POST /api/verify-passcode
-router.post('/verify-passcode', (req, res) => {
-  const parsed = z.object({
-    targetNodeId: z.number().int().min(1).max(20001),
-    passCode:     z.string().length(6).regex(/^\d{6}$/),
-    sourceToken:  z.string(),
-  }).safeParse(req.body)
-
-  if (!parsed.success) { res.status(400).json({ error: 'INVALID_INPUT' }); return }
-
-  const { targetNodeId, passCode, sourceToken } = parsed.data
-  const caller = authMiddleware(sourceToken)
-  if (!caller) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
-
-  const target = nodes.get(targetNodeId)
-  if (!target) { res.status(404).json({ error: 'NODE_NOT_FOUND' }); return }
-
-  const now = Date.now()
-  if (now < target.lockedUntil) {
-    res.status(423).json({ error: 'NODE_LOCKED', unlockAt: target.lockedUntil })
-    return
-  }
-
-  if (target.passCodeHash === hashPassCode(passCode)) {
-    target.failedAttempts = 0
-    res.json({ ok: true })
-  } else {
-    target.failedAttempts++
-    if (target.failedAttempts >= MAX_ATTEMPTS) {
-      target.lockedUntil = now + LOCK_DURATION
-      res.status(423).json({ error: 'NODE_LOCKED', unlockAt: target.lockedUntil })
-    } else {
-      res.status(401).json({
-        error: 'WRONG_PASSCODE',
-        attemptsLeft: MAX_ATTEMPTS - target.failedAttempts,
-      })
-    }
-  }
 })
 
 // GET /api/stats
@@ -210,10 +191,7 @@ router.get('/qr-token', (req, res) => {
   if (!authHeader?.startsWith('Bearer ')) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
   const token = authHeader.slice(7)
 
-  let ownerSession: NodeSession | undefined
-  for (const s of nodes.values()) {
-    if (s.token === token) { ownerSession = s; break }
-  }
+  const ownerSession = findSessionByToken(token)
   if (!ownerSession) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
 
   const qrToken = nanoid(32)
@@ -278,18 +256,17 @@ router.post('/report', (req, res) => {
   const { targetNodeId, reason, sourceToken } = parsed.data
   const ip = getClientIP(req)
 
-  // Find source node
-  let sourceSession: NodeSession | undefined
-  for (const s of nodes.values()) {
-    if (s.token === sourceToken) { sourceSession = s; break }
-  }
+  const sourceSession = findSessionByToken(sourceToken)
   if (!sourceSession) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
 
-  // Cannot report self
   if (sourceSession.nodeId === targetNodeId) { res.status(400).json({ error: 'CANNOT_REPORT_SELF' }); return }
 
-  // Target must exist
-  if (!nodes.has(targetNodeId)) { res.status(404).json({ error: 'NODE_NOT_FOUND' }); return }
+  // Target nodeId must exist on at least one session
+  let targetExists = false
+  for (const s of nodes.values()) {
+    if (s.nodeId === targetNodeId) { targetExists = true; break }
+  }
+  if (!targetExists) { res.status(404).json({ error: 'NODE_NOT_FOUND' }); return }
 
   // Rate limit: max 5 reports per IP per 10 minutes
   const now = Date.now()
@@ -320,10 +297,7 @@ router.post('/report', (req, res) => {
 
 // Middleware to look up session by token
 export function authMiddleware(token: string): NodeSession | null {
-  for (const s of nodes.values()) {
-    if (s.token === token) return s
-  }
-  return null
+  return findSessionByToken(token)
 }
 
 // Catch-all for unknown /api routes — always return JSON

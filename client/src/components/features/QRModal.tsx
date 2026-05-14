@@ -3,7 +3,7 @@ import QRCode from 'qrcode'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
 import { useAuthStore } from '@/store/auth'
-import { useNetworkStore } from '@/store/network'
+import { playSound } from '@/lib/sound'
 
 interface Props {
   nodeId: number
@@ -51,17 +51,9 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
         const data = await res.json() as { qrToken: string; channelId: string; expiresAt: number }
         setQrToken(data.qrToken)
         setExpiresAt(data.expiresAt)
-
-        // Join the QR channel so a scanner can find this owner.
-        // Only switch channels live when already connected — otherwise the
-        // user is still on /login and will join the default passcode-cluster
-        // channel when they enter /network. (Stashing the QR channel in
-        // sessionStorage would silently isolate the owner from the cluster,
-        // breaking same-passcode discovery across browsers.)
-        const ns = useNetworkStore.getState()
-        if (ns.wsConnected) {
-          ns.joinChannel(data.channelId)
-        }
+        playSound('scan')
+        // No channel-switch needed: clusters are now identity-scoped, so a
+        // scanner who joins with the same nodeId+passcode lands automatically.
       }
     } catch { /* ignore */ }
     setLoading(false)

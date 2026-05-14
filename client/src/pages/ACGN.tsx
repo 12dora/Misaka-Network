@@ -2,7 +2,7 @@ import { useState } from 'react'
 import MisakaCard from '@/components/ui/MisakaCard'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
-import { QUOTES, CHARACTERS, LORE_LOG, getCharacterByNodeId } from '@/data/lore'
+import { QUOTES, CHARACTERS, LORE_LOG, LORE_TIMELINE, getCharacterByNodeId } from '@/data/lore'
 
 const HERO_CHARACTER = import.meta.env.BASE_URL + 'assets/misaka.webp'
 const HERO_TITLE     = import.meta.env.BASE_URL + 'assets/misaka-title.webp'
@@ -147,7 +147,7 @@ function EasterEggSection() {
             <MisakaKanjiBlock char="録" size="sm" />
             <span className="font-kanji font-bold text-sm text-[var(--text-on-white)]">网络日志</span>
           </div>
-          <div className="flex flex-col gap-2 overflow-y-auto" style={{ maxHeight: 200 }}>
+          <div className="lore-log flex flex-col gap-2 overflow-y-auto" style={{ maxHeight: 200 }}>
             {LORE_LOG.map((entry, i) => (
               <div key={i} className="flex items-start gap-2 text-xs">
                 <span
@@ -160,6 +160,24 @@ function EasterEggSection() {
             ))}
           </div>
         </MisakaCard>
+      </div>
+    </section>
+  )
+}
+
+// ── Timeline Section ──────────────────────────────────────────────
+function TimelineSection() {
+  return (
+    <section id="timeline" className="px-5 md:px-8 py-14">
+      <SectionHeader kanji="史" title="世界观时间线" furigana="タイムライン" />
+      <div className="max-w-4xl grid grid-cols-1 md:grid-cols-2 gap-5">
+        {LORE_TIMELINE.map(item => (
+          <MisakaCard key={item.title} padding="md">
+            <div className="font-mono text-xs text-[var(--accent-cyan)] mb-2">{item.date}</div>
+            <h3 className="font-kanji font-bold text-base text-[var(--text-on-white)] mb-2">{item.title}</h3>
+            <p className="font-kanji text-sm leading-relaxed text-[var(--text-on-white-2)]">{item.body}</p>
+          </MisakaCard>
+        ))}
       </div>
     </section>
   )
@@ -302,6 +320,7 @@ export default function ACGN() {
 
       <CharacterSection />
       <EasterEggSection />
+      <TimelineSection />
 
       {/* ── Footer ───────────────────────────────────────────────── */}
       <footer

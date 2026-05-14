@@ -1,9 +1,27 @@
 import type { NodeSession, QrTokenRecord, ReportRecord } from './types.js'
 
-export const nodes    = new Map<number, NodeSession>()
-export const channels = new Map<string, Set<number>>()
+// Sessions keyed by unique sessionId (one entry per WS session). Multiple
+// sessions may share the same nodeId — that is the "multi-device same
+// identity" model the cluster channel relies on.
+export const nodes    = new Map<string, NodeSession>()
+export const channels = new Map<string, Set<string>>()    // channelId -> sessionIds
 export const qrTokens = new Map<string, QrTokenRecord>()
 export const reports: ReportRecord[] = []
+
+export function findSessionByToken(token: string): NodeSession | null {
+  for (const s of nodes.values()) {
+    if (s.token === token) return s
+  }
+  return null
+}
+
+export function findSessionsByNodeAndHash(nodeId: number, passCodeHash: string): NodeSession[] {
+  const out: NodeSession[] = []
+  for (const s of nodes.values()) {
+    if (s.nodeId === nodeId && s.passCodeHash === passCodeHash) out.push(s)
+  }
+  return out
+}
 
 export const stats = {
   totalTransfers: 0,
@@ -60,4 +78,9 @@ export function countReportsForTarget(nodeId: number, since: number): number {
     if (r.targetNodeId === nodeId && r.reportedAt > since) count++
   }
   return count
+}
+
+export function clusterChannelId(nodeId: number, passCodeHash: string): string {
+  // Channel scope = identity tuple. Same nodeId+passcode → same cluster.
+  return `cluster-${nodeId}-${passCodeHash.slice(0, 16)}`
 }

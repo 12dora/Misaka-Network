@@ -36,26 +36,30 @@ export function connect(t: string) {
 }
 
 function doConnect() {
-  if (ws?.readyState === WebSocket.OPEN) return
+  // Don't replace a socket that's already open *or* still connecting —
+  // overwriting it leaves the old socket's `onopen` referencing the new ws
+  // via closure, which then calls `ws.send` on a still-CONNECTING socket.
+  if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
 
-  ws = new WebSocket(wsUrl())
+  const sock = new WebSocket(wsUrl())
+  ws = sock
 
-  ws.onopen = () => {
-    ws!.send(JSON.stringify({ t: 'AUTH', token }))
+  sock.onopen = () => {
+    sock.send(JSON.stringify({ t: 'AUTH', token }))
     reconnectAttempts = 0
     connectHandlers.forEach(h => h())
   }
 
-  ws.onclose = () => {
+  sock.onclose = () => {
     disconnectHandlers.forEach(h => h())
     scheduleReconnect()
   }
 
-  ws.onerror = () => {
-    ws?.close()
+  sock.onerror = () => {
+    sock.close()
   }
 
-  ws.onmessage = (e) => {
+  sock.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data as string) as WSServerMessage
       if (msg.t === 'SERVER_SHUTDOWN') serverShutdown = true

@@ -1,4 +1,5 @@
 import { createSHA256 } from 'hash-wasm'
+import { computeFileHashInWorker } from './fileHashWorker'
 import {
   saveTransfer, updateTransfer, getTransfer, getActiveTransfers,
   saveChunk, getChunk, deleteChunks, getSavedChunkIndexes,
@@ -48,6 +49,15 @@ export type DCProtocolMessage = MetaMessage | ChunkHeader | AckMessage | ResumeR
 // ── Hashing ──────────────────────────────────────────────────────────
 
 export async function computeFileHash(file: File): Promise<string> {
+  const workerHash = computeFileHashInWorker(file)
+  if (workerHash) {
+    try {
+      return await workerHash
+    } catch {
+      // Fall through to the inline path if the worker is unavailable at runtime.
+    }
+  }
+
   const hasher = await createSHA256()
   const CHUNK = 4 * 1024 * 1024 // 4MB read chunks
   for (let offset = 0; offset < file.size; offset += CHUNK) {

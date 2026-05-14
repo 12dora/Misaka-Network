@@ -3,12 +3,22 @@ import { useHomeStore } from '@/store/home'
 import { useAuthStore } from '@/store/auth'
 import { onMessage } from '@/lib/signaling'
 import type { ActivityEvent } from '@/types'
+import { ACTIVITY_QUOTES } from '@/data/lore'
 
 const TYPE_COLOR: Record<ActivityEvent['type'], string> = {
   join:     'var(--state-success)',
   leave:    'var(--text-muted)',
   transfer: 'var(--accent-cyan)',
   channel:  'var(--state-warn)',
+}
+
+function quoteEvent(index: number): ActivityEvent {
+  return {
+    id: `quote-${index}-${Math.floor(Date.now() / 60000)}`,
+    type: 'channel',
+    timestamp: Date.now(),
+    message: ACTIVITY_QUOTES[index % ACTIVITY_QUOTES.length],
+  }
 }
 
 function formatTime(ts: number) {
@@ -20,6 +30,7 @@ export default function ActivityStream() {
   const addActivity = useHomeStore(s => s.addActivity)
   const session = useAuthStore(s => s.session)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const quoteIndex = useRef(0)
 
   useEffect(() => {
     if (!session) return
@@ -27,6 +38,14 @@ export default function ActivityStream() {
       if (msg.t === 'ACTIVITY') addActivity(msg.event as ActivityEvent)
     })
   }, [session, addActivity])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      quoteIndex.current += 1
+      addActivity(quoteEvent(quoteIndex.current))
+    }, 45_000)
+    return () => window.clearInterval(timer)
+  }, [addActivity])
 
   // Auto scroll to left on new activity
   useEffect(() => {

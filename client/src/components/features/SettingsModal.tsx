@@ -7,12 +7,13 @@ import {
   loadBlocklist, removeBlockedNode,
   type TurnServer, type TurnSettings, type Blocklist,
 } from '@/lib/turn'
+import { isSoundEnabled, setSoundEnabled, subscribeSoundPreference, playSound } from '@/lib/sound'
 
 interface Props {
   onClose: () => void
 }
 
-type SettingsTab = 'turn' | 'blacklist' | 'about'
+type SettingsTab = 'turn' | 'sound' | 'blacklist' | 'about'
 
 export default function SettingsModal({ onClose }: Props) {
   const [tab, setTab] = useState<SettingsTab>('turn')
@@ -20,6 +21,7 @@ export default function SettingsModal({ onClose }: Props) {
   const [blocklist, setBlocklist] = useState<Blocklist>(loadBlocklist)
   const [editingServer, setEditingServer] = useState<TurnServer | null>(null)
   const [testingId, setTestingId] = useState<string | null>(null)
+  const [soundOn, setSoundOn] = useState(isSoundEnabled)
   const navigate = useNavigate()
 
   // Form state
@@ -30,6 +32,8 @@ export default function SettingsModal({ onClose }: Props) {
   useEffect(() => {
     saveTurnSettings(turnSettings)
   }, [turnSettings])
+
+  useEffect(() => subscribeSoundPreference(setSoundOn), [])
 
   function handleAdd() {
     const server: TurnServer = {
@@ -92,6 +96,13 @@ export default function SettingsModal({ onClose }: Props) {
     setBlocklist(loadBlocklist())
   }
 
+  function handleSoundToggle() {
+    const next = !soundOn
+    setSoundEnabled(next)
+    setSoundOn(next)
+    if (next) playSound('scan')
+  }
+
   function handleBackdrop(e: React.MouseEvent<HTMLDivElement>) {
     if (e.target === e.currentTarget) onClose()
   }
@@ -135,6 +146,7 @@ export default function SettingsModal({ onClose }: Props) {
         <div className="flex border-b" style={{ borderColor: 'var(--border-card)' }}>
           {([
             { id: 'turn' as const, label: '中继' },
+            { id: 'sound' as const, label: '音效' },
             { id: 'blacklist' as const, label: '黑名单' },
             { id: 'about' as const, label: '关于' },
           ]).map(t => (
@@ -285,6 +297,42 @@ export default function SettingsModal({ onClose }: Props) {
                     </MisakaButton>
                   )}
                 </div>
+              </div>
+            </div>
+          )}
+
+          {/* ── Sound ─────────────────────────────────────── */}
+          {tab === 'sound' && (
+            <div className="flex flex-col gap-4">
+              <p className="font-kanji text-xs text-[var(--text-on-white-2)] leading-relaxed">
+                扫码、传输完成、错误提示会播放短音效。设置只保存在本机。
+              </p>
+              <div className="flex items-center justify-between">
+                <span className="font-kanji text-sm text-[var(--text-on-white)]">启用操作音效</span>
+                <button
+                  className="w-10 h-6 rounded-full transition-colors relative"
+                  style={{
+                    border: 'none',
+                    background: soundOn ? 'var(--state-success)' : 'var(--text-muted)',
+                  }}
+                  onClick={handleSoundToggle}
+                >
+                  <span
+                    className="absolute top-0.5 w-5 h-5 rounded-full bg-white transition-transform"
+                    style={{ left: soundOn ? 'calc(100% - 22px)' : '2px' }}
+                  />
+                </button>
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                {([
+                  ['scan', '扫码'],
+                  ['complete', '完成'],
+                  ['error', '错误'],
+                ] as const).map(([event, label]) => (
+                  <MisakaButton key={event} variant="pill" size="sm" onClick={() => playSound(event)}>
+                    {label}
+                  </MisakaButton>
+                ))}
               </div>
             </div>
           )}

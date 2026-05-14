@@ -1,13 +1,14 @@
 import type { WebSocket } from 'ws'
 
 export interface NodeSession {
-  nodeId: number
+  sessionId: string         // unique per WS session — primary routing key
+  nodeId: number            // user-input node id; shared across devices of same identity
   passCodeHash: string
-  token: string
+  token: string             // auth token (private)
   socket: WebSocket | null
   lastSeen: number
   channelId: string | null
-  blockedIds: Set<number>
+  blockedIds: Set<string>   // blocked sessionIds
   failedAttempts: number
   lockedUntil: number
   joinedAt: number
@@ -45,10 +46,9 @@ export interface ActivityEvent {
 
 export type WSClientMessage =
   | { t: 'AUTH'; token: string }
-  | { t: 'JOIN_CHANNEL'; channelId: string }
+  | { t: 'JOIN_CLUSTER' }                                       // auto-join own identity cluster
   | { t: 'LEAVE_CHANNEL' }
-  | { t: 'CONNECT_REQ'; targetNodeId: number }
-  | { t: 'SIGNAL_SDP'; targetNodeId: number; sdp: object }
-  | { t: 'SIGNAL_ICE'; targetNodeId: number; candidate: object }
+  | { t: 'SIGNAL_SDP'; targetSessionId: string; sdp: object }
+  | { t: 'SIGNAL_ICE'; targetSessionId: string; candidate: object }
   | { t: 'PING' }
-  | { t: 'BLOCK'; nodeId: number }
+  | { t: 'BLOCK'; sessionId: string }
