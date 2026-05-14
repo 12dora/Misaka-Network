@@ -40,6 +40,8 @@ export default function ScanModal({ onClose }: Props) {
   const [cameraError, setCameraError] = useState<string | null>(null)
   const [facingMode, setFacingMode] = useState<FacingMode>('user')
   const [detected, setDetected] = useState<string | null>(null)
+  const [manualUrl, setManualUrl] = useState('')
+  const [manualError, setManualError] = useState<string | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const animRef = useRef<number>(0)
 
@@ -162,22 +164,34 @@ export default function ScanModal({ onClose }: Props) {
     onClose()
   }
 
+  function openDetectedUrl(raw: string) {
+    try {
+      const url = new URL(raw)
+      const sameOrigin = url.origin === location.origin
+      window.location.href = sameOrigin ? `${url.pathname}${url.search}${url.hash}` : raw
+      return true
+    } catch {
+      if (raw.startsWith('misaka://')) {
+        const httpUrl = raw.replace('misaka://', `${location.origin}/`)
+        window.location.href = httpUrl
+        return true
+      }
+    }
+    return false
+  }
+
+  function handleManualJoin() {
+    setManualError(null)
+    if (!openDetectedUrl(manualUrl.trim())) {
+      setManualError('请输入有效的御坂网络 QR 链接')
+    }
+  }
+
   // When QR detected, navigate
   useEffect(() => {
     if (detected) {
       stopCamera()
-      // Parse URL and navigate
-      try {
-        new URL(detected)
-        // Redirect to join flow
-        window.location.href = detected
-      } catch {
-        // Not a URL, try custom protocol: misaka://join?...
-        if (detected.startsWith('misaka://')) {
-          const httpUrl = detected.replace('misaka://', `${location.origin}/`)
-          window.location.href = httpUrl
-        }
-      }
+      openDetectedUrl(detected)
     }
   }, [detected])
 
@@ -243,6 +257,28 @@ export default function ScanModal({ onClose }: Props) {
             <div className="absolute inset-0 flex items-center justify-center" style={{ background: 'rgba(0,194,138,0.15)' }}>
               <span className="font-kanji font-bold text-sm" style={{ color: 'var(--state-success)' }}>✓ 已识别</span>
             </div>
+          )}
+        </div>
+
+        {/* Actions */}
+        <div className="w-full rounded-xl p-3" style={{ background: 'var(--surface-tint)' }}>
+          <label className="block font-kanji text-xs text-[var(--text-on-white-2)] mb-2">
+            粘贴 QR 链接
+          </label>
+          <div className="flex gap-2">
+            <input
+              value={manualUrl}
+              onChange={e => setManualUrl(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') handleManualJoin() }}
+              placeholder="http://localhost:5173/join?..."
+              className="misaka-input text-xs flex-1"
+            />
+            <MisakaButton variant="primary" size="sm" onClick={handleManualJoin} disabled={!manualUrl.trim()}>
+              接入
+            </MisakaButton>
+          </div>
+          {manualError && (
+            <p className="font-kanji text-[10px] text-[var(--state-danger)] mt-2">{manualError}</p>
           )}
         </div>
 

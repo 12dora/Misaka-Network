@@ -1,15 +1,11 @@
-import { useAuthStore } from '@/store/auth'
 import LoginCard from '@/components/features/LoginCard'
 import StatsDashboard from '@/components/features/StatsDashboard'
 import ActivityStream from '@/components/features/ActivityStream'
-import QuickJoin from '@/components/features/QuickJoin'
 
 const HERO_CHARACTER = import.meta.env.BASE_URL + 'assets/misaka.webp'
 const HERO_TITLE     = import.meta.env.BASE_URL + 'assets/misaka-title.webp'
 
 export default function Home() {
-  const isConnected = useAuthStore(s => s.isConnected)
-
   return (
     <div className="min-h-screen" style={{ background: 'var(--bg-primary)' }}>
 
@@ -124,9 +120,6 @@ export default function Home() {
 
       {/* ── Activity Stream ─────────────────────────────────────────── */}
       <ActivityStream />
-
-      {/* ── Quick Join ──────────────────────────────────────────────── */}
-      {!isConnected && <QuickJoin />}
 
       {/* ── Footer ──────────────────────────────────────────────────── */}
       <footer

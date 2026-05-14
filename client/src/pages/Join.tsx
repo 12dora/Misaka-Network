@@ -1,109 +1,145 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
+import MisakaButton from '@/components/ui/MisakaButton'
 import { useAuthStore } from '@/store/auth'
 import { apiUrl } from '@/config'
+
+type JoinStatus = 'connecting' | 'needs-passcode' | 'error'
+
+function decodePassCode(encoded: string | null): string {
+  if (!encoded) return ''
+  try {
+    return atob(encoded).replace(/\D/g, '').slice(0, 6)
+  } catch {
+    return ''
+  }
+}
+
+function isValidPassCode(passCode: string) {
+  return /^\d{6}$/.test(passCode)
+}
 
 export default function Join() {
   const [params] = useSearchParams()
   const navigate = useNavigate()
-  const [status, setStatus] = useState<'connecting' | 'error'>('connecting')
-  const [errorMsg, setErrorMsg] = useState('')
   const auth = useAuthStore()
+  const [status, setStatus] = useState<JoinStatus>('connecting')
+  const [errorMsg, setErrorMsg] = useState('')
+  const [passCode, setPassCode] = useState(() => decodePassCode(params.get('c')))
+  const [manualPass, setManualPass] = useState('')
+  const [attempt, setAttempt] = useState(0)
+
+  const joinInfo = useMemo(() => ({
+    type: params.get('type') ?? 'node',
+    targetNodeId: Number(params.get('id')),
+    qrToken: params.get('t') ?? '',
+    fileSessionId: params.get('fid'),
+    encodedPass: params.get('c'),
+  }), [params])
 
   useEffect(() => {
+    if (attempt > 0) return
+    if (!joinInfo.qrToken || !Number.isInteger(joinInfo.targetNodeId) || joinInfo.targetNodeId < 1 || joinInfo.targetNodeId > 20001) {
+      setStatus('error')
+      setErrorMsg('无效的 QR 链接')
+      return
+    }
+    if (!isValidPassCode(passCode)) {
+      setStatus('needs-passcode')
+      return
+    }
+    setAttempt(1)
+  }, [attempt, joinInfo.qrToken, joinInfo.targetNodeId, passCode])
+
+  useEffect(() => {
+    if (attempt === 0) return
+    let cancelled = false
+
     async function handleJoin() {
-      const type = params.get('type')
-      const qrToken = params.get('t')
-      const fileSessionId = params.get('fid')
-      const encodedPass = params.get('c')
+      setStatus('connecting')
+      setErrorMsg('')
 
-      if (!qrToken) {
-        setStatus('error')
-        setErrorMsg('无效的 QR 链接')
-        return
-      }
-
-      // Ensure identity exists
-      let identity = auth.identity
-      if (!identity) {
-        // Trigger identity generation — auth store generates on first access
-        identity = auth.identity
-      }
-
-      // If not connected, connect first
-      if (!auth.isConnected && !auth.isLoading) {
-        try {
-          await auth.connect()
-        } catch {
-          setStatus('error')
-          setErrorMsg('网络接入失败，请返回首页手动连接后再试')
-          return
-        }
-      }
-
-      // If still not connected after connect attempt
-      if (!auth.session) {
-        setStatus('error')
-        setErrorMsg('请先返回首页完成身份注册')
-        return
-      }
-
-      // Build QR redeem payload
-      const payload: Record<string, unknown> = {
-        qrToken,
-        myNodeId: auth.identity.nodeId,
-        myPassCode: auth.identity.passCode,
-      }
-
-      // Call qr-redeem
       try {
+        auth.setNodeId(joinInfo.targetNodeId)
+        auth.setPassCode(passCode)
+
         const res = await fetch(apiUrl('/api/qr-redeem'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
+          body: JSON.stringify({
+            qrToken: joinInfo.qrToken,
+            myNodeId: joinInfo.targetNodeId,
+            myPassCode: passCode,
+          }),
         })
 
         if (!res.ok) {
-          const err = await res.json().catch(() => ({ error: 'UNKNOWN' }))
-          setStatus('error')
-          setErrorMsg(err.error === 'INVALID_QR_TOKEN' ? 'QR 码已过期或已被使用' : '接入失败')
+          const err = await res.json().catch(() => ({ error: 'UNKNOWN' })) as { error?: string }
+          if (cancelled) return
+          if (err.error === 'QR_REQUIRES_PASSCODE' || err.error === 'WRONG_PASSCODE') {
+            setStatus('needs-passcode')
+            setErrorMsg(err.error === 'WRONG_PASSCODE' ? '通行码不正确，请重新输入' : '')
+          } else {
+            setStatus('error')
+            setErrorMsg(err.error === 'INVALID_QR_TOKEN' ? 'QR 码已过期或已被使用' : '接入失败')
+          }
           return
         }
 
         const data = await res.json() as { targetNodeId: number; channelId: string }
 
-        // Store join context for the network page
         sessionStorage.setItem('misaka.join', JSON.stringify({
           targetNodeId: data.targetNodeId,
           channelId: data.channelId,
-          type,
-          fileSessionId,
-          encodedPass,
+          type: joinInfo.type,
+          fileSessionId: joinInfo.fileSessionId,
+          encodedPass: joinInfo.encodedPass,
         }))
 
-        // Navigate to network
-        navigate('/network', { replace: true })
+        await auth.connect()
+        if (cancelled) return
+
+        if (useAuthStore.getState().isConnected) {
+          navigate('/network', { replace: true })
+        } else {
+          setStatus('error')
+          setErrorMsg(useAuthStore.getState().error ?? '接入失败，请稍后重试')
+        }
       } catch {
-        setStatus('error')
-        setErrorMsg('网络请求失败')
+        if (!cancelled) {
+          setStatus('error')
+          setErrorMsg('网络请求失败')
+        }
       }
     }
 
     handleJoin()
-  }, [])
+    return () => { cancelled = true }
+  }, [attempt, joinInfo, navigate, passCode])
+
+  function submitPassCode() {
+    const next = manualPass.replace(/\D/g, '').slice(0, 6)
+    if (!isValidPassCode(next)) {
+      setErrorMsg('请输入 6 位通行码')
+      return
+    }
+    setPassCode(next)
+    setManualPass('')
+    setAttempt(prev => prev + 1)
+  }
 
   return (
-    <div className="min-h-screen flex items-center justify-center" style={{ background: 'var(--bg-primary)' }}>
+    <div className="min-h-screen flex items-center justify-center p-4" style={{ background: 'var(--bg-primary)' }}>
       <div
         className="flex flex-col items-center gap-6 rounded-2xl p-8"
         style={{
           background: 'var(--surface)',
           boxShadow: 'var(--shadow-float)',
-          minWidth: 300,
+          width: 'min(360px, 100%)',
         }}
       >
-        {status === 'connecting' ? (
+        {status === 'connecting' && (
           <>
             <MisakaKanjiBlock char="接" size="lg" />
             <div className="text-center">
@@ -114,12 +150,46 @@ export default function Join() {
                 接続中…
               </div>
             </div>
-            <div
-              className="w-12 h-1 rounded-full animate-pulse"
-              style={{ background: 'var(--accent-cyan)' }}
-            />
+            <div className="w-12 h-1 rounded-full animate-pulse" style={{ background: 'var(--accent-cyan)' }} />
           </>
-        ) : (
+        )}
+
+        {status === 'needs-passcode' && (
+          <>
+            <MisakaKanjiBlock char="鍵" size="lg" />
+            <div className="text-center">
+              <div className="font-kanji font-bold text-lg text-[var(--text-on-white)]">
+                输入通行码
+              </div>
+              <div className="font-jp text-xs text-[var(--text-on-white-2)] mt-1">
+                御坂 {joinInfo.targetNodeId} 号への接続
+              </div>
+            </div>
+            <input
+              value={manualPass}
+              onChange={e => setManualPass(e.target.value.replace(/\D/g, '').slice(0, 6))}
+              onKeyDown={e => { if (e.key === 'Enter') submitPassCode() }}
+              inputMode="numeric"
+              maxLength={6}
+              autoFocus
+              placeholder="000000"
+              className="misaka-input text-center font-mono text-xl tracking-[0.35em]"
+            />
+            {errorMsg && (
+              <p className="font-kanji text-xs text-[var(--state-danger)] text-center">{errorMsg}</p>
+            )}
+            <div className="flex gap-2 w-full">
+              <MisakaButton variant="pill" size="sm" fullWidth onClick={() => navigate('/', { replace: true })}>
+                返回首页
+              </MisakaButton>
+              <MisakaButton variant="primary" size="sm" fullWidth disabled={!isValidPassCode(manualPass)} onClick={submitPassCode}>
+                接入
+              </MisakaButton>
+            </div>
+          </>
+        )}
+
+        {status === 'error' && (
           <>
             <MisakaKanjiBlock char="断" size="lg" />
             <div className="text-center">
@@ -130,12 +200,9 @@ export default function Join() {
                 {errorMsg}
               </div>
             </div>
-            <button
-              className="nav-pill"
-              onClick={() => navigate('/', { replace: true })}
-            >
+            <MisakaButton variant="pill" onClick={() => navigate('/', { replace: true })}>
               返回首页
-            </button>
+            </MisakaButton>
           </>
         )}
       </div>

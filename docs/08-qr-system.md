@@ -72,15 +72,15 @@ const code = jsQR(imageData.data, imageData.width, imageData.height);
 
 ```
 解析 URL →
-  type=node:    未登录则先生成身份 → /api/qr-redeem → 跳 /network → 发 CONNECT_REQ
-                → 弹窗输通行码（除非 QR 带 c=）
+  type=node:    若 QR 带 c= 则自动填通行码；否则先弹窗输入通行码
+                → 写入 nodeId/passCode → /api/qr-redeem → /api/register → 跳 /network
   type=file:    同上接入 → 自动弹出接收 Modal
   type=channel: 接入 → JOIN_CHANNEL → 跳 /network
 ```
 
 ## 显示我的 QR
 
-登录后，TopNav 右侧 + LoginCard 都有 `[🔲 我的 QR]` 白胶囊按钮。点击展开 Modal（居中白卡 + 钴蓝遮罩）：
+登录后，TopNav 右侧 + LoginCard 都有 `[🔲 我的 QR]` 白胶囊按钮。未登录时，LoginCard 内提供 `QR 接入` 入口，可扫码或粘贴链接。点击展开 Modal（居中白卡 + 钴蓝遮罩）：
 
 - 标题 `kanji-block`「我」+ `我的接入 QR / わたしの QR`
 - QR 图（深海军蓝 + 中心「御」字章 + 角框）
