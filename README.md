@@ -215,6 +215,25 @@ turns:turn.example.com:5349?transport=tcp
 
 用户名填 `misaka`，密码填 `change-this-password`。
 
+#### Docker 模板（推荐）
+
+仓库提供可直接改值启动的模板：
+
+- `deploy/docker-compose.turn.yml`
+- `deploy/turnserver.conf.example`
+
+使用方式：
+
+```bash
+cd deploy
+cp turnserver.conf.example turnserver.conf
+# 修改 external-ip / realm / user 等参数
+docker compose -f docker-compose.turn.yml up -d
+```
+
+> 说明：模板使用 `network_mode: host`，可简化 UDP relay 端口映射。请确认云防火墙放行：
+> `3478/tcp+udp`、`5349/tcp`、以及 `min-port~max-port` 的 UDP 端口段。
+
 ## 文档入口
 
 - 架构总览：`docs/00-overview.md`

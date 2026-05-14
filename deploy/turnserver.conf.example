@@ -1,0 +1,35 @@
+# Misaka TURN template (coturn)
+# 1) Copy to deploy/turnserver.conf
+# 2) Replace all placeholders before boot
+
+listening-port=3478
+tls-listening-port=5349
+
+# Your public server IP. If behind NAT, fill external-ip=<public>/<private>.
+external-ip=203.0.113.10
+
+# Credential mode
+fingerprint
+lt-cred-mech
+realm=turn.example.com
+server-name=turn.example.com
+user=misaka:change-this-password
+
+# Network
+listening-ip=0.0.0.0
+relay-ip=0.0.0.0
+min-port=49160
+max-port=49200
+
+# TLS certs for turns: (optional but recommended)
+# cert=/etc/letsencrypt/live/turn.example.com/fullchain.pem
+# pkey=/etc/letsencrypt/live/turn.example.com/privkey.pem
+
+# Hardening
+no-cli
+no-multicast-peers
+stale-nonce=600
+
+# Logs
+simple-log
+log-file=stdout
