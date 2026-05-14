@@ -2,7 +2,7 @@
 
 Node.js + Express + ws。只负责身份注册、WebSocket 信令、活动统计和 QR token 兑换，不保存文件内容。
 
-详细协议见 `../docs/07-signaling-server.md`。
+详细协议见 `../docs/archive/07-signaling-server.md`。
 
 ## 本地运行
 

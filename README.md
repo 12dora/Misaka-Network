@@ -1,21 +1,62 @@
-# 御坂网络 · MISAKA NETWORK
+# 御坂网络 · Misaka Network
 
-浏览器内 P2P 文件传输 Web APP（React + WebRTC + Node.js Signaling）。
+浏览器内 P2P 文件传输 Web App（React + WebRTC + Node.js Signaling）。
+
+## 项目背景
+
+这个项目是一个「零注册、低门槛、强隐私」的跨设备文件传输实验：  
+用户只需输入节点编号与 6 位通行码，即可在浏览器内完成设备间直连传输。
+
+设计灵感来自《某科学的超电磁炮》中的“妹妹网络”设定，采用和风海报风格视觉表达。
+
+## 项目介绍
+
+核心目标：
+
+- 文件本体端到端直传（WebRTC DataChannel）
+- 服务器仅负责信令，不存储文件
+- 支持断线重连与断点续传
+- 支持 TURN 自配置与强制 relay 测试
+
+当前状态：
+
+- v1/v2 核心功能完成
+- PWA 基础能力完成（SW + Manifest + 安装提示）
+- 性能项已完成 desktop Lighthouse 实测（首页 Performance 99）
+- 剩余主要工作为实网验证闭环（ICE 三场景、TURN 公网可达）
+
+## 主要功能
+
+- 节点注册与接入（nodeId + passcode）
+- QR 邀请加入（含链接接入）
+- 多 peer 同时在线与群发
+- 文件传输（加密、暂停/恢复/取消）
+- 大文件接收写盘（File System Access / OPFS / IndexedDB 降级）
+- 会话消息与文件卡片下载
+- 网络诊断（信道类型、ICE 路径与时间戳、诊断一键复制）
+
+## 技术栈
+
+- 前端：React 18 + TypeScript + Vite + Tailwind + Zustand
+- 传输：WebRTC DataChannel + 应用层 AES-GCM
+- 后端：Node.js + Express + ws（信令）
+- 部署：静态前端 + Docker 化信令 + 可选 coturn
 
 ## 仓库结构
 
 ```text
 misaka-network/
-├── client/                 # 前端（Vite + React）
-├── server/                 # 信令服务（Node.js + ws + express）
-├── docs/                   # 设计/架构/进度文档
-├── docker-compose.yml      # 后端 Docker 快速部署
+├── client/                         # 前端
+├── server/                         # 信令服务
+├── deploy/                         # 生产部署模板（Caddy / coturn）
+├── docs/                           # 精简文档入口
+│   └── archive/                    # 历史/低频文档归档
 └── README.md
 ```
 
-## 本地开发（前后端）
+## 本地开发
 
-1) 启动后端
+1) 启动信令服务
 
 ```bash
 cd server
@@ -23,9 +64,9 @@ npm install
 npm run dev
 ```
 
-默认监听 `http://localhost:8080`，WebSocket 为 `ws://localhost:8080/ws`。
+默认：`http://localhost:8080`，WS：`ws://localhost:8080/ws`
 
-2) 启动前端（新终端）
+2) 启动前端
 
 ```bash
 cd client
@@ -33,53 +74,63 @@ npm install
 npm run dev
 ```
 
-默认访问 `http://localhost:5173`。开发模式下 Vite 已代理 `/api` 和 `/ws` 到 `8080`。
+默认：`http://localhost:5173`（开发代理 `/api` `/ws` 到 `8080`）
 
-## 后端 Docker 快速部署（推荐）
+## 使用方法（最短路径）
 
-### 方式 A：docker compose（一条命令）
+1. 设备 A 打开首页，输入节点编号和通行码接入网络  
+2. 设备 B 扫描 A 的 QR（或打开复制链接）  
+3. 在网络页选择目标节点并发送文件  
+4. 接收端确认并下载文件
 
-在仓库根目录执行：
+## 部署方法
+
+### A. 信令服务（Docker，快速）
+
+根目录执行：
 
 ```bash
 docker compose up -d --build
 ```
 
-查看状态与日志：
+查看状态：
 
 ```bash
 docker compose ps
 docker compose logs -f signaling
 ```
 
-停止：
+### B. 生产 HTTPS/WSS（Caddy）
 
 ```bash
-docker compose down
+cd deploy
+cp Caddyfile.example Caddyfile
+# 修改域名与邮箱
+docker compose -f docker-compose.prod.yml up -d --build
 ```
 
-默认会映射宿主机 `8080:8080`。
-
-如果宿主机 `8080` 已被占用，可以临时改用其他端口：
+健康检查：
 
 ```bash
-docker run -d --name misaka-signaling -p 18080:8080 misaka-signaling
+curl -s https://signal.example.com/api/health
 ```
 
-### 方式 B：纯 docker 命令
+### C. TURN 中继（coturn）
 
 ```bash
-docker build -t misaka-signaling ./server
-docker run -d --name misaka-signaling -p 8080:8080 \
-  -e PORT=8080 \
-  -e MAX_NODES=10000 \
-  -e RATE_LIMIT_PER_MIN=60 \
-  misaka-signaling
+cd deploy
+cp turnserver.conf.example turnserver.conf
+# 修改 external-ip / realm / user
+docker compose -f docker-compose.turn.yml up -d
 ```
 
-## 前端部署（静态托管）
+防火墙需放行：
 
-前端是纯静态资源，构建后可部署到 Nginx / Cloudflare Pages / Vercel / GitHub Pages。
+- `3478/tcp+udp`
+- `5349/tcp`
+- `49160-49200/udp`（与模板一致）
+
+### D. 前端静态部署
 
 ```bash
 cd client
@@ -87,55 +138,9 @@ npm install
 npm run build
 ```
 
-产物在 `client/dist/`。
+将 `client/dist/` 部署到静态托管（GitHub Pages / Nginx / Cloudflare Pages）。
 
-### 运行时配置（关键）
-
-前端会读取 `client/public/config.json`（构建后位于 `dist/config.json`），用它指向线上后端：
-
-```json
-{
-  "API_BASE": "https://your-domain.com",
-  "WS_URL": "wss://your-domain.com/ws"
-}
-```
-
-这样无需重新打包前端即可切换后端地址。
-
-## 生产部署建议
-
-1. 后端用 Docker 部署在云主机（开放 `8080` 或置于反向代理后）。
-2. 前端部署静态站点。
-3. 生产环境必须使用 HTTPS + WSS（浏览器 WebRTC/权限相关特性更稳定）。
-
-## 自托管部署方案（信令 + TURN）
-
-推荐准备两个域名：
-
-- `signal.example.com`：反向代理到信令服务 `127.0.0.1:8080`
-- `turn.example.com`：coturn 中继服务
-
-### 1. 信令服务 HTTPS / WSS
-
-信令服务本身只监听 HTTP + WS，生产环境由 Nginx / Caddy 负责 TLS：
-
-```nginx
-server {
-  listen 443 ssl http2;
-  server_name signal.example.com;
-
-  location / {
-    proxy_pass http://127.0.0.1:8080;
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-  }
-}
-```
-
-前端 `config.json` 配置为：
+`dist/config.json` 运行时配置示例：
 
 ```json
 {
@@ -143,99 +148,15 @@ server {
   "WS_URL": "wss://signal.example.com/ws"
 }
 ```
-
-#### Caddy 一键方案（推荐）
-
-仓库已提供生产模板：
-
-- `deploy/docker-compose.prod.yml`
-- `deploy/Caddyfile.example`
-
-使用方式：
-
-```bash
-cd deploy
-cp Caddyfile.example Caddyfile
-# 把 Caddyfile 里的 signal.example.com 与 email 改成你的真实值
-docker compose -f docker-compose.prod.yml up -d --build
-```
-
-验活：
-
-```bash
-curl -s https://signal.example.com/api/health
-```
-
-预期返回 `{"ok":true,...}`。此时前端 `dist/config.json` 指向：
-
-```json
-{
-  "API_BASE": "https://signal.example.com",
-  "WS_URL": "wss://signal.example.com/ws"
-}
-```
-
-### 2. coturn 中继服务器
-
-Ubuntu 示例：
-
-```bash
-sudo apt update
-sudo apt install coturn
-sudo systemctl enable coturn
-```
-
-`/etc/turnserver.conf` 最小配置：
-
-```conf
-listening-port=3478
-tls-listening-port=5349
-fingerprint
-lt-cred-mech
-realm=turn.example.com
-server-name=turn.example.com
-user=misaka:change-this-password
-no-multicast-peers
-no-cli
-```
-
-云防火墙需放行：
-
-- TCP/UDP `3478`
-- TCP `5349`
-- UDP relay 端口范围（默认较大；可用 `min-port`/`max-port` 收窄）
-
-前端设置页中添加：
-
-```text
-turn:turn.example.com:3478?transport=udp
-turn:turn.example.com:3478?transport=tcp
-turns:turn.example.com:5349?transport=tcp
-```
-
-用户名填 `misaka`，密码填 `change-this-password`。
-
-#### Docker 模板（推荐）
-
-仓库提供可直接改值启动的模板：
-
-- `deploy/docker-compose.turn.yml`
-- `deploy/turnserver.conf.example`
-
-使用方式：
-
-```bash
-cd deploy
-cp turnserver.conf.example turnserver.conf
-# 修改 external-ip / realm / user 等参数
-docker compose -f docker-compose.turn.yml up -d
-```
-
-> 说明：模板使用 `network_mode: host`，可简化 UDP relay 端口映射。请确认云防火墙放行：
-> `3478/tcp+udp`、`5349/tcp`、以及 `min-port~max-port` 的 UDP 端口段。
 
 ## 文档入口
 
-- 架构总览：`docs/00-overview.md`
+- 总览：`docs/00-overview.md`
 - 当前进度：`docs/PROGRESS.md`
-- 提示词模板：`docs/PROMPTS.md`
+- 会话模板：`docs/PROMPTS.md`
+- 归档文档：`docs/archive/`
+
+## 版权与致谢
+
+- 项目维护与版权：**© Master Huang · Misaka Network**
+- 本项目为同人风格技术作品，非商业用途，向原作及相关创作者致敬。

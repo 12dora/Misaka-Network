@@ -27,8 +27,8 @@
 
 请先读：
 - docs/PROGRESS.md
-- docs/[文档编号]-xxx.md
-- docs/01-design-system.md（涉及 UI 时）
+- docs/archive/[文档编号]-xxx.md
+- docs/archive/01-design-system.md（涉及 UI 时）
 
 完成后更新 PROGRESS.md。
 ```
@@ -54,7 +54,7 @@
 
 ```
 项目约定：
-1. UI 文案使用 docs/01-design-system.md 术语对照表
+1. UI 文案使用 docs/archive/01-design-system.md 术语对照表
 2. 颜色/字体/组件用设计 token，禁辉光/扫描线/glitch
 3. 服务端不持久化任何数据，全部内存
 4. QR 默认不含通行码
