@@ -18,10 +18,10 @@
 ☑ QA bug 修复完成（BUG-1 ~ BUG-8）— 见 docs/bug.md
 
 ### 2.1 真机 / 实网端到端验证
-- ☐ PC ↔ 手机 QR 扫码加入（同 LAN、跨 NAT、Chrome/Safari/Firefox 矩阵）
-- ☐ TURN 中继实装（部署 coturn，自托管）
-- ☐ ICE 路径实测（host → srflx → relay 优先级）
-- ☐ iOS Safari / Android Chrome 兼容（BarcodeDetector 降级、IndexedDB 配额、AES-GCM）
+- ☑ PC ↔ 手机 QR 扫码加入（已测试）
+- ◐ TURN 中继实装（coturn 自托管方案已补；实际服务器部署未做）
+- ◐ ICE 路径实测（host → srflx → relay 优先级；已补前端 ICE 路径可视化，待实网逐项打点）
+- ☒ iOS Safari / Android Chrome 兼容真机矩阵（本阶段不做真机矩阵；仅保留通用降级逻辑）
 
 ### 2.2 多对等节点（multi-peer）
 - ☑ NodeRadar 同时管理 N 个 PeerConnection（Map 隔离，已实现）
@@ -37,7 +37,7 @@
 - ☑ 1GB 文件内存压测（server/tests/stress-1gb.test.mjs）— sender +1.6MB / streaming +0MB / Blob 组装峰值 1.7GB
 
 ### 2.4 信令服务器加固
-- ☐ 部署到 Railway / 自托管（HTTPS + WSS）
+- ◐ 自托管部署（HTTPS + WSS 反代方案已补；实际服务器部署未做）
 - ☑ /api/metrics（real CPU + peak concurrent + uptime）
 - ☑ 异常退出通知对端（SERVER_SHUTDOWN + WS 1001 关闭码）
 - ☑ 通行码暴力穷举集成测试（server/tests/brute-force.test.mjs）
@@ -50,28 +50,19 @@
 ## v3 — 打磨 & 沉浸感
 
 ### 3.1 NodeRadar 可视化
-- ☐ Canvas 极坐标雷达（替换列表）
-- ☐ 距离 = ICE RTT，角度 = 节点编号 mod 360
-- ☐ 扫描线（节制，不走赛博风）
-- ☐ Hover peer 详情卡
+- ☒ 不做（保留当前列表式节点雷达，优先可靠传输与清晰操作）
 
 ### 3.2 传输历史
-- ☐ IndexedDB schema：transfers 表
-- ☐ Network 页「历史」Tab
-- ☐ 再传 / 查看本地副本 / 删除
-- ☐ 隐私开关：关闭记录
+- ☒ 不做（双方退出 session 即销毁，不保留历史记录）
 
 ### 3.3 PWA
-- ☐ Service Worker（app shell 离线）
-- ☐ Manifest + 图标
-- ☐ Installable 提示
-- ☐ Background Sync 评估
+- ☑ Service Worker（app shell 离线）
+- ☑ Manifest + 图标
+- ☑ Installable 提示
+- ☑ Background Sync 评估（当前不接入：实时 WebRTC/WS 会话不适合离线排队语义）
 
 ### 3.4 主题 & 视觉
-- ☐ 浅 / 深 / 妹妹色三主题
-- ☐ 设置面板主题切换
-- ☐ Reduced-motion 兼容
-- ☐ 字体子集化
+- ☒ 不做主题系统 / 字体子集化（保留现有单一视觉风格）
 
 ### 3.5 彩蛋 & 沉浸
 - ☑ 关键编号（10032 / 9982 / 20001）特殊提示
@@ -80,8 +71,8 @@
 - ☑ ACGN 世界观长文 + 时间线
 
 ### 3.6 i18n（可选）
-- ☐ 中 / 日 / 英
-- ☐ 设计 token 术语表分语言
+- ☒ 不做多语言系统
+- ☑ 文案一致性修复：核心操作界面统一中文；ACGN / 世界观内容保留必要日文氛围
 
 ### 3.7 性能
 - ☑ 路由级懒加载 + bundle 拆分
@@ -90,14 +81,14 @@
 
 ## 当前会话焦点
 
-部署可运维化：新增后端 Docker 快速部署（Dockerfile + docker-compose），并在 README.md 整理前后端本地开发、Docker 部署、静态前端部署与运行时配置说明。
-
-接收文件改为手动下载：文件接收完成后不再自动触发浏览器下载，而是在聊天框插入文件卡片（显示文件名 + 大小 + "↓ 下载"按钮），点击后才开始下载，下载后按钮变为"✓ 已下载"。
+ICE 路径实测与部署准备：保留 TURN / ICE / 自托管 / PWA / Lighthouse；已补网络页 ICE 路径可视化（候选类型/协议），待 host/srflx/relay 三场景逐项实测。
 
 ## 已知问题
 
-- TURN 中继未实际部署测试
-- QR 扫码加入流程需真机端到端测试
+- TURN 中继未实际部署测试（coturn 部署方案已写入 README / server README）
+- ICE 路径实测仍缺实网三场景结果（当前仅完成前端观测能力：Network 信息栏展示 selected candidate pair 路径）
+- Service Worker 当前仅做 app shell + 静态资源离线缓存；`/api` 与 `/ws` 不缓存（实时信令与会话语义保持在线优先）
+- PWA 图标当前使用 `favicon.svg` 作为 manifest icon（`purpose: any maskable`）；后续如需商店级上架可再补 192/512 位图资源
 - 接收端 DataChannel 监听器有重复绑定风险（已用 addEventListener 规避，待复核）
 - File System Access API 仅在 Chromium 系浏览器可用，Safari/Firefox 使用 OPFS 磁盘缓存替代（相同效果）
 - OPFS 写入可能因磁盘配额不足失败 → 自动降级 IndexedDB + Blob 内存组装
@@ -106,7 +97,7 @@
 - 浏览器通知依赖用户授权；若用户拒绝，仍可正常收发文件，仅不弹系统通知
 - 页脚规范：各页面底部仅保留 `© Master Huang · Misaka Network` 与 GitHub 链接；设置页 About 同步保持一致
 - 页脚组件化：Home / ACGN 复用同一 `AppFooter` source，后续统一改版仅需改一处
-- Docker 验证依赖本机 daemon；若 `docker.sock` 不可用，将无法本机完成镜像构建与容器启动验证
+- 不做项：NodeRadar Canvas 可视化、传输历史、多主题、多语言完整 i18n、移动端真机兼容矩阵
 
 ## 决策记录（精简）
 
@@ -139,6 +130,10 @@
 - 接收文件手动下载：deliverCompletedFile 不再调用 triggerDownload，改为在 chatMessages 插入 type='file' 的消息（含 fileName/fileSize/downloadUrl 字段）；ChannelChat 对 type='file' 消息渲染文件卡片 + "↓ 下载"按钮；点击后触发下载并 revokeObjectURL，按钮变为"✓ 已下载"
 - v3 沉浸：特殊节点 9982 / 10032 / 20001 在登录卡展示 lore hint；ActivityStream 每 45s 注入一条妹妹语录；设置面板增加音效开关，扫码 / 完成 / 错误音效由 WebAudio 合成且默认开启
 - v3 性能：路由改 React.lazy + Suspense；Vite manualChunks 拆出 react / qr / hash；整文件 SHA-256 优先交给 module worker，失败时降级主线程分块 hash
+- ICE 观测增强：连接成功后从 `pc.getStats()` 读取 nominated `candidate-pair`，在 Network 信息栏展示 `localType/proto → remoteType/proto`（如 `host/udp → host/udp`、`srflx/udp → srflx/udp`、`relay/tcp → relay/tcp`），用于 host → srflx → relay 实测留痕
+- PWA 起步：新增 `public/sw.js` 并在 `main.tsx` 注册；采用 app shell 缓存与导航离线回退（`index.html`），静态资源走缓存优先，`/api` 与 `/ws` 始终直连网络
+- PWA 安装链路：新增 `manifest.webmanifest` 并在 `index.html` 挂载；TopNav 监听 `beforeinstallprompt/appinstalled`，在可安装时显示「安装应用」入口
+- Background Sync 评估结论：暂不接入。当前核心是实时信令 + DataChannel 直连，离线队列重放易引入会话时序歧义；保留为后续“非实时任务”能力再评估
 - QR join：`/join` 以链接 `id` 覆盖本机 nodeId，`c` 存在时 base64 解码为通行码并自动注册；`c` 缺失或错误时停在通行码输入卡片，不再要求先返回首页注册
 - 接收卡片去重：`deliverCompletedFile` 以 `transferId` 去重，防止同一传输在并发回调下重复插入 file 消息
 - 未读与通知：`unreadByPeer` 记录每节点消息/文件未读数；收到文件时若页面在后台且通知权限已授权，触发系统 Notification

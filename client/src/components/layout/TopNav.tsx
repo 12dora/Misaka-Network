@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link, useLocation } from 'react-router-dom'
 import { useAuthStore } from '@/store/auth'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
@@ -20,6 +20,38 @@ export default function TopNav() {
   const [showQR, setShowQR]         = useState(false)
   const [showScan, setShowScan]     = useState(false)
   const [showSettings, setShowSettings] = useState(false)
+  const [installPrompt, setInstallPrompt] = useState<null | {
+    prompt: () => Promise<void>
+    userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>
+  }>(null)
+
+  useEffect(() => {
+    const onBeforeInstallPrompt = (e: Event) => {
+      e.preventDefault()
+      setInstallPrompt(e as unknown as {
+        prompt: () => Promise<void>
+        userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>
+      })
+    }
+    const onAppInstalled = () => setInstallPrompt(null)
+    window.addEventListener('beforeinstallprompt', onBeforeInstallPrompt)
+    window.addEventListener('appinstalled', onAppInstalled)
+    return () => {
+      window.removeEventListener('beforeinstallprompt', onBeforeInstallPrompt)
+      window.removeEventListener('appinstalled', onAppInstalled)
+    }
+  }, [])
+
+  async function handleInstallApp() {
+    if (!installPrompt) return
+    await installPrompt.prompt()
+    try {
+      const result = await installPrompt.userChoice
+      if (result.outcome === 'accepted') setInstallPrompt(null)
+    } catch {
+      // ignore
+    }
+  }
 
   function isActive(to: string) {
     return to === '/' ? location.pathname === '/' : location.pathname.startsWith(to)
@@ -79,6 +111,11 @@ export default function TopNav() {
         <div className="flex items-center gap-3">
           {isConnected && (
             <>
+              {installPrompt && (
+                <button className="nav-pill text-sm !px-3" onClick={handleInstallApp}>
+                  ⬇ 安装应用
+                </button>
+              )}
               <button className="nav-pill text-sm !px-3" onClick={() => setShowQR(true)}>
                 🔲 我的 QR
               </button>
@@ -189,6 +226,11 @@ export default function TopNav() {
           })}
           {isConnected && (
             <div className="flex gap-2 p-4">
+              {installPrompt && (
+                <button className="nav-pill text-sm flex-1" onClick={() => { setMenuOpen(false); handleInstallApp() }}>
+                  ⬇ 安装应用
+                </button>
+              )}
               <button className="nav-pill text-sm flex-1" onClick={() => { setMenuOpen(false); setShowQR(true) }}>
                 🔲 我的 QR
               </button>
