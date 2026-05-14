@@ -31,6 +31,7 @@ interface AuthState {
   isConnected: boolean
   isLoading: boolean
   error: string | null
+  ipFullPrompt: boolean
 
   setNodeId: (nodeId: number) => void
   setPassCode: (passCode: string) => void
@@ -38,6 +39,8 @@ interface AuthState {
   regeneratePassCode: () => void
   connect: () => Promise<void>
   disconnect: () => Promise<void>
+  releaseAllFromIp: () => Promise<number>
+  dismissIpFullPrompt: () => void
 }
 
 export const useAuthStore = create<AuthState>((set, get) => ({
@@ -46,6 +49,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   isConnected: false,
   isLoading: false,
   error: null,
+  ipFullPrompt: false,
 
   setNodeId(nodeId) {
     const identity = { ...get().identity, nodeId }
@@ -72,49 +76,70 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   async connect() {
-    const { identity } = get()
-    set({ isLoading: true, error: null })
+    const current = get().identity
+    set({ isLoading: true, error: null, ipFullPrompt: false })
 
-    for (let attempt = 0; attempt < 5; attempt++) {
-      try {
-        const res = await fetch(apiUrl('/api/register'), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ nodeId: identity.nodeId, passCode: identity.passCode }),
-        })
+    try {
+      const res = await fetch(apiUrl('/api/register'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ nodeId: current.nodeId, passCode: current.passCode }),
+      })
 
-        if (res.status === 409) {
-          const newNodeId = identity.nodeId + 1 > 20001 ? randomInt(1, 20001) : identity.nodeId + 1
-          const newIdentity = { ...identity, nodeId: newNodeId }
-          persistIdentity(newIdentity)
-          set({ identity: newIdentity })
-          continue
-        }
-
-        if (res.status === 423) {
-          const data = await res.json() as { error: string; unlockAt: number }
-          const mins = Math.ceil((data.unlockAt - Date.now()) / 60000)
-          set({ isLoading: false, error: `检测到异常接入尝试，节点已临时锁定（${mins} 分钟后解除）` })
-          return
-        }
-
-        if (!res.ok) {
-          set({ isLoading: false, error: '接入失败，请稍后重试' })
-          return
-        }
-
-        const data = await res.json() as { token: string; expiresAt: number; resumed: boolean }
-        const session: Session = { token: data.token, expiresAt: data.expiresAt }
-        sessionStorage.setItem('misaka.session', JSON.stringify(session))
-        set({ session, isConnected: true, isLoading: false })
-        return
-      } catch {
-        set({ isLoading: false, error: '网络连接失败，请检查网络' })
+      if (res.status === 409) {
+        // The chosen nodeId is held by someone else with a different passcode.
+        // Don't auto-bump — the user picked this nodeId on purpose and
+        // expects the cluster to contain peers with exactly this number.
+        set({ isLoading: false, error: '该节点编号已被他人占用，请换一个' })
         return
       }
-    }
 
-    set({ isLoading: false, error: '节点编号冲突，请手动选择编号' })
+      if (res.status === 423) {
+        const data = await res.json() as { error: string; unlockAt: number }
+        const mins = Math.ceil((data.unlockAt - Date.now()) / 60000)
+        set({ isLoading: false, error: `检测到异常接入尝试，节点已临时锁定（${mins} 分钟后解除）` })
+        return
+      }
+
+      if (res.status === 429) {
+        const data = await res.json().catch(() => ({ error: 'RATE_LIMITED' })) as { error: string; message?: string }
+        if (data.error === 'IP_LIMITED') {
+          set({ isLoading: false, ipFullPrompt: true, error: null })
+          return
+        }
+        set({ isLoading: false, error: data.message ?? '请求过于频繁，请稍后再试' })
+        return
+      }
+
+      if (!res.ok) {
+        set({ isLoading: false, error: '接入失败，请稍后重试' })
+        return
+      }
+
+      const data = await res.json() as { token: string; sessionId: string; expiresAt: number; resumed: boolean }
+      const session: Session = { token: data.token, sessionId: data.sessionId, expiresAt: data.expiresAt }
+      sessionStorage.setItem('misaka.session', JSON.stringify(session))
+      set({ session, isConnected: true, isLoading: false })
+    } catch {
+      set({ isLoading: false, error: '网络连接失败，请检查网络' })
+    }
+  },
+
+  async releaseAllFromIp() {
+    try {
+      const res = await fetch(apiUrl('/api/release-by-ip'), { method: 'POST' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json() as { released: number }
+      set({ ipFullPrompt: false })
+      return data.released
+    } catch {
+      set({ error: '释放失败，请重试' })
+      return 0
+    }
+  },
+
+  dismissIpFullPrompt() {
+    set({ ipFullPrompt: false })
   },
 
   async disconnect() {

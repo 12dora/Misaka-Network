@@ -52,16 +52,16 @@ export function createDataChannel(pc: RTCPeerConnection, label = 'misaka'): RTCD
   })
 }
 
+// Trickle ICE: return the SDP as soon as the local description is set, then
+// stream candidates over the signaling channel via `onicecandidate`.
+// Previously we waited for `iceGatheringState === 'complete'` but the
+// listener was registered with `{ once: true }` — the first transition is
+// usually `new → gathering`, the handler fires, doesn't resolve, gets
+// removed, and the `complete` event later has no handler. The whole
+// handshake hung, the DC never opened, and the user saw "DataChannel 打开超时".
 export async function createOffer(pc: RTCPeerConnection): Promise<RTCSessionDescriptionInit> {
   const offer = await pc.createOffer()
   await pc.setLocalDescription(offer)
-  // Wait for ICE gathering to complete
-  await new Promise<void>(resolve => {
-    if (pc.iceGatheringState === 'complete') resolve()
-    else pc.addEventListener('icegatheringstatechange', () => {
-      if (pc.iceGatheringState === 'complete') resolve()
-    }, { once: true })
-  })
   return pc.localDescription!.toJSON()
 }
 
@@ -72,13 +72,6 @@ export async function createAnswer(
   await pc.setRemoteDescription(new RTCSessionDescription(offer))
   const answer = await pc.createAnswer()
   await pc.setLocalDescription(answer)
-  // Wait for ICE gathering
-  await new Promise<void>(resolve => {
-    if (pc.iceGatheringState === 'complete') resolve()
-    else pc.addEventListener('icegatheringstatechange', () => {
-      if (pc.iceGatheringState === 'complete') resolve()
-    }, { once: true })
-  })
   return pc.localDescription!.toJSON()
 }
 

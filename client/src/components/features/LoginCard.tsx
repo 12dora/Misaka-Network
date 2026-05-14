@@ -5,14 +5,21 @@ import MisakaCard from '@/components/ui/MisakaCard'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
 import QRModal from '@/components/features/QRModal'
+import { SPECIAL_NODE_HINTS } from '@/data/lore'
 
 export default function LoginCard() {
   const navigate = useNavigate()
   const {
-    identity, session, isConnected, isLoading, error,
+    identity, session, isConnected, isLoading, error, ipFullPrompt,
     setNodeId, setPassCode, regenerateNodeId, regeneratePassCode,
-    connect, disconnect,
+    connect, disconnect, releaseAllFromIp, dismissIpFullPrompt,
   } = useAuthStore()
+
+  async function handleReleaseAndRetry() {
+    const released = await releaseAllFromIp()
+    if (released > 0) await connect()
+    if (useAuthStore.getState().isConnected) navigate('/network')
+  }
 
   const passInputs = useRef<(HTMLInputElement | null)[]>([])
   const [showQR, setShowQR] = useState(false)
@@ -70,6 +77,7 @@ export default function LoginCard() {
 
   // Whether passcode is complete (6 digits)
   const passComplete = /^\d{6}$/.test(identity.passCode)
+  const specialHint = SPECIAL_NODE_HINTS[identity.nodeId]
 
   async function handleConnect() {
     await connect()
@@ -102,6 +110,15 @@ export default function LoginCard() {
         <div className="font-jp text-xs text-[var(--text-on-white-2)] mb-5">
           みさか {identity.nodeId} ごう
         </div>
+        {specialHint && (
+          <div
+            className="rounded-lg px-3 py-2 mb-5 font-kanji text-xs leading-relaxed"
+            style={{ background: 'var(--surface-tint)', color: 'var(--text-on-white)' }}
+          >
+            <div className="font-semibold mb-0.5">{specialHint.title}</div>
+            <div className="text-[var(--text-on-white-2)]">{specialHint.hint}</div>
+          </div>
+        )}
 
         <div className="flex items-center gap-2 mb-6 text-sm text-[var(--text-on-white-2)] font-kanji">
           通行码：
@@ -138,6 +155,32 @@ export default function LoginCard() {
   }
 
   return (
+    <>
+    {ipFullPrompt && (
+      <div
+        className="fixed inset-0 z-[110] flex items-center justify-center p-4"
+        style={{ background: 'rgba(14,42,107,0.75)', backdropFilter: 'blur(8px)' }}
+      >
+        <MisakaCard padding="lg" className="w-full max-w-[380px]">
+          <div className="flex items-center gap-2 mb-1">
+            <MisakaKanjiBlock char="満" size="md" />
+            <span className="font-kanji font-bold text-lg text-[var(--text-on-white)]">本机节点已满</span>
+          </div>
+          <p className="font-jp text-xs text-[var(--text-on-white-2)] mb-3">IP 上限に到達</p>
+          <p className="font-kanji text-sm text-[var(--text-on-white)] mb-5">
+            本机 IP 同时最多允许 10 个节点。是否销毁本机所有已注册节点后重新接入？
+          </p>
+          <div className="flex gap-2">
+            <MisakaButton variant="primary" fullWidth onClick={handleReleaseAndRetry}>
+              全部销毁并重试
+            </MisakaButton>
+            <MisakaButton variant="pill" fullWidth onClick={dismissIpFullPrompt}>
+              取消
+            </MisakaButton>
+          </div>
+        </MisakaCard>
+      </div>
+    )}
     <MisakaCard padding="lg" className="w-full max-w-[420px]">
       {/* Header */}
       <div className="flex items-center gap-2 mb-1">
@@ -182,6 +225,16 @@ export default function LoginCard() {
           </button>
         </div>
       </div>
+
+      {specialHint && (
+        <div
+          className="rounded-lg px-3 py-2 mb-5 font-kanji text-xs leading-relaxed"
+          style={{ background: 'var(--surface-tint)', color: 'var(--text-on-white)' }}
+        >
+          <div className="font-semibold mb-0.5">{specialHint.title}</div>
+          <div className="text-[var(--text-on-white-2)]">{specialHint.hint}</div>
+        </div>
+      )}
 
       {/* Pass Code */}
       <div className="mb-6">
@@ -246,5 +299,6 @@ export default function LoginCard() {
         ⓘ 30 分钟无活动会话自动释放
       </p>
     </MisakaCard>
+    </>
   )
 }

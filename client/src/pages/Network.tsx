@@ -5,7 +5,6 @@ import MisakaButton from '@/components/ui/MisakaButton'
 import MisakaStatusBadge from '@/components/ui/MisakaStatusBadge'
 import MisakaProgressBar from '@/components/ui/MisakaProgressBar'
 import QRModal from '@/components/features/QRModal'
-import ReceiveConfirmModal from '@/components/features/ReceiveConfirmModal'
 import { useNetworkStore } from '@/store/network'
 import { useAuthStore } from '@/store/auth'
 import { apiUrl } from '@/config'
@@ -33,11 +32,10 @@ function formatSpeed(bps: number) {
 }
 
 // ── NodeRadar ─────────────────────────────────────────────────────
-function NodeRadar({ peers, selected, onSelect, onSend, onShowQR, onCopyLink }: {
+function NodeRadar({ peers, selected, onSelect, onShowQR, onCopyLink }: {
   peers: Peer[]
-  selected: number | null
-  onSelect: (id: number) => void
-  onSend: (id: number) => void
+  selected: string | null
+  onSelect: (sessionId: string) => void
   onShowQR: () => void
   onCopyLink: () => void
 }) {
@@ -62,39 +60,31 @@ function NodeRadar({ peers, selected, onSelect, onSend, onShowQR, onCopyLink }: 
         </MisakaCard>
       ) : (
         peers.map(peer => {
-          const isSelected = selected === peer.nodeId
+          const isSelected = selected === peer.sessionId
+          // Suffix the last 4 chars of sessionId so multiple devices sharing
+          // the same nodeId remain visually distinguishable in the list.
+          const sidTag = peer.sessionId.slice(-4)
           return (
             <MisakaCard
-              key={peer.nodeId}
+              key={peer.sessionId}
               padding="sm"
               className={`cursor-pointer hover:-translate-y-0.5 transition-all duration-150 relative ${isSelected ? 'ring-2 ring-[var(--bg-deep)]' : ''}`}
               style={isSelected ? { background: 'var(--surface-tint)' } : {}}
-              onClick={() => onSelect(peer.nodeId)}
+              onClick={() => onSelect(peer.sessionId)}
             >
               {isSelected && (
-                <div
-                  className="absolute left-0 top-3 bottom-3 w-1 rounded-r"
-                  style={{ background: 'var(--bg-deep)' }}
-                />
+                <div className="absolute left-0 top-3 bottom-3 w-1 rounded-r" style={{ background: 'var(--bg-deep)' }} />
               )}
               <div className="flex items-center gap-2 mb-2 pl-2">
                 <MisakaStatusBadge status={peer.status} />
                 <span className="font-kanji font-bold text-sm text-[var(--text-on-white)] ml-auto">
                   御坂 {peer.nodeId} 号
+                  <span className="ml-1 font-mono text-[10px] text-[var(--text-muted)]">#{sidTag}</span>
                 </span>
               </div>
-              <div className="pl-2 space-y-0.5 text-xs text-[var(--text-on-white-2)] font-kanji mb-3">
+              <div className="pl-2 space-y-0.5 text-xs text-[var(--text-on-white-2)] font-kanji mb-1">
                 <div>▪ {channelLabel(peer.channelType)}</div>
                 <div>⏱ {formatDuration(Date.now() - peer.joinedAt)}</div>
-              </div>
-              <div className="flex gap-1.5 pl-2">
-                <MisakaButton
-                  variant="pill" size="sm" className="flex-1 text-xs py-1.5"
-                  onClick={e => { e.stopPropagation(); onSend(peer.nodeId) }}
-                >
-                  📤 发送
-                </MisakaButton>
-                <MisakaButton variant="pill" size="sm" className="flex-1 text-xs py-1.5">💬 消息</MisakaButton>
               </div>
             </MisakaCard>
           )
@@ -105,48 +95,150 @@ function NodeRadar({ peers, selected, onSelect, onSend, onShowQR, onCopyLink }: 
 }
 
 // ── Channel Chat ───────────────────────────────────────────────────
-function ChannelChat({ peerNodeId }: { peerNodeId: number }) {
-  const messages = useNetworkStore(s => s.chatMessages[peerNodeId] ?? [])
+function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
+  const messages = useNetworkStore(s => s.chatMessages[peerSessionId] ?? [])
+  const pendingFile = useNetworkStore(s => s.pendingFiles[peerSessionId] ?? null)
+  const recvTransfers = useNetworkStore(s => s.transfers.filter(t => t.peerSessionId === peerSessionId))
+  const sendPendingFile = useNetworkStore(s => s.sendPendingFile)
+  const clearPendingFile = useNetworkStore(s => s.setPendingFile)
   const bottomRef = useRef<HTMLDivElement>(null)
+  const [downloadedIds, setDownloadedIds] = useState<Set<string>>(new Set())
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+  }, [messages.length, recvTransfers.length, pendingFile])
+
+  function handleDownload(m: { id: string; fileName?: string; downloadUrl?: string }) {
+    if (!m.downloadUrl) return
+    const a = document.createElement('a')
+    a.href = m.downloadUrl
+    a.download = m.fileName ?? 'download'
+    a.click()
+    setTimeout(() => { if (m.downloadUrl) URL.revokeObjectURL(m.downloadUrl) }, 500)
+    setDownloadedIds(prev => new Set([...prev, m.id]))
+  }
 
   return (
     <div
       className="border-t p-4 flex flex-col gap-2"
-      style={{ borderColor: 'var(--border-card)', maxHeight: 160, overflowY: 'auto' }}
+      style={{ borderColor: 'var(--border-card)', maxHeight: 200, overflowY: 'auto' }}
     >
       <div className="font-kanji text-xs font-semibold text-[var(--text-on-white-2)] mb-1">会话信道</div>
-      {messages.length === 0 ? (
+      {messages.length === 0 && recvTransfers.length === 0 && !pendingFile && (
         <div className="font-kanji text-xs text-[var(--text-on-white-2)]">
           <span className="font-mono mr-2 text-[var(--accent-cyan)]">▸</span>
           [已连接] 人格连接已建立
         </div>
-      ) : (
-        messages.map(m => (
-          <div key={m.id} className="font-kanji text-xs text-[var(--text-on-white)]">
-            <span className="font-mono mr-2 text-[var(--accent-cyan)]">▸</span>
-            <span className="text-[var(--text-on-white-2)] text-[10px] mr-1">
-              {new Date(m.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
-            </span>
-            {m.content}
+      )}
+      {messages.map(m => {
+        const mine = m.direction === 'sent'
+        const isSystem = m.type === 'system'
+
+        if (m.type === 'file') {
+          const alreadyDownloaded = downloadedIds.has(m.id)
+          return (
+            <div key={m.id} className="font-kanji text-xs flex justify-start">
+              <div
+                className="max-w-[85%] rounded-lg px-2.5 py-2"
+                style={{ background: 'var(--surface-tint)', color: 'var(--text-on-white)' }}
+              >
+                <div className="flex items-center gap-1 mb-1.5">
+                  <span className="text-[10px] opacity-70">
+                    {new Date(m.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
+                  </span>
+                  <span className="text-[10px] opacity-80 ml-1">对方:</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-sm">📎</span>
+                  <div className="flex-1 min-w-0">
+                    <div className="truncate text-xs font-semibold">{m.fileName}</div>
+                    {m.fileSize !== undefined && (
+                      <div className="text-[10px]" style={{ color: 'var(--text-muted)' }}>{formatBytes(m.fileSize)}</div>
+                    )}
+                  </div>
+                  {alreadyDownloaded ? (
+                    <span className="text-[10px] font-mono shrink-0" style={{ color: 'var(--state-success)' }}>✓ 已下载</span>
+                  ) : (
+                    <MisakaButton variant="primary" size="sm" className="text-xs py-0.5 px-2 shrink-0"
+                      onClick={() => handleDownload(m)}>
+                      ↓ 下载
+                    </MisakaButton>
+                  )}
+                </div>
+              </div>
+            </div>
+          )
+        }
+
+        return (
+          <div
+            key={m.id}
+            className={`font-kanji text-xs flex ${mine ? 'justify-end' : 'justify-start'}`}
+          >
+            <div
+              className="max-w-[80%] rounded-lg px-2.5 py-1.5"
+              style={{
+                background: isSystem
+                  ? 'transparent'
+                  : (mine ? 'var(--bg-deep)' : 'var(--surface-tint)'),
+                color: isSystem
+                  ? 'var(--text-on-white-2)'
+                  : (mine ? '#fff' : 'var(--text-on-white)'),
+                fontStyle: isSystem ? 'italic' : 'normal',
+              }}
+            >
+              <span className="text-[10px] opacity-70 mr-1">
+                {new Date(m.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
+              </span>
+              {!isSystem && <span className="mr-1 text-[10px] opacity-80">{mine ? '你' : '对方'}:</span>}
+              {m.content}
+            </div>
           </div>
-        ))
+        )
+      })}
+      {recvTransfers.filter(t => t.direction === 'recv').map(t => (
+        <div key={t.id} className="font-kanji text-xs text-[var(--text-on-white)] flex items-center gap-2">
+          <span className="font-mono text-[var(--accent-cyan)]">📥</span>
+          <span className="text-[var(--text-on-white-2)] text-[10px]">
+            {new Date(t.startedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
+          </span>
+          <span className="truncate flex-1">{t.fileName}</span>
+          <span className="text-[10px] text-[var(--text-muted)]">{Math.round(t.progress * 100)}%</span>
+        </div>
+      ))}
+      {pendingFile && (
+        <div
+          className="font-kanji text-xs rounded-md p-2 flex items-center gap-2"
+          style={{ background: 'var(--surface-tint)', border: '1px dashed var(--border-card)' }}
+        >
+          <span className="font-mono text-[var(--accent-cyan)]">📎</span>
+          <div className="flex-1 min-w-0">
+            <div className="truncate text-[var(--text-on-white)]">{pendingFile.name}</div>
+            <div className="text-[10px] text-[var(--text-muted)]">{formatBytes(pendingFile.size)}</div>
+          </div>
+          <MisakaButton variant="primary" size="sm" className="text-xs py-1 px-3"
+            data-testid="send-pending-file"
+            onClick={() => sendPendingFile(peerSessionId)}>
+            发送
+          </MisakaButton>
+          <MisakaButton variant="pill" size="sm" className="text-xs py-1 px-2"
+            onClick={() => clearPendingFile(peerSessionId, null)}>
+            ✕
+          </MisakaButton>
+        </div>
       )}
       <div ref={bottomRef} />
     </div>
   )
 }
 
-function ChatInput({ peerNodeId }: { peerNodeId: number }) {
+function ChatInput({ peerSessionId }: { peerSessionId: string }) {
   const [text, setText] = useState('')
   const sendChatMessage = useNetworkStore(s => s.sendChatMessage)
 
   function handleSend() {
     if (!text.trim()) return
-    sendChatMessage(peerNodeId, text.trim())
+    sendChatMessage(peerSessionId, text.trim())
     setText('')
   }
 
@@ -170,84 +262,28 @@ function ChatInput({ peerNodeId }: { peerNodeId: number }) {
 }
 
 // ── TransferChannel ───────────────────────────────────────────────
-function TransferChannel({
-  selectedPeer,
-  incomingRequest,
-  onVerifyPassCode,
-  onRejectIncoming,
-  onSendFile,
-  onSendFileToAll,
-}: {
+function TransferChannel({ selectedPeer, onStageFile, onSendFileToAll }: {
   selectedPeer: Peer | null
-  incomingRequest: { fromNodeId: number } | null
-  onVerifyPassCode: (code: string) => void
-  onRejectIncoming: () => void
-  onSendFile: (file: File) => void
+  onStageFile: (file: File) => void
   onSendFileToAll: (file: File) => void
 }) {
   const [isDragOver, setDragOver] = useState(false)
-  const [passCode, setPassCode] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  // Handle file drop
   function handleDrop(e: React.DragEvent) {
     e.preventDefault()
     setDragOver(false)
     const file = e.dataTransfer.files[0]
-    if (file) onSendFile(file)
+    if (file) onStageFile(file)
   }
 
   function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
-    if (file) onSendFile(file)
-    // Reset so selecting the same file triggers again
+    if (file) onStageFile(file)
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
-  // ── Mode C: Passcode verification ──────────────────────────────
-  if (incomingRequest) {
-    return (
-      <MisakaCard padding="md" className="flex flex-col items-center justify-center h-full min-h-[340px]">
-        <MisakaKanjiBlock char="锁" size="lg" className="mb-3" />
-        <p className="font-kanji font-bold text-base text-[var(--text-on-white)] mb-1">
-          御坂 {incomingRequest.fromNodeId} 号请求接入
-        </p>
-        <p className="font-jp text-xs text-[var(--text-on-white-2)] mb-4">
-          接続リクエスト
-        </p>
-        <p className="font-kanji text-xs text-[var(--text-on-white-2)] mb-4">
-          请输入对方的通行码以建立连接
-        </p>
-        <input
-          type="password"
-          inputMode="numeric"
-          maxLength={6}
-          value={passCode}
-          onChange={e => setPassCode(e.target.value.replace(/\D/g, ''))}
-          placeholder="000000"
-          className="misaka-input mb-3 text-center text-lg tracking-[0.3em] font-mono"
-          style={{ maxWidth: 200 }}
-          onKeyDown={e => {
-            if (e.key === 'Enter' && passCode.length === 6) onVerifyPassCode(passCode)
-          }}
-        />
-        <div className="flex gap-2">
-          <MisakaButton
-            variant="primary" size="md"
-            disabled={passCode.length !== 6}
-            onClick={() => onVerifyPassCode(passCode)}
-          >
-            验证
-          </MisakaButton>
-          <MisakaButton variant="pill" size="md" onClick={onRejectIncoming}>
-            取消
-          </MisakaButton>
-        </div>
-      </MisakaCard>
-    )
-  }
-
-  // ── Mode A: No peer selected ──────────────────────────────────
+  // ── No peer selected ────────────────────────────────────────
   if (!selectedPeer) {
     return (
       <MisakaCard
@@ -261,14 +297,12 @@ function TransferChannel({
         onDrop={e => { e.preventDefault(); setDragOver(false) }}
       >
         <MisakaKanjiBlock char="同" size="xl" className="mb-4" />
-        <p className="font-kanji font-bold text-lg text-[var(--text-on-white)] mb-1">拖拽文件到此处</p>
-        <p className="font-jp text-sm text-[var(--text-on-white-2)] mb-3">ファイルをドロップ</p>
-        <p className="font-kanji text-xs text-[var(--text-muted)] mt-6">── 请先从左侧选择目标节点 ──</p>
+        <p className="font-kanji font-bold text-lg text-[var(--text-on-white)] mb-1">从左侧选择目标节点</p>
+        <p className="font-jp text-sm text-[var(--text-on-white-2)] mb-3">対象ノードを選択</p>
       </MisakaCard>
     )
   }
 
-  // ── Mode B: Peer selected ─────────────────────────────────────
   return (
     <MisakaCard padding="none" className="flex flex-col h-full min-h-[340px]">
       {/* Info bar */}
@@ -278,6 +312,7 @@ function TransferChannel({
       >
         <div className="font-kanji text-sm font-semibold text-[var(--text-on-white)]">
           目标：御坂 {selectedPeer.nodeId} 号
+          <span className="ml-1 font-mono text-[10px] text-[var(--text-muted)]">#{selectedPeer.sessionId.slice(-4)}</span>
         </div>
         <div className="font-kanji text-xs text-[var(--text-on-white-2)] mt-0.5">
           {channelLabel(selectedPeer.channelType)} · DTLS + AES-GCM
@@ -303,41 +338,28 @@ function TransferChannel({
         onDragLeave={() => setDragOver(false)}
         onDrop={handleDrop}
       >
-        <MisakaButton
-          variant="pill" size="md" className="w-56"
-          onClick={() => fileInputRef.current?.click()}
-        >
+        <MisakaButton variant="pill" size="md" className="w-56"
+          onClick={() => fileInputRef.current?.click()}>
           📁 拖拽 / 点击选择文件
         </MisakaButton>
-        <MisakaButton
-          variant="pill" size="md" className="w-56"
-          onClick={() => document.getElementById('fanout-file-input')?.click()}
-        >
+        <MisakaButton variant="pill" size="md" className="w-56"
+          onClick={() => document.getElementById('fanout-file-input')?.click()}>
           📡 群发文件到全部节点
         </MisakaButton>
-        <input
-          ref={fileInputRef}
-          type="file"
-          className="hidden"
-          onChange={handleFileChange}
-        />
-        <input
-          id="fanout-file-input"
-          type="file"
-          className="hidden"
+        <input ref={fileInputRef} type="file" className="hidden" onChange={handleFileChange} />
+        <input id="fanout-file-input" type="file" className="hidden"
           onChange={(e) => {
             const file = e.target.files?.[0]
             if (file) onSendFileToAll(file)
             e.target.value = ''
-          }}
-        />
+          }} />
       </div>
 
       {/* Channel messages */}
-      <ChannelChat peerNodeId={selectedPeer.nodeId} />
+      <ChannelChat peerSessionId={selectedPeer.sessionId} />
 
       {/* Message input */}
-      <ChatInput peerNodeId={selectedPeer.nodeId} />
+      <ChatInput peerSessionId={selectedPeer.sessionId} />
     </MisakaCard>
   )
 }
@@ -346,7 +368,7 @@ function TransferChannel({
 function TaskPanel({ transfers, onPause, onResume, onCancel }: {
   transfers: Transfer[]
   onPause: (id: string) => void
-  onResume: (id: string, peerId: number) => void
+  onResume: (id: string, peerSessionId: string) => void
   onCancel: (id: string) => void
 }) {
   return (
@@ -390,7 +412,7 @@ function TaskPanel({ transfers, onPause, onResume, onCancel }: {
                 <span style={{ color: 'var(--text-muted)' }}>已暂停</span>
               </div>
               <div className="flex gap-1.5 mt-2">
-                <MisakaButton variant="primary" size="sm" className="flex-1 text-xs py-1" onClick={() => onResume(t.id, t.peerNodeId)}>▶ 继续</MisakaButton>
+                <MisakaButton variant="primary" size="sm" className="flex-1 text-xs py-1" onClick={() => onResume(t.id, t.peerSessionId)}>▶ 继续</MisakaButton>
                 <MisakaButton variant="pill" size="sm" className="flex-1 text-xs py-1" onClick={() => onCancel(t.id)}>✕ 取消</MisakaButton>
               </div>
             </>
@@ -404,14 +426,13 @@ function TaskPanel({ transfers, onPause, onResume, onCancel }: {
           {t.status === 'completed' && (
             <div className="flex items-center gap-2 mt-1">
               <span style={{ color: 'var(--state-success)' }} className="font-mono text-xs">✓ 已完成</span>
-              <MisakaButton variant="pill" size="sm" className="ml-auto text-xs py-1 px-3">打开</MisakaButton>
             </div>
           )}
           {t.status === 'failed' && (
             <>
               <div className="flex items-center gap-2 mt-1">
                 <span style={{ color: 'var(--state-danger)' }} className="font-mono text-xs">✗ 失败</span>
-                <MisakaButton variant="pill" size="sm" className="ml-auto text-xs py-1 px-3" onClick={() => onResume(t.id, t.peerNodeId)}>重试</MisakaButton>
+                <MisakaButton variant="pill" size="sm" className="ml-auto text-xs py-1 px-3" onClick={() => onResume(t.id, t.peerSessionId)}>重试</MisakaButton>
               </div>
               {t.error && (
                 <div className="mt-1 text-[10px] font-kanji" style={{ color: 'var(--text-on-white-2)' }}>
@@ -475,11 +496,16 @@ const TABS: { id: TabId; kanji: string; label: string }[] = [
 export default function Network() {
   const [activeTab, setActiveTab] = useState<TabId>('radar')
   const [showQR, setShowQR]   = useState(false)
-  const [verifyError, setVerifyError] = useState<string | null>(null)
   const [toast, setToast] = useState<string | null>(null)
 
   const auth = useAuthStore()
   const store = useNetworkStore()
+
+  useEffect(() => {
+    if (auth.session?.token && !store.wsConnected) {
+      store.init(auth.session.token)
+    }
+  }, [auth.session?.token])
 
   async function handleCopyLink() {
     if (!auth.session?.token) return
@@ -490,7 +516,7 @@ export default function Network() {
         headers: { Authorization: `Bearer ${auth.session.token}` },
       })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json() as { qrToken: string; channelId: string }
+      const data = await res.json() as { qrToken: string }
       const params = new URLSearchParams({
         type: 'node',
         id: String(auth.identity.nodeId),
@@ -498,8 +524,6 @@ export default function Network() {
       })
       const link = `${location.origin}/join?${params.toString()}`
       await navigator.clipboard.writeText(link)
-      // Owner needs to be in the QR channel for the scanner to land into the same channel
-      if (store.wsConnected) store.joinChannel(data.channelId)
       setToast('链接已复制到剪贴板')
     } catch (e) {
       setToast(`复制失败：${String(e)}`)
@@ -507,135 +531,71 @@ export default function Network() {
     setTimeout(() => setToast(null), 2400)
   }
 
-  // Init store on mount
-  useEffect(() => {
-    if (auth.session?.token && !store.wsConnected) {
-      store.init(auth.session.token)
-    }
-    return () => {
-      // Don't destroy on unmount — keep connection alive across tab switches
-    }
-  }, [auth.session?.token])
-
-  function handleSelectPeer(id: number) {
-    store.selectPeer(id)
+  function handleSelectPeer(sessionId: string) {
+    store.selectPeer(sessionId)
     setActiveTab('channel')
   }
 
-  async function handleSend(id: number) {
-    store.selectPeer(id)
-    await store.requestConnection(id)
-  }
-
-  async function handleVerify(passCode: string) {
-    try {
-      setVerifyError(null)
-      await store.verifyAndConnect(passCode)
-    } catch (e) {
-      setVerifyError(String(e))
-    }
-  }
-
-  function handleRejectIncoming() {
-    store.rejectIncoming()
-    setVerifyError(null)
-  }
-
-  async function handleSendFile(file: File) {
-    try {
-      await store.sendFile(file)
-    } catch (e) {
-      console.error('Send failed:', e)
-    }
+  function handleStageFile(file: File) {
+    if (!store.selectedSessionId) return
+    store.setPendingFile(store.selectedSessionId, file)
+    setActiveTab('channel')
   }
 
   async function handleSendFileToAll(file: File) {
-    try {
-      await store.sendFileToAll(file)
-    } catch (e) {
-      console.error('Fanout send failed:', e)
-    }
+    try { await store.sendFileToAll(file) }
+    catch (e) { console.error('Fanout send failed:', e) }
   }
 
-  const peerEntity = store.peers.find(p => p.nodeId === store.selectedPeerId) ?? null
-
-  const receiveModalMeta = store.incomingMeta ? {
-    sourceNodeId: store.incomingMeta.fromNodeId,
-    fileName: store.incomingMeta.fileName,
-    fileSize: store.incomingMeta.fileSize,
-    channelType: 'stun' as const,
-    fileHash: store.incomingMeta.fileHash,
-  } : null
+  const peerEntity = store.peers.find(p => p.sessionId === store.selectedSessionId) ?? null
 
   return (
     <div className="min-h-screen pt-16" style={{ background: 'var(--bg-primary)' }}>
-
-      {/* ── Desktop: 3-column grid ─────────────────────────────────── */}
-      <div
-        className="hidden md:grid h-[calc(100vh-64px)] gap-6 p-6"
-        style={{ gridTemplateColumns: '1fr 2fr 1fr' }}
-      >
+      {/* Desktop 3-column */}
+      <div className="hidden md:grid h-[calc(100vh-64px)] gap-6 p-6" style={{ gridTemplateColumns: '1fr 2fr 1fr' }}>
         <div className="overflow-y-auto">
           <NodeRadar
             peers={store.peers}
-            selected={store.selectedPeerId}
+            selected={store.selectedSessionId}
             onSelect={handleSelectPeer}
-            onSend={handleSend}
             onShowQR={() => setShowQR(true)}
             onCopyLink={handleCopyLink}
           />
         </div>
         <TransferChannel
           selectedPeer={peerEntity}
-          incomingRequest={store.incomingRequest}
-          onVerifyPassCode={handleVerify}
-          onRejectIncoming={handleRejectIncoming}
-          onSendFile={handleSendFile}
+          onStageFile={handleStageFile}
           onSendFileToAll={handleSendFileToAll}
         />
         <div className="overflow-y-auto">
           <TaskPanel
             transfers={store.transfers}
             onPause={(id) => store.pauseTransfer(id)}
-            onResume={(id, peerId) => store.resumeTransfer(id, peerId)}
+            onResume={(id, sid) => store.resumeTransfer(id, sid)}
             onCancel={(id) => store.cancelTransferAction(id)}
           />
         </div>
       </div>
 
-      {/* ── Mobile: tab layout ────────────────────────────────────── */}
+      {/* Mobile tabs */}
       <div className="md:hidden flex flex-col" style={{ minHeight: 'calc(100svh - 64px)' }}>
-        {/* Tab bar */}
-        <div
-          className="flex border-b"
-          style={{
-            background: 'rgba(14,42,107,0.85)',
-            backdropFilter: 'blur(12px)',
-            borderColor: 'rgba(255,255,255,0.12)',
-          }}
-        >
+        <div className="flex border-b" style={{
+          background: 'rgba(14,42,107,0.85)', backdropFilter: 'blur(12px)',
+          borderColor: 'rgba(255,255,255,0.12)',
+        }}>
           {TABS.map(({ id, kanji, label }) => {
             const active = activeTab === id
             return (
-              <button
-                key={id}
-                onClick={() => setActiveTab(id)}
+              <button key={id} onClick={() => setActiveTab(id)}
                 className="flex-1 flex flex-col items-center justify-center gap-1 py-3 cursor-pointer transition-colors"
                 style={{
-                  border: 'none',
-                  background: 'transparent',
+                  border: 'none', background: 'transparent',
                   borderBottom: active ? '2px solid var(--accent-cyan)' : '2px solid transparent',
-                }}
-              >
-                <MisakaKanjiBlock
-                  char={kanji}
-                  size="sm"
-                  className={`transition-opacity ${active ? 'opacity-100' : 'opacity-50'}`}
-                />
-                <span
-                  className="font-kanji text-xs"
-                  style={{ color: active ? 'var(--text-on-blue)' : 'var(--text-muted)' }}
-                >
+                }}>
+                <MisakaKanjiBlock char={kanji} size="sm"
+                  className={`transition-opacity ${active ? 'opacity-100' : 'opacity-50'}`} />
+                <span className="font-kanji text-xs"
+                  style={{ color: active ? 'var(--text-on-blue)' : 'var(--text-muted)' }}>
                   {label}
                 </span>
               </button>
@@ -643,14 +603,12 @@ export default function Network() {
           })}
         </div>
 
-        {/* Tab panel */}
         <div className="flex-1 overflow-y-auto p-4">
           {activeTab === 'radar' && (
             <NodeRadar
               peers={store.peers}
-              selected={store.selectedPeerId}
+              selected={store.selectedSessionId}
               onSelect={handleSelectPeer}
-              onSend={handleSend}
               onShowQR={() => setShowQR(true)}
               onCopyLink={handleCopyLink}
             />
@@ -658,10 +616,7 @@ export default function Network() {
           {activeTab === 'channel' && (
             <TransferChannel
               selectedPeer={peerEntity}
-              incomingRequest={store.incomingRequest}
-              onVerifyPassCode={handleVerify}
-              onRejectIncoming={handleRejectIncoming}
-              onSendFile={handleSendFile}
+              onStageFile={handleStageFile}
               onSendFileToAll={handleSendFileToAll}
             />
           )}
@@ -669,25 +624,15 @@ export default function Network() {
             <TaskPanel
               transfers={store.transfers}
               onPause={(id) => store.pauseTransfer(id)}
-              onResume={(id, peerId) => store.resumeTransfer(id, peerId)}
+              onResume={(id, sid) => store.resumeTransfer(id, sid)}
               onCancel={(id) => store.cancelTransferAction(id)}
             />
           )}
         </div>
 
-        {/* Bottom action bar */}
         <MobileBottomBar onShowQR={() => setShowQR(true)} />
       </div>
 
-      {/* Passcode verify error */}
-      {verifyError && (
-        <div className="fixed top-20 left-1/2 -translate-x-1/2 z-[120] px-4 py-2 rounded-lg text-sm font-kanji"
-          style={{ background: 'var(--state-danger)', color: '#fff' }}>
-          {verifyError}
-        </div>
-      )}
-
-      {/* Toast */}
       {toast && (
         <div className="fixed bottom-24 md:bottom-8 left-1/2 -translate-x-1/2 z-[120] px-4 py-2 rounded-lg text-sm font-kanji shadow-lg"
           style={{ background: 'var(--bg-deep)', color: '#fff' }}>
@@ -695,20 +640,11 @@ export default function Network() {
         </div>
       )}
 
-      {/* Modals */}
       {showQR && (
         <QRModal
           nodeId={auth.identity.nodeId}
           passCode={auth.identity.passCode}
           onClose={() => setShowQR(false)}
-        />
-      )}
-      {receiveModalMeta && !store.incomingRequest && (
-        <ReceiveConfirmModal
-          transfer={receiveModalMeta}
-          onAccept={() => store.acceptTransfer()}
-          onReject={() => store.rejectTransfer()}
-          onBlock={() => store.blockPeer(receiveModalMeta.sourceNodeId)}
         />
       )}
     </div>

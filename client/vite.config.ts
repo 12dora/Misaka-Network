@@ -19,4 +19,15 @@ export default defineConfig(({ mode }) => ({
       '/ws': { target: 'ws://localhost:8080', ws: true },
     },
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          react: ['react', 'react-dom', 'react-router-dom', 'zustand'],
+          qr: ['qrcode', 'jsqr'],
+          hash: ['hash-wasm'],
+        },
+      },
+    },
+  },
 }))

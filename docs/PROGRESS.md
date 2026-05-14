@@ -74,23 +74,25 @@
 - ☐ 字体子集化
 
 ### 3.5 彩蛋 & 沉浸
-- ☐ 关键编号（10032 / 9982 / 20001）特殊提示
-- ☐ 妹妹语录穿插 ActivityStream
-- ☐ 音效（扫码 / 完成 / 错误，可关）
-- ☐ ACGN 世界观长文 + 时间线
+- ☑ 关键编号（10032 / 9982 / 20001）特殊提示
+- ☑ 妹妹语录穿插 ActivityStream
+- ☑ 音效（扫码 / 完成 / 错误，可关）
+- ☑ ACGN 世界观长文 + 时间线
 
 ### 3.6 i18n（可选）
 - ☐ 中 / 日 / 英
 - ☐ 设计 token 术语表分语言
 
 ### 3.7 性能
-- ☐ 路由级懒加载 + bundle 拆分
-- ☐ Lighthouse 90+
-- ☐ 大文件 hash 走 Web Worker
+- ☑ 路由级懒加载 + bundle 拆分
+- ◐ Lighthouse 90+（已做性能侧拆包 / worker；需浏览器 Lighthouse 实测）
+- ☑ 大文件 hash 走 Web Worker
 
 ## 当前会话焦点
 
-v2 编码完成。本机部署验证通过。剩余待办：2.1 真机验证 + 2.4.1 部署信令。
+v3.5 彩蛋与沉浸、v3.7 性能已编码：关键编号提示、ActivityStream 语录、可关闭音效、ACGN 时间线、路由 lazy chunks、manualChunks、文件 hash worker。剩余：Lighthouse 90+ 需浏览器实测。
+
+接收文件改为手动下载：文件接收完成后不再自动触发浏览器下载，而是在聊天框插入文件卡片（显示文件名 + 大小 + "↓ 下载"按钮），点击后才开始下载，下载后按钮变为"✓ 已下载"。
 
 ## 已知问题
 
@@ -99,6 +101,7 @@ v2 编码完成。本机部署验证通过。剩余待办：2.1 真机验证 + 2
 - 接收端 DataChannel 监听器有重复绑定风险（已用 addEventListener 规避，待复核）
 - File System Access API 仅在 Chromium 系浏览器可用，Safari/Firefox 使用 OPFS 磁盘缓存替代（相同效果）
 - OPFS 写入可能因磁盘配额不足失败 → 自动降级 IndexedDB + Blob 内存组装
+- Lighthouse 90+ 尚未在真实浏览器环境跑分，仅完成代码侧优化与生产构建验证
 
 ## 决策记录（精简）
 
@@ -106,7 +109,17 @@ v2 编码完成。本机部署验证通过。剩余待办：2.1 真机验证 + 2
 - 服务端全内存，无持久化；速率限制滑动窗口；上报保留 1h
 - chunk 加密：iv(12B) + ciphertext 单帧；DataChannel 文本头 + 二进制体双消息
 - ECDH 在 DataChannel open 后第一帧交换，30s 超时
-- 对等发现：SHA-256(passcode).slice(0,16) 作 channel；QR 可覆盖
+- 对等发现：identity-scoped cluster — channelId = `cluster-<nodeId>-<SHA-256(passcode).slice(0,16)>`，仅同 nodeId+passcode 的设备相互可见。允许多设备共享同一身份（手机/电脑同时在线）
+- 路由身份分离：每个 WS session 持有唯一 sessionId（nanoid 16），nodeId 用于显示与聚类，sessionId 用于 WebRTC 信令与 DataChannel 路由
+- 自动建链：WELCOME 后客户端自动发 JOIN_CLUSTER；服务端在 PEER_JOINED 中标记 shouldInitiate，仅"新到达者"主动发 SDP offer，避免 glare
+- 取消 CONNECT_REQ / verify-passcode：cluster 内成员同身份天然互信，不再二次握手
+- DataChannel 必须显式设置 `binaryType='arraybuffer'`：默认 'blob' 会让接收端 `instanceof ArrayBuffer` 校验失败，文件 chunk 整段被静默丢弃
+- DataChannel onopen 必须处理"已 open"竞态：answerer 侧通过 `pc.ondatachannel` 拿到的 channel 可能已在监听器附加前完成 open；附加前先比较 `dc.readyState`
+- 聊天发送策略：即使 DC 暂未 open 也立即写入本地 chatMessages（用户操作必有反馈），同时把序列化后的 payload 入队，dc.onopen 中 flush
+- ChannelMessage 增加 direction: 'sent' | 'recv' | 'system'，UI 右对齐展示自己发的消息、左对齐对方
+- WebRTC 改用 trickle ICE：createOffer / createAnswer / ICE restart 在 setLocalDescription 后立即返回 SDP，候选通过 onicecandidate → SIGNAL_ICE 流式发送。原先等 `iceGatheringState === 'complete'` 的实现误用 `{ once: true }`，第一次 `new → gathering` 状态变化触发后监听器被自动移除，后续 `complete` 永远收不到 → 握手挂起 15s → "DataChannel 打开超时"
+- store.init() 必须幂等（模块级 `initialized` flag）：React 18 StrictMode 开发态会让 useEffect 双调用，第二次会重复 onMessage 注册导致每个信令被处理两次，引发并发 setRemoteDescription/setLocalDescription 触发 `Called in wrong state: stable`
+- signaling.doConnect 在 readyState === CONNECTING 时也直接 return，并把 socket 引用绑到 onopen 闭包里（用局部 `sock` 变量而不是模块级 `ws`），避免重连/重试期间老 ws 的 onopen 引到刚替换的新 ws 上调用 send，触发 "Still in CONNECTING state"
 - 前端配置三级：public/config.json + window.__MISAKA_CONFIG__ + VITE_ env
 - GitHub Pages：VITE_BASE 控制 base path；404.html + sessionStorage 恢复路径
 - 聊天复用 DataChannel，JSON 文本 type='chat'，不新增协议
@@ -118,3 +131,6 @@ v2 编码完成。本机部署验证通过。剩余待办：2.1 真机验证 + 2
 - 信令关闭通知：SERVER_SHUTDOWN 消息 + WS 1001 关闭码，客户端标记 serverShutdown 阻止重连
 - 1GB 压测：sender 流式路径 heapUsed +1.6MB（安全）；接收端流式写盘 +0MB（安全）；Blob 组装降级峰值 RSS 1.7GB（仅 Safari/Firefox 降级路径，可用）
 - OPFS 磁盘缓存：利用 navigator.storage.getDirectory() 在接收时逐 chunk 落盘，完成后 getFile() 获取引用而非常驻内存。OPFS 所有现代浏览器均支持，替换了 IndexedDB + Blob 全量组装的降级路径，避免 10GB 文件撑爆 JS heap
+- 接收文件手动下载：deliverCompletedFile 不再调用 triggerDownload，改为在 chatMessages 插入 type='file' 的消息（含 fileName/fileSize/downloadUrl 字段）；ChannelChat 对 type='file' 消息渲染文件卡片 + "↓ 下载"按钮；点击后触发下载并 revokeObjectURL，按钮变为"✓ 已下载"
+- v3 沉浸：特殊节点 9982 / 10032 / 20001 在登录卡展示 lore hint；ActivityStream 每 45s 注入一条妹妹语录；设置面板增加音效开关，扫码 / 完成 / 错误音效由 WebAudio 合成且默认开启
+- v3 性能：路由改 React.lazy + Suspense；Vite manualChunks 拆出 react / qr / hash；整文件 SHA-256 优先交给 module worker，失败时降级主线程分块 hash

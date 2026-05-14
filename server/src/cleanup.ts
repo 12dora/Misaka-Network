@@ -9,20 +9,18 @@ export function startCleanupTask() {
   setInterval(() => {
     const now = Date.now()
 
-    for (const [nodeId, session] of nodes) {
-      // Auto-unlock nodes whose lock has expired
+    for (const [sessionId, session] of nodes) {
       if (session.lockedUntil > 0 && now >= session.lockedUntil) {
         session.lockedUntil = 0
         session.failedAttempts = 0
       }
 
-      // Expire idle disconnected sessions
       if (session.socket === null && now - session.lastSeen > SESSION_TTL) {
-        nodes.delete(nodeId)
+        nodes.delete(sessionId)
         if (session.channelId) {
           const ch = channels.get(session.channelId)
           if (ch) {
-            ch.delete(nodeId)
+            ch.delete(sessionId)
             if (ch.size === 0) channels.delete(session.channelId)
           }
         }

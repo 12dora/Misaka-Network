@@ -1,23 +1,21 @@
 import { WebSocketServer, WebSocket } from 'ws'
 import { IncomingMessage } from 'http'
 import { z } from 'zod'
-import { nodes, channels, updatePeakConcurrent } from './store.js'
+import { nodes, channels, clusterChannelId, updatePeakConcurrent } from './store.js'
 import { broadcast } from './activity.js'
 import { authMiddleware } from './http.js'
 import type { NodeSession } from './types.js'
 
-const MAX_CHANNELS_PER_NODE = 3
 const MAX_MESSAGE_SIZE = 64 * 1024
 
 const wsMessageSchema = z.discriminatedUnion('t', [
-  z.object({ t: z.literal('AUTH'),          token:        z.string() }),
-  z.object({ t: z.literal('JOIN_CHANNEL'),  channelId:    z.string().min(1).max(64) }),
+  z.object({ t: z.literal('AUTH'),         token:           z.string() }),
+  z.object({ t: z.literal('JOIN_CLUSTER') }),
   z.object({ t: z.literal('LEAVE_CHANNEL') }),
-  z.object({ t: z.literal('CONNECT_REQ'),  targetNodeId: z.number().int().min(1).max(20001) }),
-  z.object({ t: z.literal('SIGNAL_SDP'),   targetNodeId: z.number().int().min(1).max(20001), sdp: z.object({}).passthrough() }),
-  z.object({ t: z.literal('SIGNAL_ICE'),   targetNodeId: z.number().int().min(1).max(20001), candidate: z.object({}).passthrough() }),
+  z.object({ t: z.literal('SIGNAL_SDP'),   targetSessionId: z.string().min(1).max(64), sdp:       z.object({}).passthrough() }),
+  z.object({ t: z.literal('SIGNAL_ICE'),   targetSessionId: z.string().min(1).max(64), candidate: z.object({}).passthrough() }),
   z.object({ t: z.literal('PING') }),
-  z.object({ t: z.literal('BLOCK'),         nodeId:       z.number().int().min(1).max(20001) }),
+  z.object({ t: z.literal('BLOCK'),        sessionId:       z.string().min(1).max(64) }),
 ])
 
 function send(ws: WebSocket, msg: object) {
@@ -26,8 +24,8 @@ function send(ws: WebSocket, msg: object) {
   }
 }
 
-function forwardToNode(targetNodeId: number, msg: object) {
-  const target = nodes.get(targetNodeId)
+function forwardToSession(targetSessionId: string, msg: object) {
+  const target = nodes.get(targetSessionId)
   if (target?.socket) send(target.socket, msg)
 }
 
@@ -37,37 +35,25 @@ function getWSIP(req: IncomingMessage): string {
   return req.socket.remoteAddress ?? 'unknown'
 }
 
-function countChannelsForNode(nodeId: number): number {
-  let count = 0
-  for (const ch of channels.values()) {
-    if (ch.has(nodeId)) count++
-  }
-  return count
-}
-
 export function setupWS(wss: WebSocketServer) {
   wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
     let session: NodeSession | null = null
 
     ws.on('message', (raw) => {
-      // Enforce max message size
       const rawStr = raw.toString()
       if (Buffer.byteLength(rawStr) > MAX_MESSAGE_SIZE) {
         send(ws, { t: 'ERROR', code: 'MESSAGE_TOO_LARGE', message: '消息过大' })
         return
       }
 
-      // Validate with zod
       let msg: z.infer<typeof wsMessageSchema>
       try {
         const parsed = JSON.parse(rawStr)
         msg = wsMessageSchema.parse(parsed)
       } catch {
-        // Silently drop invalid messages
         return
       }
 
-      // First message must be AUTH
       if (!session) {
         if (msg.t !== 'AUTH') {
           ws.close(4001, 'AUTH_REQUIRED')
@@ -85,6 +71,7 @@ export function setupWS(wss: WebSocketServer) {
 
         send(ws, {
           t: 'WELCOME',
+          sessionId: session.sessionId,
           myNodeId: session.nodeId,
           sessionExpiresAt: Date.now() + 30 * 60 * 1000,
         })
@@ -101,20 +88,23 @@ export function setupWS(wss: WebSocketServer) {
       session.socket = null
       session.lastSeen = Date.now()
 
-      // Notify channel peers
+      // Notify channel peers — by sessionId
       if (session.channelId) {
         const ch = channels.get(session.channelId)
         if (ch) {
-          for (const peerId of ch) {
-            if (peerId !== session.nodeId) {
-              forwardToNode(peerId, { t: 'PEER_LEFT', nodeId: session.nodeId })
+          for (const peerSid of ch) {
+            if (peerSid !== session.sessionId) {
+              forwardToSession(peerSid, { t: 'PEER_LEFT', sessionId: session.sessionId, nodeId: session.nodeId })
             }
           }
+          ch.delete(session.sessionId)
+          if (ch.size === 0) channels.delete(session.channelId)
         }
+        session.channelId = null
       }
 
       broadcast({ type: 'leave', nodeId: session.nodeId, message: `御坂 ${session.nodeId} 号通信终止` })
-        updatePeakConcurrent()
+      updatePeakConcurrent()
     })
 
     ws.on('error', () => { /* swallow */ })
@@ -127,31 +117,36 @@ function handleMessage(ws: WebSocket, session: NodeSession, msg: z.infer<typeof 
       send(ws, { t: 'PONG' })
       break
 
-    case 'JOIN_CHANNEL': {
-      // Leave existing channel
+    case 'JOIN_CLUSTER': {
+      // Identity-scoped channel: same nodeId + passcode → same cluster.
+      const channelId = clusterChannelId(session.nodeId, session.passCodeHash)
+      if (session.channelId === channelId) return  // already there
+
       if (session.channelId) leaveChannel(session)
 
-      // Enforce max channels per node
-      if (countChannelsForNode(session.nodeId) >= MAX_CHANNELS_PER_NODE) {
-        send(ws, { t: 'ERROR', code: 'TOO_MANY_CHANNELS', message: '频道数已达上限' })
-        return
+      const ch = channels.get(channelId) ?? new Set<string>()
+      channels.set(channelId, ch)
+
+      // Tell each existing peer about the newcomer (they wait for the offer).
+      // Tell the newcomer about each existing peer with shouldInitiate=true
+      // so the newcomer drives offer creation — no glare.
+      for (const peerSid of ch) {
+        const peer = nodes.get(peerSid)
+        if (!peer) continue
+        forwardToSession(peerSid, {
+          t: 'PEER_JOINED',
+          peer: { sessionId: session.sessionId, nodeId: session.nodeId, joinedAt: session.joinedAt },
+          shouldInitiate: false,
+        })
+        send(ws, {
+          t: 'PEER_JOINED',
+          peer: { sessionId: peer.sessionId, nodeId: peer.nodeId, joinedAt: peer.joinedAt },
+          shouldInitiate: true,
+        })
       }
 
-      const ch = channels.get(msg.channelId) ?? new Set<number>()
-      channels.set(msg.channelId, ch)
-
-      // Notify existing members
-      for (const peerId of ch) {
-        forwardToNode(peerId, { t: 'PEER_JOINED', node: { nodeId: session.nodeId, joinedAt: session.joinedAt } })
-        const peer = nodes.get(peerId)
-        if (peer) {
-          send(ws, { t: 'PEER_JOINED', node: { nodeId: peerId, joinedAt: peer.joinedAt } })
-        }
-      }
-
-      ch.add(session.nodeId)
-      session.channelId = msg.channelId
-      broadcast({ type: 'channel', message: `新实验批次 ${msg.channelId} 建立` })
+      ch.add(session.sessionId)
+      session.channelId = channelId
       break
     }
 
@@ -159,35 +154,31 @@ function handleMessage(ws: WebSocket, session: NodeSession, msg: z.infer<typeof 
       leaveChannel(session)
       break
 
-    case 'CONNECT_REQ': {
-      const target = nodes.get(msg.targetNodeId)
-      if (!target?.socket) {
-        send(ws, { t: 'ERROR', code: 'NODE_OFFLINE', message: '目标节点不在线' })
-        return
-      }
-      if (session.blockedIds.has(msg.targetNodeId)) {
-        send(ws, { t: 'ERROR', code: 'BLOCKED', message: '目标节点已被屏蔽' })
-        return
-      }
-      forwardToNode(msg.targetNodeId, { t: 'CONNECT_REQ_IN', fromNodeId: session.nodeId, requestId: Date.now().toString() })
-      break
-    }
-
     case 'SIGNAL_SDP':
-      if (!assertSameChannel(session, msg.targetNodeId)) {
+      if (!assertSameChannel(session, msg.targetSessionId)) {
         send(ws, { t: 'ERROR', code: 'NOT_IN_CHANNEL', message: '不在同一实验批次' })
         return
       }
-      forwardToNode(msg.targetNodeId, { t: 'SIGNAL_SDP', fromNodeId: session.nodeId, sdp: msg.sdp })
+      forwardToSession(msg.targetSessionId, {
+        t: 'SIGNAL_SDP',
+        fromSessionId: session.sessionId,
+        fromNodeId: session.nodeId,
+        sdp: msg.sdp,
+      })
       break
 
     case 'SIGNAL_ICE':
-      if (!assertSameChannel(session, msg.targetNodeId)) return
-      forwardToNode(msg.targetNodeId, { t: 'SIGNAL_ICE', fromNodeId: session.nodeId, candidate: msg.candidate })
+      if (!assertSameChannel(session, msg.targetSessionId)) return
+      forwardToSession(msg.targetSessionId, {
+        t: 'SIGNAL_ICE',
+        fromSessionId: session.sessionId,
+        fromNodeId: session.nodeId,
+        candidate: msg.candidate,
+      })
       break
 
     case 'BLOCK':
-      session.blockedIds.add(msg.nodeId)
+      session.blockedIds.add(msg.sessionId)
       break
   }
 }
@@ -196,17 +187,17 @@ function leaveChannel(session: NodeSession) {
   if (!session.channelId) return
   const ch = channels.get(session.channelId)
   if (ch) {
-    ch.delete(session.nodeId)
-    for (const peerId of ch) {
-      forwardToNode(peerId, { t: 'PEER_LEFT', nodeId: session.nodeId })
+    ch.delete(session.sessionId)
+    for (const peerSid of ch) {
+      forwardToSession(peerSid, { t: 'PEER_LEFT', sessionId: session.sessionId, nodeId: session.nodeId })
     }
     if (ch.size === 0) channels.delete(session.channelId)
   }
   session.channelId = null
 }
 
-function assertSameChannel(session: NodeSession, targetNodeId: number): boolean {
+function assertSameChannel(session: NodeSession, targetSessionId: string): boolean {
   if (!session.channelId) return false
-  const target = nodes.get(targetNodeId)
+  const target = nodes.get(targetSessionId)
   return target?.channelId === session.channelId
 }
