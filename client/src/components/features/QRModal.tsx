@@ -22,7 +22,8 @@ function buildURL(
   fileSessionId?: string,
   channelId?: string,
 ) {
-  const base = `${location.origin}/join`
+  const appBase = import.meta.env.BASE_URL.replace(/\/$/, '')
+  const base = `${location.origin}${appBase}/join`
   const params = new URLSearchParams({ type, id: String(nodeId), t: qrToken })
   if (type === 'file' && fileSessionId) params.set('fid', fileSessionId)
   if (type === 'channel' && channelId) params.set('cid', channelId)

@@ -90,7 +90,7 @@
 
 ## 当前会话焦点
 
-v3.5 彩蛋与沉浸、v3.7 性能已编码：关键编号提示、ActivityStream 语录、可关闭音效、ACGN 时间线、路由 lazy chunks、manualChunks、文件 hash worker。剩余：Lighthouse 90+ 需浏览器实测。
+QR 接入体验修复：复制含通行码链接到另一浏览器可自动注册并进入网络；不含通行码链接会弹窗要求输入；首页 QuickJoin 区块已移除，QR 接入合并到首页登录卡。
 
 接收文件改为手动下载：文件接收完成后不再自动触发浏览器下载，而是在聊天框插入文件卡片（显示文件名 + 大小 + "↓ 下载"按钮），点击后才开始下载，下载后按钮变为"✓ 已下载"。
 
@@ -102,6 +102,7 @@ v3.5 彩蛋与沉浸、v3.7 性能已编码：关键编号提示、ActivityStrea
 - File System Access API 仅在 Chromium 系浏览器可用，Safari/Firefox 使用 OPFS 磁盘缓存替代（相同效果）
 - OPFS 写入可能因磁盘配额不足失败 → 自动降级 IndexedDB + Blob 内存组装
 - Lighthouse 90+ 尚未在真实浏览器环境跑分，仅完成代码侧优化与生产构建验证
+- QR token 单次使用：同一复制链接完成一次接入后再次打开会提示过期 / 已使用，需要重新生成 QR
 
 ## 决策记录（精简）
 
@@ -134,3 +135,4 @@ v3.5 彩蛋与沉浸、v3.7 性能已编码：关键编号提示、ActivityStrea
 - 接收文件手动下载：deliverCompletedFile 不再调用 triggerDownload，改为在 chatMessages 插入 type='file' 的消息（含 fileName/fileSize/downloadUrl 字段）；ChannelChat 对 type='file' 消息渲染文件卡片 + "↓ 下载"按钮；点击后触发下载并 revokeObjectURL，按钮变为"✓ 已下载"
 - v3 沉浸：特殊节点 9982 / 10032 / 20001 在登录卡展示 lore hint；ActivityStream 每 45s 注入一条妹妹语录；设置面板增加音效开关，扫码 / 完成 / 错误音效由 WebAudio 合成且默认开启
 - v3 性能：路由改 React.lazy + Suspense；Vite manualChunks 拆出 react / qr / hash；整文件 SHA-256 优先交给 module worker，失败时降级主线程分块 hash
+- QR join：`/join` 以链接 `id` 覆盖本机 nodeId，`c` 存在时 base64 解码为通行码并自动注册；`c` 缺失或错误时停在通行码输入卡片，不再要求先返回首页注册

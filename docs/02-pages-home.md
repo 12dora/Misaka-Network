@@ -8,7 +8,6 @@
 FIRSTFOLD  钴蓝海报 = 左立绘 + 右上胶囊导航 + 右中字标 + 右下登录卡片
 SECOND     网络运行情报（StatsDashboard 6 卡）
 THIRD      实时活动流（ActivityStream 横向滚动）
-FOURTH     未登录时的 QuickJoin 三卡
 FOOTER     致敬声明（复用 ACGN 页脚简版）
 ```
 
@@ -55,6 +54,7 @@ FOOTER     致敬声明（复用 ACGN 页脚简版）
 - 节点编号：`御坂 [10032] 号` + 重新生成 ↻
 - 通行码：6 位独立 input，自动跳格、支持粘贴
 - 主按钮「接入网络」：`--bg-deep` 实底白字，48px 高，圆角 12px
+- QR 接入：登录卡内嵌入口，打开扫码 / 粘贴链接 Modal
 - 副文「ⓘ 30 分钟无活动自动释放」
 
 **已登录态**字段：
@@ -103,16 +103,7 @@ Section Header 模式（全站复用）：
 
 实现：WebSocket 订阅 `ACTIVITY` 事件。
 
-## 4. QuickJoin（未登录时）
-
-三张大白卡横排（移动垂直）：
-- 📷 扫码接入 / カメラから接続 → 调起 BarcodeDetector
-- ⌨ 输入通行码 / パスコード入力 → 弹 Modal
-- 📖 了解御坂网络 / みさか について → 跳 `/acgn`
-
-每卡：56px 大图标（线条风深海军蓝）+ 中文标题 + 假名副标 + 底部深海军蓝胶囊按钮。
-
-## 5. Footer
+## 4. Footer
 
 ACGN 页脚简版，`--bg-deep` 背景白字。
 

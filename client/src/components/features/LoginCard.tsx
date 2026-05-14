@@ -5,6 +5,7 @@ import MisakaCard from '@/components/ui/MisakaCard'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
 import QRModal from '@/components/features/QRModal'
+import ScanModal from '@/components/features/ScanModal'
 import { SPECIAL_NODE_HINTS } from '@/data/lore'
 
 export default function LoginCard() {
@@ -23,6 +24,7 @@ export default function LoginCard() {
 
   const passInputs = useRef<(HTMLInputElement | null)[]>([])
   const [showQR, setShowQR] = useState(false)
+  const [showScan, setShowScan] = useState(false)
 
   function handleNodeIdChange(val: string) {
     const n = parseInt(val, 10)
@@ -156,6 +158,7 @@ export default function LoginCard() {
 
   return (
     <>
+    {showScan && <ScanModal onClose={() => setShowScan(false)} />}
     {ipFullPrompt && (
       <div
         className="fixed inset-0 z-[110] flex items-center justify-center p-4"
@@ -294,6 +297,32 @@ export default function LoginCard() {
       >
         {isLoading ? '正在接入...' : '接入网络 / CONNECT'}
       </MisakaButton>
+
+      <div
+        className="mt-3 rounded-xl p-3"
+        style={{ background: 'var(--surface-tint)', border: '1px solid var(--border-card)' }}
+      >
+        <button
+          type="button"
+          onClick={() => setShowScan(true)}
+          className="w-full flex items-center gap-3 text-left cursor-pointer"
+          style={{ border: 'none', background: 'transparent', color: 'var(--text-on-white)' }}
+        >
+          <span
+            className="grid place-items-center w-10 h-10 rounded-lg shrink-0 font-kanji font-bold"
+            style={{ background: 'var(--bg-deep)', color: '#fff' }}
+          >
+            読
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block font-kanji text-sm font-semibold">QR 接入</span>
+            <span className="block font-kanji text-[11px] text-[var(--text-on-white-2)] leading-relaxed">
+              扫描或粘贴对方节点链接，自动填入身份并接入
+            </span>
+          </span>
+          <span className="font-mono text-[var(--accent-cyan)]">→</span>
+        </button>
+      </div>
 
       <p className="text-[10px] text-[var(--text-on-white-2)] text-center mt-3 font-kanji">
         ⓘ 30 分钟无活动会话自动释放
