@@ -30,6 +30,7 @@ import { notifyIncomingFile } from '@/lib/notify'
 // may share a nodeId; sessionId is the unique key.
 const peerConnections = new Map<string, RTCPeerConnection>()
 const dataChannels = new Map<string, RTCDataChannel>()
+const configuredDataChannels = new WeakSet<RTCDataChannel>()
 const pendingIceCandidates = new Map<string, RTCIceCandidateInit[]>()
 const ecdhResolvers: Map<string, () => void> = new Map()
 const iceRestarting = new Set<string>()
@@ -557,6 +558,11 @@ async function handleRemoteICE(fromSessionId: string, candidate: RTCIceCandidate
 }
 
 function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
+  // Idempotency guard: in reconnect races the same channel instance may flow
+  // through setup twice; avoid duplicate listeners / duplicate side effects.
+  if (configuredDataChannels.has(dc)) return
+  configuredDataChannels.add(dc)
+
   let lastChunkHeader: ChunkHeader | null = null
 
   // Without this, incoming chunk bodies arrive as Blob and the
