@@ -2,6 +2,7 @@ import { useState } from 'react'
 import MisakaCard from '@/components/ui/MisakaCard'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
+import AppFooter from '@/components/ui/AppFooter'
 import { QUOTES, CHARACTERS, LORE_LOG, LORE_TIMELINE, getCharacterByNodeId } from '@/data/lore'
 
 const HERO_CHARACTER = import.meta.env.BASE_URL + 'assets/misaka.webp'
@@ -323,23 +324,7 @@ export default function ACGN() {
       <TimelineSection />
 
       {/* ── Footer ───────────────────────────────────────────────── */}
-      <footer
-        id="credits"
-        className="px-6 py-14 text-center"
-        style={{ background: 'var(--bg-deep)' }}
-      >
-        <div className="font-jp text-sm text-[var(--text-on-blue-2)] leading-loose">
-          <p className="text-white text-base font-kanji font-semibold mb-3">© Master Huang · Misaka Network</p>
-          <a
-            className="nav-pill text-xs py-1.5 px-4 no-underline"
-            href="https://github.com/12dora/Misaka-Network"
-            target="_blank"
-            rel="noreferrer"
-          >
-            GitHub
-          </a>
-        </div>
-      </footer>
+      <AppFooter id="credits" />
     </div>
   )
 }

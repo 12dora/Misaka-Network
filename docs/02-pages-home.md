@@ -105,7 +105,7 @@ Section Header 模式（全站复用）：
 
 ## 4. Footer
 
-仅保留 App 作者版权与 GitHub 链接。
+首页页脚统一复用 `AppFooter` 组件（与 ACGN 共用），仅保留 App 作者版权与 GitHub 链接，纵向留白为紧凑模式。
 
 ## 状态管理（Zustand）
 
