@@ -140,6 +140,28 @@ turns:turn.example.com:5349?transport=tcp
 
 密码：`change-this-password`
 
+### coturn Docker 模板
+
+仓库根目录 `deploy/` 已包含：
+
+- `docker-compose.turn.yml`
+- `turnserver.conf.example`
+
+启动步骤：
+
+```bash
+cd deploy
+cp turnserver.conf.example turnserver.conf
+# 修改 external-ip / realm / user
+docker compose -f docker-compose.turn.yml up -d
+```
+
+注意放行端口：
+
+- `3478/tcp+udp`
+- `5349/tcp`
+- `49160-49200/udp`（与模板 `min-port/max-port` 对应）
+
 ## 关键约束
 
 - 所有业务数据在内存中，服务重启即清空
