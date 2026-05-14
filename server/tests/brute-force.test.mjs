@@ -6,7 +6,7 @@
  * 1. 3 次错误通行码 → 锁定 5 分钟
  * 2. 锁定期间正确通行码也拒绝
  * 3. 注册 API 速率限制
- * 4. 单 IP 最多 5 个节点
+ * 4. 单 IP 最多 10 个节点
  *
  * Usage: cd server && node tests/brute-force.test.mjs
  */
@@ -61,32 +61,18 @@ async function testBruteForceLock() {
   assert(reg.token, '注册应返回 token')
   console.log('   ✓ 注册成功')
 
-  // Attempt 1: wrong passcode
-  const a1 = await post('/verify-passcode', {
-    targetNodeId: nodeId,
-    passCode: wrongCode1,
-    sourceToken: reg.token,
-  })
-  assertEq(a1.error, 'WRONG_PASSCODE', '第 1 次错误')
-  assertEq(a1.attemptsLeft, 2, '剩余 2 次')
-  console.log('   ✓ 第 1 次错误 → WRONG_PASSCODE (attemptsLeft=2)')
+  // The identity-scoped model removed /verify-passcode. Wrong passcode
+  // attempts now happen when another device tries to register an occupied
+  // nodeId with a different passcode.
+  const a1 = await post('/register', { nodeId, passCode: wrongCode1 })
+  assertEq(a1.error, 'NODE_OCCUPIED', '第 1 次错误')
+  console.log('   ✓ 第 1 次错误 → NODE_OCCUPIED')
 
-  // Attempt 2: wrong passcode
-  const a2 = await post('/verify-passcode', {
-    targetNodeId: nodeId,
-    passCode: wrongCode2,
-    sourceToken: reg.token,
-  })
-  assertEq(a2.error, 'WRONG_PASSCODE', '第 2 次错误')
-  assertEq(a2.attemptsLeft, 1, '剩余 1 次')
-  console.log('   ✓ 第 2 次错误 → WRONG_PASSCODE (attemptsLeft=1)')
+  const a2 = await post('/register', { nodeId, passCode: wrongCode2 })
+  assertEq(a2.error, 'NODE_OCCUPIED', '第 2 次错误')
+  console.log('   ✓ 第 2 次错误 → NODE_OCCUPIED')
 
-  // Attempt 3: wrong passcode → should lock
-  const a3 = await post('/verify-passcode', {
-    targetNodeId: nodeId,
-    passCode: '333333',
-    sourceToken: reg.token,
-  })
+  const a3 = await post('/register', { nodeId, passCode: '333333' })
   assertEq(a3.error, 'NODE_LOCKED', '第 3 次错误应锁定')
   assert(a3.unlockAt > Date.now(), 'unlockAt 应在未来')
   const lockDuration = a3.unlockAt - Date.now()
@@ -122,17 +108,17 @@ async function testRateLimit() {
 async function testIpNodeLimit() {
   console.log('[3/6] 单 IP 节点数限制测试...')
 
-  // Register nodes from same IP until limit (test 1 already registered 1 node, so 4 more = 5 total)
+  // Register nodes from same IP until limit (test 1 already registered 1 node, so 9 more = 10 total)
   const baseId = 12000
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 9; i++) {
     const res = await post('/register', { nodeId: baseId + i, passCode: '123456' })
     assert(res.token, `节点 ${baseId + i} 应注册成功`)
   }
 
-  // 5th additional node (6th total from this IP) should be rejected
-  const overflow = await post('/register', { nodeId: baseId + 4, passCode: '123456' })
+  // 10th additional node (11th total from this IP) should be rejected
+  const overflow = await post('/register', { nodeId: baseId + 9, passCode: '123456' })
   assertEq(overflow.error, 'IP_LIMITED', '超过 IP 限制的节点应被拒')
-  console.log('   ✓ 第 6 个同 IP 节点 → IP_LIMITED')
+  console.log('   ✓ 第 11 个同 IP 节点 → IP_LIMITED')
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
