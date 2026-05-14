@@ -32,6 +32,11 @@ function formatSpeed(bps: number) {
   return `${(bps / 1e6).toFixed(1)} MB/s`
 }
 
+function formatIceMeasuredAt(ts?: number) {
+  if (!ts) return '未记录'
+  return new Date(ts).toLocaleString('zh-CN', { hour12: false })
+}
+
 // ── NodeRadar ─────────────────────────────────────────────────────
 function NodeRadar({ peers, selected, unreadByPeer, onSelect, onShowQR, onCopyLink }: {
   peers: Peer[]
@@ -46,7 +51,7 @@ function NodeRadar({ peers, selected, unreadByPeer, onSelect, onShowQR, onCopyLi
       <div className="flex items-center gap-2 mb-1">
         <MisakaKanjiBlock char="点" size="sm" />
         <span className="font-kanji font-bold text-white text-sm">节点雷达</span>
-        <span className="font-jp text-xs text-[var(--text-on-blue-2)] ml-1">ノードレーダー</span>
+        <span className="font-kanji text-xs text-[var(--text-on-blue-2)] ml-1">发现同身份设备</span>
       </div>
       <div className="w-12 h-0.5 ml-[calc(1.25rem+0.5rem)]" style={{ background: 'var(--accent-cyan)' }} />
 
@@ -54,7 +59,7 @@ function NodeRadar({ peers, selected, unreadByPeer, onSelect, onShowQR, onCopyLi
         <MisakaCard padding="md" className="text-center">
           <MisakaKanjiBlock char="空" size="lg" className="mx-auto mb-3" />
           <p className="font-kanji text-sm text-[var(--text-on-white)] mb-1">网络中暂无其他实验体</p>
-          <p className="font-jp text-xs text-[var(--text-on-white-2)] mb-4">他にネットワーク参加者なし</p>
+          <p className="font-kanji text-xs text-[var(--text-on-white-2)] mb-4">分享 QR 或链接给另一台设备即可接入</p>
           <div className="flex gap-2">
             <MisakaButton variant="pill" size="sm" fullWidth onClick={onShowQR}>显示我的 QR</MisakaButton>
             <MisakaButton variant="pill" size="sm" fullWidth onClick={onCopyLink}>复制链接</MisakaButton>
@@ -296,6 +301,22 @@ function TransferChannel({ selectedPeer, onStageFile, onSendFileToAll }: {
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
+  async function handleCopyIceDiagnostics() {
+    if (!selectedPeer) return
+    const lines = [
+      `节点: 御坂 ${selectedPeer.nodeId} 号 (#${selectedPeer.sessionId.slice(-4)})`,
+      `信道: ${channelLabel(selectedPeer.channelType)}`,
+      `ICE路径: ${selectedPeer.icePath ?? '未采集'}`,
+      `采集时间: ${formatIceMeasuredAt(selectedPeer.icePathMeasuredAt)}`,
+      `状态: ${selectedPeer.status}`,
+    ]
+    try {
+      await navigator.clipboard.writeText(lines.join('\n'))
+    } catch {
+      // ignore
+    }
+  }
+
   // ── No peer selected ────────────────────────────────────────
   if (!selectedPeer) {
     return (
@@ -311,7 +332,7 @@ function TransferChannel({ selectedPeer, onStageFile, onSendFileToAll }: {
       >
         <MisakaKanjiBlock char="同" size="xl" className="mb-4" />
         <p className="font-kanji font-bold text-lg text-[var(--text-on-white)] mb-1">从左侧选择目标节点</p>
-        <p className="font-jp text-sm text-[var(--text-on-white-2)] mb-3">対象ノードを選択</p>
+        <p className="font-kanji text-sm text-[var(--text-on-white-2)] mb-3">选择节点后即可发送文件或消息</p>
       </MisakaCard>
     )
   }
@@ -330,6 +351,21 @@ function TransferChannel({ selectedPeer, onStageFile, onSendFileToAll }: {
         <div className="font-kanji text-xs text-[var(--text-on-white-2)] mt-0.5">
           {channelLabel(selectedPeer.channelType)} · DTLS + AES-GCM
         </div>
+        {selectedPeer.icePath && (
+          <>
+            <div className="font-mono text-[10px] text-[var(--text-muted)] mt-1">
+              ICE 路径：{selectedPeer.icePath}
+            </div>
+            <div className="font-mono text-[10px] text-[var(--text-muted)] mt-0.5">
+              采集时间：{formatIceMeasuredAt(selectedPeer.icePathMeasuredAt)}
+            </div>
+            <div className="mt-1.5">
+              <MisakaButton variant="pill" size="sm" className="text-[10px] py-0.5 px-2" onClick={handleCopyIceDiagnostics}>
+                复制诊断
+              </MisakaButton>
+            </div>
+          </>
+        )}
         {selectedPeer.status === 'reconnecting' && (
           <div className="flex items-center gap-1.5 mt-2 px-2 py-1 rounded text-[10px]" style={{ background: 'rgba(255,193,7,0.12)', color: 'var(--state-warn)' }}>
             <MisakaStatusBadge status="reconnecting" />
@@ -389,7 +425,7 @@ function TaskPanel({ transfers, onPause, onResume, onCancel }: {
       <div className="flex items-center gap-2 mb-1">
         <MisakaKanjiBlock char="流" size="sm" />
         <span className="font-kanji font-bold text-white text-sm">传输面板</span>
-        <span className="font-jp text-xs text-[var(--text-on-blue-2)] ml-1">タスクパネル</span>
+        <span className="font-kanji text-xs text-[var(--text-on-blue-2)] ml-1">当前文件任务</span>
       </div>
       <div className="w-12 h-0.5 ml-[calc(1.25rem+0.5rem)]" style={{ background: 'var(--accent-cyan)' }} />
 
