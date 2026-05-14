@@ -57,8 +57,8 @@ export default function ReceiveConfirmModal({ transfer, onAccept, onReject, onBl
             <div className="font-kanji font-bold text-lg text-[var(--text-on-white)]">
               检测到数据包传入
             </div>
-            <div className="font-jp text-xs text-[var(--text-on-white-2)] mt-0.5">
-              データ着信検知
+            <div className="font-kanji text-xs text-[var(--text-on-white-2)] mt-0.5">
+              请确认是否接收此文件
             </div>
           </div>
         </div>

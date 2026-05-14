@@ -109,8 +109,8 @@ export default function LoginCard() {
         <div className="font-kanji font-bold text-2xl text-[var(--text-on-white)] mb-0.5">
           御坂 {identity.nodeId} 号
         </div>
-        <div className="font-jp text-xs text-[var(--text-on-white-2)] mb-5">
-          みさか {identity.nodeId} ごう
+        <div className="font-kanji text-xs text-[var(--text-on-white-2)] mb-5">
+          当前节点身份
         </div>
         {specialHint && (
           <div
@@ -169,7 +169,7 @@ export default function LoginCard() {
             <MisakaKanjiBlock char="満" size="md" />
             <span className="font-kanji font-bold text-lg text-[var(--text-on-white)]">本机节点已满</span>
           </div>
-          <p className="font-jp text-xs text-[var(--text-on-white-2)] mb-3">IP 上限に到達</p>
+          <p className="font-kanji text-xs text-[var(--text-on-white-2)] mb-3">当前 IP 已达到节点上限</p>
           <p className="font-kanji text-sm text-[var(--text-on-white)] mb-5">
             本机 IP 同时最多允许 10 个节点。是否销毁本机所有已注册节点后重新接入？
           </p>
@@ -192,8 +192,8 @@ export default function LoginCard() {
           接入御坂网络
         </span>
       </div>
-      <p className="font-jp text-xs text-[var(--text-on-white-2)] mb-6">
-        みさかネットワークへ
+      <p className="font-kanji text-xs text-[var(--text-on-white-2)] mb-6">
+        输入节点编号和通行码后即可接入
       </p>
 
       {/* Node ID */}
@@ -295,7 +295,7 @@ export default function LoginCard() {
         onClick={handleConnect}
         disabled={isLoading || !passComplete}
       >
-        {isLoading ? '正在接入...' : '接入网络 / CONNECT'}
+        {isLoading ? '正在接入...' : '接入网络'}
       </MisakaButton>
 
       <div
