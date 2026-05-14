@@ -1,0 +1,18 @@
+{
+  # Replace with your email for ACME registration/expiry notices.
+  email admin@example.com
+}
+
+# HTTPS + WSS reverse proxy for Misaka signaling
+signal.example.com {
+  encode zstd gzip
+
+  @ws {
+    path /ws*
+    header Connection *Upgrade*
+    header Upgrade websocket
+  }
+
+  reverse_proxy @ws signaling:8080
+  reverse_proxy signaling:8080
+}

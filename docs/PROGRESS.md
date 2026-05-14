@@ -37,7 +37,7 @@
 - ☑ 1GB 文件内存压测（server/tests/stress-1gb.test.mjs）— sender +1.6MB / streaming +0MB / Blob 组装峰值 1.7GB
 
 ### 2.4 信令服务器加固
-- ◐ 自托管部署（HTTPS + WSS 反代方案已补；实际服务器部署未做）
+- ◐ 自托管部署（已补 Caddy + docker-compose 生产模板与 /api/health；实际服务器部署未做）
 - ☑ /api/metrics（real CPU + peak concurrent + uptime）
 - ☑ 异常退出通知对端（SERVER_SHUTDOWN + WS 1001 关闭码）
 - ☑ 通行码暴力穷举集成测试（server/tests/brute-force.test.mjs）
@@ -86,6 +86,7 @@
 ## 已知问题
 
 - TURN 中继未实际部署测试（coturn 部署方案已写入 README / server README）
+- 自托管模板已提供但未实机上线验证（域名证书签发、80/443 入站、防火墙策略待实操）
 - ICE 路径实测仍缺实网三场景结果（当前仅完成前端观测能力：Network 信息栏展示 selected candidate pair 路径）
 - Service Worker 当前仅做 app shell + 静态资源离线缓存；`/api` 与 `/ws` 不缓存（实时信令与会话语义保持在线优先）
 - PWA 图标当前使用 `favicon.svg` 作为 manifest icon（`purpose: any maskable`）；后续如需商店级上架可再补 192/512 位图资源
@@ -136,6 +137,7 @@
 - PWA 安装链路：新增 `manifest.webmanifest` 并在 `index.html` 挂载；TopNav 监听 `beforeinstallprompt/appinstalled`，在可安装时显示「安装应用」入口
 - Background Sync 评估结论：暂不接入。当前核心是实时信令 + DataChannel 直连，离线队列重放易引入会话时序歧义；保留为后续“非实时任务”能力再评估
 - Lighthouse 达标实测：使用 `vite preview` + Lighthouse desktop preset 对首页跑分；首屏提速主要来自两点——`index.html` 字体请求收敛（移除非首屏 serif 字体）与 Home 首图 `fetchPriority=\"high\" + eager`，最终首页 Performance 99（LCP 0.8s / FCP 0.4s）
+- 自托管部署模板化：新增 `deploy/docker-compose.prod.yml` 与 `deploy/Caddyfile.example`，支持 HTTPS/WSS 反代 + 自动证书；服务端新增 `/api/health` 作为容器健康检查与上线验活入口
 - QR join：`/join` 以链接 `id` 覆盖本机 nodeId，`c` 存在时 base64 解码为通行码并自动注册；`c` 缺失或错误时停在通行码输入卡片，不再要求先返回首页注册
 - 接收卡片去重：`deliverCompletedFile` 以 `transferId` 去重，防止同一传输在并发回调下重复插入 file 消息
 - 未读与通知：`unreadByPeer` 记录每节点消息/文件未读数；收到文件时若页面在后台且通知权限已授权，触发系统 Notification
