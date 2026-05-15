@@ -1,4 +1,4 @@
-import { getTurnIceServers, loadTurnSettings } from './turn'
+import { getTurnIceServers, getAutoTurnIceServers, loadTurnSettings } from './turn'
 import { DEFAULT_STUN, ICE_CANDIDATE_POOL_SIZE } from '@/constants'
 
 // ICE candidate pair → channel type
@@ -68,8 +68,11 @@ export async function getSelectedIcePath(pc: RTCPeerConnection): Promise<Selecte
 
 export function createPeerConnection(): RTCPeerConnection {
   const turnSettings = loadTurnSettings()
+  // Order: STUN → server-issued auto TURN (Cloudflare short-lived) → manual user TURN.
+  // Manual user TURN is preserved even when auto TURN is unavailable.
   const iceServers: RTCIceServer[] = [
     ...DEFAULT_STUN,
+    ...getAutoTurnIceServers(),
     ...getTurnIceServers(),
   ]
 

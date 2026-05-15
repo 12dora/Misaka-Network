@@ -6,6 +6,8 @@ import { router } from './http.js'
 import { setupWS } from './ws.js'
 import { setWSS } from './activity.js'
 import { startCleanupTask } from './cleanup.js'
+import { loadTurnState, startPersistFlusher, stopPersistFlusher, flushTurnState } from './persist.js'
+import { startTurnPollers, stopTurnPollers } from './turn.js'
 import { PORT, SHUTDOWN_TIMEOUT_MS } from './config.js'
 
 const app = express()
@@ -26,6 +28,16 @@ const wss = new WebSocketServer({ server: httpServer, path: '/ws' })
 setWSS(wss)
 setupWS(wss)
 startCleanupTask()
+
+// TURN auto-provisioning: persist + pollers. Loaded async at boot so the HTTP
+// server still binds even if the filesystem is slow. Pollers self-start only
+// when Cloudflare credentials are configured (see turn.turnConfigured()).
+loadTurnState().then(() => {
+  startPersistFlusher()
+  startTurnPollers()
+}).catch(err => {
+  console.error('[boot] TURN init failed; running without auto TURN:', err.message)
+})
 
 httpServer.listen(PORT, () => {
   console.log(`御坂信令服务器 listening on :${PORT}`)
@@ -48,7 +60,12 @@ function gracefulShutdown(signal: string) {
     client.close(1001, 'SERVER_SHUTDOWN')
   }
 
-  // 3. Stop accepting new connections, then exit
+  // 3. Stop TURN pollers and flush persisted state synchronously.
+  stopTurnPollers()
+  stopPersistFlusher()
+  flushTurnState(true).catch(err => console.error('[shutdown] flush error:', err.message))
+
+  // 4. Stop accepting new connections, then exit
   httpServer.close(() => {
     console.log('信令服务器已安全关闭')
     process.exit(0)

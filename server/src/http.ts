@@ -5,6 +5,7 @@ import { z } from 'zod'
 import { nodes, channels, qrTokens, reports, stats, getOnlineCount, getLongestUptimeMs, countNodesByIp, getCpuUsagePercent, findSessionByToken } from './store.js'
 import { broadcast } from './activity.js'
 import { checkRateLimit } from './ratelimit.js'
+import { issueCredentials, getTurnStatus } from './turn.js'
 import type { NodeSession, QrTokenRecord, ReportRecord } from './types.js'
 import {
   MAX_NODES, MAX_NODES_PER_IP, NODE_ID_MIN, NODE_ID_MAX,
@@ -166,6 +167,43 @@ router.get('/stats', (_req, res) => {
     uptimeSeconds:    Math.floor((Date.now() - stats.startedAt) / 1000),
     cpuLoadPercent:   getCpuUsagePercent(),
   })
+})
+
+// GET /api/turn-credentials
+// Auth: Bearer <session token>. Returns short-lived TURN credentials issued
+// by Cloudflare and tagged with customIdentifier=`misaka-${sessionId}`.
+// All enforcement (deny list / per-IP rate / global kill switch) lives in
+// turn.issueCredentials — clients are pure consumers.
+router.get('/turn-credentials', async (req, res) => {
+  const authHeader = req.headers.authorization
+  if (!authHeader?.startsWith('Bearer ')) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
+  const token = authHeader.slice(7)
+  const session = findSessionByToken(token)
+  if (!session) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
+
+  const result = await issueCredentials(session.sessionId, session.ip)
+  if (!result.ok) {
+    // Map abuse reasons to HTTP status; client should fall back to no auto TURN.
+    const status = result.reason === 'DISABLED' || result.reason === 'NOT_CONFIGURED' ? 503
+      : result.reason === 'GLOBAL_QUOTA_EXCEEDED' ? 503
+      : result.reason === 'SESSION_BANNED' || result.reason === 'IP_BANNED' ? 403
+      : result.reason === 'IP_RATE_LIMITED' || result.reason === 'IP_BYTES_LIMITED' ? 429
+      : 502
+    res.status(status).json({ enabled: false, reason: result.reason })
+    return
+  }
+
+  res.json({
+    enabled: true,
+    iceServers: result.iceServers,
+    expiresAt: result.expiresAt,
+    // customIdentifier is intentionally not returned — it embeds sessionId.
+  })
+})
+
+// GET /api/turn-status (no secrets, safe to expose)
+router.get('/turn-status', (_req, res) => {
+  res.json(getTurnStatus())
 })
 
 // GET /api/health

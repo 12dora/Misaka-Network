@@ -16,7 +16,8 @@
 - 文件本体端到端直传（WebRTC DataChannel）
 - 服务器仅负责信令，不存储文件
 - 支持断线重连与断点续传
-- 支持 TURN 自配置与强制 relay 测试
+- 信令服务器自动下发 Cloudflare TURN 短时效凭证（含防滥用 + 1T 月度熔断）；保留用户手工 TURN
+- 支持强制 relay 测试
 
 当前状态：
 
@@ -115,7 +116,60 @@ docker compose -f docker-compose.prod.yml up -d --build
 curl -s https://signal.example.com/api/health
 ```
 
-### C. TURN 中继（coturn）
+### C. TURN 中继（推荐：Cloudflare 自动下发）
+
+信令服务器可自动按 session 申请 Cloudflare Realtime TURN 短时效凭证下发给客户端，**所有防滥用、配额、熔断都在服务端 enforce**，客户端为纯消费方。
+
+1. **拿凭证**：Cloudflare Dashboard → Realtime → TURN，建一个 TURN Key，记下：
+   - Key ID
+   - API Token（权限至少 `TURN:Edit` + `Account Analytics:Read`）
+   - Account Tag（侧栏 Account ID）
+
+2. **配置 `.env`**（仓库已 gitignore，参考 `.env.example`）：
+
+   ```env
+   TURN_CF_KEY_ID=...
+   TURN_CF_API_TOKEN=...
+   TURN_CF_ACCOUNT_TAG=...
+   ```
+
+3. **运行**（`docker-compose.yml` 已内置全部可调阈值）：
+
+   ```bash
+   docker compose up -d --build
+   ```
+
+   验证：
+
+   ```bash
+   curl -s http://localhost:9080/api/turn-status | jq
+   ```
+
+#### 防滥用策略（全部 env 可配，默认值在 docker-compose.yml）
+
+| 变量 | 默认 | 含义 |
+|---|---|---|
+| `TURN_AUTO_ENABLED` | `true` | 总开关 |
+| `TURN_CREDENTIAL_TTL_SEC` | `300` | 凭证有效期（短=即使 revoke 失败也兜底） |
+| `TURN_MAX_BYTES_PER_SESSION` | 1 GB | 单 session 累计字节超额 → revoke + 入 deny list |
+| `TURN_MAX_BYTES_PER_HOUR_PER_IP` | 10 GB | 单 IP 一小时悲观字节上限 |
+| `TURN_MAX_ISSUE_PER_HOUR_PER_IP` | 60 | 单 IP 一小时签发次数 |
+| `TURN_GLOBAL_MONTHLY_BYTES_LIMIT` | 1 TB | CF 免费额度上限（按 UTC 月份重置） |
+| `TURN_GLOBAL_THRESHOLD_PCT` | `90` | 达到全局阈值 % 即熔断停止下发 |
+| `TURN_REVOKE_ALL_ON_KILL` | `false` | 熔断时是否批量 revoke 所有活动凭证 |
+| `TURN_ABUSE_POLL_SEC` | `30` | 按 customIdentifier 查 CF Analytics 周期 |
+| `TURN_GLOBAL_POLL_SEC` | `120` | 全局月度用量查询周期 |
+| `TURN_BAN_DURATION_SEC` | `86400` | deny list 自动解禁时长（0=永久） |
+
+#### 持久化
+
+服务端把 TURN 状态（月度字节、deny list、活动凭证、签发历史）原子写到 `/app/data/turn-state.json`（默认挂 `./data`），重启不丢。其余数据（节点 / 会话 / 上报）维持现有内存策略。
+
+#### 用户手工 TURN
+
+设置 → 中继 tab 顶部展示自动 TURN 状态 + 月度用量进度条；下方手工添加的 TURN 始终生效（与自动下发并存）。
+
+### C2. 备选：自托管 coturn
 
 ```bash
 cd deploy

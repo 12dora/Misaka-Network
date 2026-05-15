@@ -5,9 +5,51 @@ services:
       dockerfile: Dockerfile
     container_name: misaka-signaling
     restart: unless-stopped
+    # Secrets (TURN_CF_KEY_ID / TURN_CF_API_TOKEN / TURN_CF_ACCOUNT_TAG) live
+    # in .env (gitignored). Public knobs live inline in `environment:` so
+    # docker-compose config diffs stay reviewable.
+    env_file:
+      - .env
     environment:
       PORT: 9080
       MAX_NODES: 10000
       RATE_LIMIT_PER_MIN: 60
+
+      # ── TURN auto-provisioning (Cloudflare) ─────────────────────────
+      # Master switch. Set to "false" to disable server-side TURN delivery
+      # entirely; clients then rely only on manual TURN in Settings.
+      TURN_AUTO_ENABLED: "true"
+      TURN_PROVIDER: cloudflare
+
+      # Credential lifetime (seconds). Short on purpose — bounds the abuse
+      # window even if a revoke call fails.
+      TURN_CREDENTIAL_TTL_SEC: 300
+
+      # Per-session / per-IP abuse caps.
+      TURN_MAX_BYTES_PER_SESSION: 1073741824        # 1 GB
+      TURN_MAX_BYTES_PER_HOUR_PER_IP: 10737418240   # 10 GB
+      TURN_MAX_ISSUE_PER_HOUR_PER_IP: 60
+
+      # Global monthly kill switch (defend the free 1 TB Cloudflare quota).
+      TURN_GLOBAL_MONTHLY_BYTES_LIMIT: 1099511627776  # 1 TB
+      TURN_GLOBAL_THRESHOLD_PCT: 90
+      TURN_REVOKE_ALL_ON_KILL: "false"
+
+      # Pessimistic byte estimate per credential — used as a fast path while
+      # Cloudflare Analytics catches up (CF reports lag 1~5 min).
+      TURN_PESSIMISTIC_RATE_BPS: 10000000           # 10 Mbps
+
+      # Polling cadence (seconds).
+      TURN_ABUSE_POLL_SEC: 30
+      TURN_GLOBAL_POLL_SEC: 120
+
+      # Deny-list TTL (seconds). 0 = permanent.
+      TURN_BAN_DURATION_SEC: 86400                  # 24 h
+
+      # Persistence.
+      TURN_PERSIST_DIR: /app/data
+      TURN_PERSIST_INTERVAL_SEC: 10
     ports:
       - "9080:9080"
+    volumes:
+      - ./data:/app/data
