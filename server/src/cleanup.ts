@@ -1,9 +1,6 @@
 import { nodes, channels, qrTokens, reports, getOnlineCount } from './store.js'
 import { cleanupRateLimitWindows } from './ratelimit.js'
-
-const DISCONNECTED_TTL = 10 * 1000    // 10 seconds — cleanup when no active nodes
-const LOCK_DURATION     = 5 * 60 * 1000
-const REPORT_TTL        = 60 * 60 * 1000 // 1 hour
+import { CLEANUP_INTERVAL_MS, DISCONNECTED_TTL_MS, LOCK_DURATION_MS, REPORT_TTL_MS } from './config.js'
 
 let zeroActiveSince: number | null = null
 
@@ -12,12 +9,12 @@ export function startCleanupTask() {
     const now = Date.now()
 
     // --- Session cleanup: when all nodes go offline, remove disconnected
-    //     sessions after a short grace period (10 s).
+    //     sessions after a short grace period.
     const activeCount = getOnlineCount()
     if (activeCount === 0) {
       if (zeroActiveSince === null) {
         zeroActiveSince = now
-      } else if (now - zeroActiveSince >= DISCONNECTED_TTL) {
+      } else if (now - zeroActiveSince >= DISCONNECTED_TTL_MS) {
         for (const [sessionId, session] of nodes) {
           if (session.socket === null) {
             nodes.delete(sessionId)
@@ -58,12 +55,12 @@ export function startCleanupTask() {
 
     // Purge old reports
     for (let i = reports.length - 1; i >= 0; i--) {
-      if (now - reports[i].reportedAt > REPORT_TTL) {
+      if (now - reports[i].reportedAt > REPORT_TTL_MS) {
         reports.splice(i, 1)
       }
     }
 
     // Purge stale rate limit windows
     cleanupRateLimitWindows()
-  }, 2_000)
+  }, CLEANUP_INTERVAL_MS)
 }

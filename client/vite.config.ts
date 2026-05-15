@@ -15,8 +15,8 @@ export default defineConfig(({ mode }) => ({
   server: {
     port: 5173,
     proxy: {
-      '/api': 'http://localhost:8080',
-      '/ws': { target: 'ws://localhost:8080', ws: true },
+      '/api': 'http://localhost:9080',
+      '/ws': { target: 'ws://localhost:9080', ws: true },
     },
   },
   build: {

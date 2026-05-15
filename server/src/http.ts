@@ -6,15 +6,15 @@ import { nodes, channels, qrTokens, reports, stats, getOnlineCount, getLongestUp
 import { broadcast } from './activity.js'
 import { checkRateLimit } from './ratelimit.js'
 import type { NodeSession, QrTokenRecord, ReportRecord } from './types.js'
+import {
+  MAX_NODES, MAX_NODES_PER_IP, NODE_ID_MIN, NODE_ID_MAX,
+  MAX_ATTEMPTS, LOCK_DURATION_MS,
+  SESSION_TTL_MS, QR_TOKEN_TTL_MS,
+  RATE_LIMIT_PER_MIN, RATE_WINDOW_MS,
+  REPORT_RATE_MAX, REPORT_RATE_WINDOW_MS, REPORT_WARN_COUNT, REPORT_WARN_WINDOW_MS,
+} from './config.js'
 
 export const router = Router()
-
-const MAX_NODES_PER_IP = 10
-const MAX_NODES = parseInt(process.env.MAX_NODES ?? '0', 10) || Infinity
-const LOCK_DURATION = 5 * 60 * 1000
-const MAX_ATTEMPTS = 3
-const RATE_LIMIT_PER_MIN = 60
-const RATE_WINDOW_MS = 60_000
 
 function hashPassCode(code: string) {
   return createHash('sha256').update(code).digest('hex')
@@ -37,7 +37,7 @@ router.use((req: Request, res: Response, next: NextFunction) => {
 // POST /api/register
 router.post('/register', (req, res) => {
   const parsed = z.object({
-    nodeId:   z.number().int().min(1).max(20001),
+    nodeId:   z.number().int().min(NODE_ID_MIN).max(NODE_ID_MAX),
     passCode: z.string().length(6).regex(/^\d{6}$/),
   }).safeParse(req.body)
 
@@ -69,7 +69,7 @@ router.post('/register', (req, res) => {
   if (conflict) {
     conflict.failedAttempts++
     if (conflict.failedAttempts >= MAX_ATTEMPTS) {
-      conflict.lockedUntil = now + LOCK_DURATION
+      conflict.lockedUntil = now + LOCK_DURATION_MS
       res.status(423).json({ error: 'NODE_LOCKED', reason: 'WRONG_PASSCODE', unlockAt: conflict.lockedUntil })
     } else {
       const remaining = MAX_ATTEMPTS - conflict.failedAttempts
@@ -107,7 +107,7 @@ router.post('/register', (req, res) => {
 
   broadcast({ type: 'join', nodeId, message: `御坂 ${nodeId} 号已接入网络` })
 
-  res.json({ sessionId, token, expiresAt: now + 30 * 60 * 1000, resumed: false })
+  res.json({ sessionId, token, expiresAt: now + SESSION_TTL_MS, resumed: false })
 })
 
 // POST /api/release-by-ip
@@ -206,7 +206,7 @@ router.get('/qr-token', (req, res) => {
 
   const qrToken = nanoid(32)
   const channelId = nanoid(8)
-  const expiresAt = Date.now() + 5 * 60 * 1000
+  const expiresAt = Date.now() + QR_TOKEN_TTL_MS
   const passCode = req.query.passCode as string | undefined
   const record: QrTokenRecord = {
     token: qrToken,
@@ -226,7 +226,7 @@ router.get('/qr-token', (req, res) => {
 router.post('/qr-redeem', (req, res) => {
   const parsed = z.object({
     qrToken:    z.string(),
-    myNodeId:   z.number().int().min(1).max(20001),
+    myNodeId:   z.number().int().min(NODE_ID_MIN).max(NODE_ID_MAX),
     myPassCode: z.string().length(6),
   }).safeParse(req.body)
 
@@ -256,7 +256,7 @@ router.post('/qr-redeem', (req, res) => {
 // POST /api/report
 router.post('/report', (req, res) => {
   const parsed = z.object({
-    targetNodeId: z.number().int().min(1).max(20001),
+    targetNodeId: z.number().int().min(NODE_ID_MIN).max(NODE_ID_MAX),
     reason:       z.enum(['spam', 'malicious', 'harassment', 'other']),
     sourceToken:  z.string(),
   }).safeParse(req.body)
@@ -280,8 +280,8 @@ router.post('/report', (req, res) => {
 
   // Rate limit: max 5 reports per IP per 10 minutes
   const now = Date.now()
-  const recentFromIp = reports.filter(r => r.reporterIp === ip && now - r.reportedAt < 10 * 60_000).length
-  if (recentFromIp >= 5) {
+  const recentFromIp = reports.filter(r => r.reporterIp === ip && now - r.reportedAt < REPORT_RATE_WINDOW_MS).length
+  if (recentFromIp >= REPORT_RATE_MAX) {
     res.status(429).json({ error: 'RATE_LIMITED', message: '上报过于频繁' })
     return
   }
@@ -297,8 +297,8 @@ router.post('/report', (req, res) => {
   reports.push(record)
 
   // If a node gets too many reports in a short time, broadcast a warning
-  const recentOnTarget = reports.filter(r => r.targetNodeId === targetNodeId && now - r.reportedAt < 60_000).length
-  if (recentOnTarget >= 3) {
+  const recentOnTarget = reports.filter(r => r.targetNodeId === targetNodeId && now - r.reportedAt < REPORT_WARN_WINDOW_MS).length
+  if (recentOnTarget >= REPORT_WARN_COUNT) {
     broadcast({ type: 'channel', message: `树形图设计者已注意到御坂 ${targetNodeId} 号的行为` })
   }
 

@@ -13,6 +13,6 @@ signal.example.com {
     header Upgrade websocket
   }
 
-  reverse_proxy @ws signaling:8080
-  reverse_proxy signaling:8080
+  reverse_proxy @ws signaling:9080
+  reverse_proxy signaling:9080
 }

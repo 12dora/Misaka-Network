@@ -24,6 +24,7 @@ import {
 import { getTransfer, getActiveTransfers } from '@/lib/db'
 import { playSound } from '@/lib/sound'
 import { notifyIncomingFile } from '@/lib/notify'
+import { MAX_ICE_RESTART_ATTEMPTS, DC_OPEN_TIMEOUT_MS, ENCRYPTION_TIMEOUT_MS } from '@/constants'
 
 // ── Non-reactive WebRTC state ────────────────────────────────────────
 // All routing is per-session (one device = one sessionId). Multiple devices
@@ -35,7 +36,6 @@ const pendingIceCandidates = new Map<string, RTCIceCandidateInit[]>()
 const ecdhResolvers: Map<string, () => void> = new Map()
 const iceRestarting = new Set<string>()
 const iceRestartAttempts = new Map<string, number>()
-const MAX_ICE_RESTART_ATTEMPTS = 3
 const sendingFiles = new Map<string, File>()  // transferId → File
 let initialized = false   // see init() — prevents StrictMode double-registration
 const deliveredTransfers = new Set<string>()  // one file card per transferId
@@ -320,14 +320,14 @@ async function ensureConnected(peerSessionId: string): Promise<RTCDataChannel> {
   }
   if (dc.readyState !== 'open') {
     await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('DataChannel 打开超时')), 15_000)
+      const timeout = setTimeout(() => reject(new Error('DataChannel 打开超时')), DC_OPEN_TIMEOUT_MS)
       const onOpen = () => { clearTimeout(timeout); resolve() }
       dc!.addEventListener('open', onOpen, { once: true })
     })
   }
   if (!hasAESKey()) {
     await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('加密协商超时')), 30_000)
+      const timeout = setTimeout(() => reject(new Error('加密协商超时')), ENCRYPTION_TIMEOUT_MS)
       ecdhResolvers.set(peerSessionId, () => { clearTimeout(timeout); resolve() })
     })
   }

@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import type { Identity, Session } from '@/types'
 import { apiUrl } from '@/config'
+import { NODE_ID_MIN, NODE_ID_MAX } from '@/constants'
 
 function randomInt(min: number, max: number) {
   return Math.floor(Math.random() * (max - min + 1)) + min
@@ -13,7 +14,7 @@ function generateIdentity(): Identity {
     return { nodeId: data.nodeId, passCode: data.passCode ?? '', createdAt: data.createdAt }
   }
   const identity: Identity = {
-    nodeId: randomInt(1, 20001),
+    nodeId: randomInt(NODE_ID_MIN, NODE_ID_MAX),
     passCode: '',
     createdAt: Date.now(),
   }
