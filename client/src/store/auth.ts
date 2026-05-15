@@ -9,20 +9,34 @@ function randomInt(min: number, max: number) {
 function generateIdentity(): Identity {
   const cached = sessionStorage.getItem('misaka.identity')
   if (cached) {
-    const { nodeId, createdAt } = JSON.parse(cached) as { nodeId: number; createdAt: number }
-    return { nodeId, passCode: '', createdAt }
+    const data = JSON.parse(cached) as { nodeId: number; passCode?: string; createdAt: number }
+    return { nodeId: data.nodeId, passCode: data.passCode ?? '', createdAt: data.createdAt }
   }
   const identity: Identity = {
     nodeId: randomInt(1, 20001),
     passCode: '',
     createdAt: Date.now(),
   }
-  sessionStorage.setItem('misaka.identity', JSON.stringify({ nodeId: identity.nodeId, createdAt: identity.createdAt }))
+  persistIdentity(identity)
   return identity
 }
 
 function persistIdentity(identity: Identity) {
-  sessionStorage.setItem('misaka.identity', JSON.stringify({ nodeId: identity.nodeId, createdAt: identity.createdAt }))
+  sessionStorage.setItem('misaka.identity', JSON.stringify({ nodeId: identity.nodeId, passCode: identity.passCode, createdAt: identity.createdAt }))
+}
+
+/** Try to restore a saved session from sessionStorage (survives page refresh). */
+function tryRestoreSession(): Session | null {
+  try {
+    const raw = sessionStorage.getItem('misaka.session')
+    if (!raw) return null
+    const session = JSON.parse(raw) as Session
+    if (session.expiresAt > Date.now() && session.token) {
+      return session
+    }
+    sessionStorage.removeItem('misaka.session')
+  } catch { /* ignore */ }
+  return null
 }
 
 interface AuthState {
@@ -43,10 +57,12 @@ interface AuthState {
   dismissIpFullPrompt: () => void
 }
 
+const savedSession = tryRestoreSession()
+
 export const useAuthStore = create<AuthState>((set, get) => ({
   identity: generateIdentity(),
-  session: null,
-  isConnected: false,
+  session: savedSession,
+  isConnected: savedSession !== null,
   isLoading: false,
   error: null,
   ipFullPrompt: false,
@@ -59,6 +75,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   setPassCode(passCode) {
     const identity = { ...get().identity, passCode }
+    persistIdentity(identity)
     set({ identity, error: null })
   },
 
@@ -72,6 +89,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   regeneratePassCode() {
     const passCode = String(randomInt(0, 999999)).padStart(6, '0')
     const identity = { ...get().identity, passCode }
+    persistIdentity(identity)
     set({ identity, error: null })
   },
 
@@ -87,17 +105,21 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       })
 
       if (res.status === 409) {
-        // The chosen nodeId is held by someone else with a different passcode.
-        // Don't auto-bump — the user picked this nodeId on purpose and
-        // expects the cluster to contain peers with exactly this number.
-        set({ isLoading: false, error: '该节点编号已被他人占用，请换一个' })
+        const data = await res.json() as { error: string; message?: string; remaining?: number }
+        const msg = data.remaining != null
+          ? `通行码错误（剩余 ${data.remaining} 次尝试机会）`
+          : (data.message ?? '该节点编号已被他人使用，请换一个')
+        set({ isLoading: false, error: msg })
         return
       }
 
       if (res.status === 423) {
-        const data = await res.json() as { error: string; unlockAt: number }
+        const data = await res.json() as { error: string; reason?: string; unlockAt: number }
         const mins = Math.ceil((data.unlockAt - Date.now()) / 60000)
-        set({ isLoading: false, error: `检测到异常接入尝试，节点已临时锁定（${mins} 分钟后解除）` })
+        const msg = data.reason === 'WRONG_PASSCODE'
+          ? `通行码错误次数过多，节点已临时锁定（${mins} 分钟后解除）`
+          : `检测到异常接入尝试，节点已临时锁定（${mins} 分钟后解除）`
+        set({ isLoading: false, error: msg })
         return
       }
 

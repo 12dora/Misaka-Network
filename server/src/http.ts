@@ -62,7 +62,7 @@ router.post('/register', (req, res) => {
   }
   const lockedSession = sameNodeSessions.find(s => now < s.lockedUntil)
   if (lockedSession) {
-    res.status(423).json({ error: 'NODE_LOCKED', unlockAt: lockedSession.lockedUntil })
+    res.status(423).json({ error: 'NODE_LOCKED', reason: 'WRONG_PASSCODE', unlockAt: lockedSession.lockedUntil })
     return
   }
   const conflict = sameNodeSessions.find(s => s.passCodeHash !== passCodeHash)
@@ -70,9 +70,10 @@ router.post('/register', (req, res) => {
     conflict.failedAttempts++
     if (conflict.failedAttempts >= MAX_ATTEMPTS) {
       conflict.lockedUntil = now + LOCK_DURATION
-      res.status(423).json({ error: 'NODE_LOCKED', unlockAt: conflict.lockedUntil })
+      res.status(423).json({ error: 'NODE_LOCKED', reason: 'WRONG_PASSCODE', unlockAt: conflict.lockedUntil })
     } else {
-      res.status(409).json({ error: 'NODE_OCCUPIED', message: '该编号已被他人使用' })
+      const remaining = MAX_ATTEMPTS - conflict.failedAttempts
+      res.status(409).json({ error: 'NODE_OCCUPIED', message: '该节点编号的通行码错误，请重新输入', remaining })
     }
     return
   }
