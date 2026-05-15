@@ -1,38 +1,57 @@
-import { nodes, channels, qrTokens, reports } from './store.js'
+import { nodes, channels, qrTokens, reports, getOnlineCount } from './store.js'
 import { cleanupRateLimitWindows } from './ratelimit.js'
 
-const SESSION_TTL = 30 * 60 * 1000  // 30 minutes
-const LOCK_DURATION = 5 * 60 * 1000
-const REPORT_TTL = 60 * 60 * 1000   // 1 hour
+const DISCONNECTED_TTL = 10 * 1000    // 10 seconds — cleanup when no active nodes
+const LOCK_DURATION     = 5 * 60 * 1000
+const REPORT_TTL        = 60 * 60 * 1000 // 1 hour
+
+let zeroActiveSince: number | null = null
 
 export function startCleanupTask() {
   setInterval(() => {
     const now = Date.now()
 
-    for (const [sessionId, session] of nodes) {
+    // --- Session cleanup: when all nodes go offline, remove disconnected
+    //     sessions after a short grace period (10 s).
+    const activeCount = getOnlineCount()
+    if (activeCount === 0) {
+      if (zeroActiveSince === null) {
+        zeroActiveSince = now
+      } else if (now - zeroActiveSince >= DISCONNECTED_TTL) {
+        for (const [sessionId, session] of nodes) {
+          if (session.socket === null) {
+            nodes.delete(sessionId)
+            if (session.channelId) {
+              const ch = channels.get(session.channelId)
+              if (ch) {
+                ch.delete(sessionId)
+                if (ch.size === 0) channels.delete(session.channelId)
+              }
+            }
+          }
+        }
+        zeroActiveSince = null
+      }
+    } else {
+      zeroActiveSince = null
+    }
+
+    // Unlock expired locks
+    for (const [, session] of nodes) {
       if (session.lockedUntil > 0 && now >= session.lockedUntil) {
         session.lockedUntil = 0
         session.failedAttempts = 0
       }
-
-      if (session.socket === null && now - session.lastSeen > SESSION_TTL) {
-        nodes.delete(sessionId)
-        if (session.channelId) {
-          const ch = channels.get(session.channelId)
-          if (ch) {
-            ch.delete(sessionId)
-            if (ch.size === 0) channels.delete(session.channelId)
-          }
-        }
-      }
     }
 
+    // Purge expired / used QR tokens
     for (const [token, record] of qrTokens) {
       if (now > record.expiresAt || record.used) {
         qrTokens.delete(token)
       }
     }
 
+    // Purge empty channels
     for (const [channelId, members] of channels) {
       if (members.size === 0) channels.delete(channelId)
     }
@@ -46,5 +65,5 @@ export function startCleanupTask() {
 
     // Purge stale rate limit windows
     cleanupRateLimitWindows()
-  }, 60_000)
+  }, 2_000)
 }

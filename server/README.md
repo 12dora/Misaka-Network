@@ -162,6 +162,13 @@ docker compose -f docker-compose.turn.yml up -d
 - `5349/tcp`
 - `49160-49200/udp`（与模板 `min-port/max-port` 对应）
 
+## 会话生命周期
+
+- 注册成功的会话会保持在线，直到 WebSocket 断开
+- 所有节点的 WebSocket 断开后，服务器会等待 **10 秒** 后自动清理所有空会话
+- 登录令牌（token）有效期为 30 分钟，刷新页面后可从 `sessionStorage` 恢复会话
+- 服务重启后所有内存数据清空，需重新接入
+
 ## 关键约束
 
 - 所有业务数据在内存中，服务重启即清空
