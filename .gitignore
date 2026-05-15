@@ -4,6 +4,8 @@ build/
 .env
 .env.local
 .credentials
+data/
+server/data/
 .DS_Store
 *.log
 .vscode/

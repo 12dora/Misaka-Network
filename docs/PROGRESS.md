@@ -19,7 +19,8 @@
 
 ### 2.1 真机 / 实网端到端验证
 - ☑ PC ↔ 手机 QR 扫码加入（已测试）
-- ◐ TURN 中继实装（已补 coturn docker 模板；实际服务器部署未做）
+- ☑ TURN 中继自动下发（Cloudflare Realtime TURN，短时效凭证 + customIdentifier + 防滥用 policy + 1T 熔断 + 持久化）
+- ◐ TURN 中继实战验证（CF Token 配置 + 真实公网流量打点未做）
 - ◐ ICE 路径实测（host → srflx → relay 优先级；已补前端 ICE 路径可视化，待实网逐项打点）
 - ☒ iOS Safari / Android Chrome 兼容真机矩阵（本阶段不做真机矩阵；仅保留通用降级逻辑）
 
@@ -92,7 +93,7 @@
 
 ## 当前会话焦点
 
-v2 鲁棒性收尾完成：消息送达状态、重连提示、NAT 穿透增强已落地。待完成：host/srflx/relay 三场景实网验证与 TURN 实际部署。
+TURN 自动下发落地：服务端按 sessionId 申请 Cloudflare 短时效凭证（默认 5 min TTL），客户端 prefetch + 自动续期。所有防滥用 enforcement 在服务端（deny list / 每 IP 字节 + 频率 / 1T 月度熔断 / CF revoke），客户端只是消费方。状态持久化到 `data/turn-state.json`（原子写）。Settings 中继 tab 顶部展示自动 TURN 状态 + 月度用量进度条；手工 TURN 列表保留。待完成：CF Token 真实配置 + 端到端流量验证。
 
 ## 已知问题
 
@@ -157,3 +158,7 @@ v2 鲁棒性收尾完成：消息送达状态、重连提示、NAT 穿透增强�
 - 接收卡片去重：`deliverCompletedFile` 以 `transferId` 去重，防止同一传输在并发回调下重复插入 file 消息
 - 未读与通知：`unreadByPeer` 记录每节点消息/文件未读数；收到文件时若页面在后台且通知权限已授权，触发系统 Notification
 - 部署标准化：根目录新增 `docker-compose.yml`，后端新增多阶段 `server/Dockerfile`；README 统一提供前后端部署步骤与 `config.json` 运行时后端地址配置方案
+- TURN 自动下发安全模型：客户端零 enforcement（可被 hook 绕过），所有黑名单/字节配额/熔断在服务端内存维护；CF 短时效凭证（默认 300s）是 revoke 失败的兜底，配合 CF revoke API 做主动吊销。`customIdentifier=misaka-${sessionId}` 用于 CF Analytics 按用户细粒度查询。API Token 仅从 env 读取、绝不进日志或响应
+- TURN 防滥用 policy 全部 env 可配（单 session 字节上限 / 每 IP 字节 + 签发频率 / 全局月度 1T 90% 熔断 / 凭证 TTL / 轮询周期 / 封禁时长）；pessimistic byte 估算 + Analytics 校准双路径（Analytics 有 1~5 min 延迟，pessimistic 走零延迟快路径）
+- TURN 状态持久化：`server/data/turn-state.json` 原子写（writeFile .tmp + rename），10s 节流批量写 + 关键事件即时写 + 关停 graceful flush。仅 TURN 数据持久化；nodes / channels / qrTokens / reports 维持原内存策略
+- 部署密钥：`TURN_CF_KEY_ID / TURN_CF_API_TOKEN / TURN_CF_ACCOUNT_TAG` 走根目录 `.env`（已加入 .gitignore），compose 用 `env_file` 引用；`.env.example` 仅占位提示

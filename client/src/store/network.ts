@@ -24,6 +24,7 @@ import {
 import { getTransfer, getActiveTransfers } from '@/lib/db'
 import { playSound } from '@/lib/sound'
 import { notifyIncomingFile } from '@/lib/notify'
+import { refreshAutoTurn, clearAutoTurn } from '@/lib/turn'
 import {
   MAX_ICE_RESTART_ATTEMPTS, ICE_RESTART_BACKOFF_MS, ICE_DISCONNECTED_RESTART_DELAY_MS,
   DC_OPEN_TIMEOUT_MS, ENCRYPTION_TIMEOUT_MS,
@@ -218,7 +219,13 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
       }
     })
 
-    onConnect(() => set({ wsConnected: true }))
+    onConnect(() => {
+      set({ wsConnected: true })
+      // Prefetch auto TURN once authed. Server may reply 503 if disabled —
+      // that's fine, we just fall back to STUN + manual TURN. Re-fetch on
+      // every reconnect because credentials are short-lived.
+      void refreshAutoTurn(token)
+    })
     onDisconnect(() => set({ wsConnected: false }))
 
     wsConnect(token)
@@ -228,6 +235,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     wsDisconnect()
     for (const sid of peerConnections.keys()) cleanupPeerConnection(sid)
     resetCrypto()
+    clearAutoTurn()
     initialized = false
     set({
       wsConnected: false, mySessionId: null, channelId: null,
