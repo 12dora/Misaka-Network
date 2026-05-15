@@ -46,6 +46,17 @@
 - ☑ ConnectionDiagnostics（peer info bar 显示 reconnecting / offline 状态 + 诊断提示）
 - ☑ 失败提示人话化（humanizeError 函数 + TaskPanel 友好错误消息）
 - ☑ 网络切换自动重连（window.online 事件触发 doConnect）
+- ☑ 聊天消息送达状态（WhatsApp 风格：⏳ 发送中 / ✓ 已发送 / ✓✓ 已送达 / ↺ 重试）
+- ☑ 重连系统提示（断线时 "⚠ 连接中断"，恢复时 "✓ 连接已恢复"，放弃时 "连接已断开"）
+
+### 2.6 NAT 穿透增强
+- ☑ STUN 池扩展至 10 个服务器（bundlePolicy max-bundle + iceCandidatePoolSize 4）
+- ☑ SIGNAL_ICE_END 端到端候选结束信令（加快对端 ICE agent 收敛）
+- ☑ ICE disconnected 5s 主动重启（不等浏览器 30s failed 超时）
+- ☑ ICE restart 指数退避（1/2/4/8/16s，最多 5 次，超过降级 full reconnect）
+- ☑ NAT 类型检测卡（Settings → TURN 标签：open/cone/symmetric/blocked）
+- ☑ nat-classify.ts 纯逻辑分离 + 18 个单元测试（client/tests/nat-classify.test.mjs）
+- ☑ SIGNAL_ICE_END 集成测试（server/tests/signaling-end.test.mjs）
 
 ## v3 — 打磨 & 沉浸感
 
@@ -81,7 +92,7 @@
 
 ## 当前会话焦点
 
-部署准备与实网验证收尾：Lighthouse 已达标；ICE 诊断已支持时间戳与一键复制留痕，待完成 host/srflx/relay 三场景实测与 TURN 实际部署验证。
+v2 鲁棒性收尾完成：消息送达状态、重连提示、NAT 穿透增强已落地。待完成：host/srflx/relay 三场景实网验证与 TURN 实际部署。
 
 ## 已知问题
 
@@ -138,6 +149,10 @@
 - ICE 实测支撑增强：Peer 增加 `icePathMeasuredAt`，Network 信息栏展示采集时间，并提供“复制诊断”按钮，输出可直接用于 host/srflx/relay 实测记录
 - TURN 模板化：新增 coturn docker compose 与 `turnserver.conf.example`（含端口段、凭据、realm、external-ip），降低中继上线门槛
 - DataChannel 监听器幂等防护：新增 `configuredDataChannels`（WeakSet）确保同一 channel 只绑定一次，消除重连竞态下重复绑定风险
+- 消息送达状态：`ChannelMessage.status` 字段（sending/sent/delivered/failed）；`outgoingQueue` 由 `queuedMessageIds` Map 追踪入队 msgId，flush 时统一标 sent；接收方收到 chat 后发 `msg-ack`，发送方收 ack 后标 delivered；断线清理时未发出的消息标 failed；UI 显示 ⏳/✓/✓✓/↺ 重试图标
+- 重连系统消息策略：ICE disconnected（前状态 transferring）→ 在 chatMessages 插入 "⚠ 连接中断" 系统消息；DC onopen（有历史聊天记录）→ 插入 "✓ 连接已恢复"；ICE restart 耗尽 → 插入 "连接已断开" + failPendingMessages
+- NAT 纯逻辑分层：nat.ts（浏览器入口，依赖 RTCPeerConnection）与 nat-classify.ts（纯函数，无 DOM 依赖，可在 Node 测试环境中直接 import）分开，解决 tsx 无法解析 @/ alias 的测试限制
+- SIGNAL_ICE_END：候选收集结束（onicecandidate e.candidate === null）时通过信令服务器转发给 peer；接收方调用 `pc.addIceCandidate({ candidate: '' })` 通知 ICE agent 对端已停止收集，加快连接性检测收敛
 - QR join：`/join` 以链接 `id` 覆盖本机 nodeId，`c` 存在时 base64 解码为通行码并自动注册；`c` 缺失或错误时停在通行码输入卡片，不再要求先返回首页注册
 - 接收卡片去重：`deliverCompletedFile` 以 `transferId` 去重，防止同一传输在并发回调下重复插入 file 消息
 - 未读与通知：`unreadByPeer` 记录每节点消息/文件未读数；收到文件时若页面在后台且通知权限已授权，触发系统 Notification
