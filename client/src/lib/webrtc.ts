@@ -1,5 +1,5 @@
 import { getTurnIceServers, loadTurnSettings } from './turn'
-import { DEFAULT_STUN } from '@/constants'
+import { DEFAULT_STUN, ICE_CANDIDATE_POOL_SIZE } from '@/constants'
 
 // ICE candidate pair → channel type
 export type ChannelType = 'direct' | 'stun' | 'relay'
@@ -76,6 +76,13 @@ export function createPeerConnection(): RTCPeerConnection {
   return new RTCPeerConnection({
     iceServers,
     iceTransportPolicy: turnSettings.forceRelay ? 'relay' : 'all',
+    // max-bundle: multiplex all media on a single transport — fewer ports
+    // requested, friendlier to strict firewalls. Required when using DCs.
+    bundlePolicy: 'max-bundle',
+    rtcpMuxPolicy: 'require',
+    // Pre-gather candidates so the offer/answer ships with srflx ready,
+    // and connectivity checks can start the moment SDP arrives.
+    iceCandidatePoolSize: ICE_CANDIDATE_POOL_SIZE,
   })
 }
 

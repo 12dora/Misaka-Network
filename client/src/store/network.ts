@@ -24,7 +24,10 @@ import {
 import { getTransfer, getActiveTransfers } from '@/lib/db'
 import { playSound } from '@/lib/sound'
 import { notifyIncomingFile } from '@/lib/notify'
-import { MAX_ICE_RESTART_ATTEMPTS, DC_OPEN_TIMEOUT_MS, ENCRYPTION_TIMEOUT_MS } from '@/constants'
+import {
+  MAX_ICE_RESTART_ATTEMPTS, ICE_RESTART_BACKOFF_MS, ICE_DISCONNECTED_RESTART_DELAY_MS,
+  DC_OPEN_TIMEOUT_MS, ENCRYPTION_TIMEOUT_MS,
+} from '@/constants'
 
 // ── Non-reactive WebRTC state ────────────────────────────────────────
 // All routing is per-session (one device = one sessionId). Multiple devices
@@ -36,6 +39,10 @@ const pendingIceCandidates = new Map<string, RTCIceCandidateInit[]>()
 const ecdhResolvers: Map<string, () => void> = new Map()
 const iceRestarting = new Set<string>()
 const iceRestartAttempts = new Map<string, number>()
+// Schedule an ICE restart when state is 'disconnected' for too long. The
+// browser fires 'failed' very lazily (~30s), so we stop waiting and try
+// to recover proactively.
+const disconnectedTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const sendingFiles = new Map<string, File>()  // transferId → File
 let initialized = false   // see init() — prevents StrictMode double-registration
 const deliveredTransfers = new Set<string>()  // one file card per transferId
@@ -156,6 +163,10 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
 
         case 'SIGNAL_ICE':
           await handleRemoteICE(msg.fromSessionId, msg.candidate)
+          break
+
+        case 'SIGNAL_ICE_END':
+          await handleRemoteICEEnd(msg.fromSessionId)
           break
 
         case 'SERVER_SHUTDOWN':
@@ -420,39 +431,14 @@ async function initiateWebRTC(peerSessionId: string) {
   pc.onicecandidate = (e) => {
     if (e.candidate) {
       wsSend({ t: 'SIGNAL_ICE', targetSessionId: peerSessionId, candidate: e.candidate.toJSON() })
+    } else {
+      // null marks end-of-candidates — tell peer so its ICE agent can stop
+      // waiting for stragglers and finalize connectivity checks faster.
+      wsSend({ t: 'SIGNAL_ICE_END', targetSessionId: peerSessionId })
     }
   }
 
-  pc.oniceconnectionstatechange = async () => {
-    const state = pc.iceConnectionState
-    if (state === 'connected' || state === 'completed') {
-      iceRestartAttempts.set(peerSessionId, 0)
-      const selectedPath = await getSelectedIcePath(pc)
-      const ct = selectedPath?.channelType ?? await getSelectedChannelType(pc)
-      useNetworkStore.setState(s => ({
-        peers: s.peers.map(p =>
-          p.sessionId === peerSessionId
-            ? {
-                ...p,
-                status: 'transferring' as NodeStatus,
-                channelType: ct ?? 'stun',
-                icePath: selectedPath?.pathText,
-                icePathMeasuredAt: selectedPath?.pathText ? Date.now() : p.icePathMeasuredAt,
-              }
-            : p,
-        ),
-        connectedPeers: new Set([...s.connectedPeers, peerSessionId]),
-      }))
-    } else if (state === 'disconnected') {
-      useNetworkStore.setState(s => ({
-        peers: s.peers.map(p =>
-          p.sessionId === peerSessionId ? { ...p, status: 'reconnecting' as NodeStatus } : p,
-        ),
-      }))
-    } else if (state === 'failed') {
-      attemptIceRestart(peerSessionId)
-    }
-  }
+  pc.oniceconnectionstatechange = () => handleIceStateChange(pc, peerSessionId)
 
   const offer = await createOffer(pc)
   wsSend({ t: 'SIGNAL_SDP', targetSessionId: peerSessionId, sdp: offer })
@@ -479,39 +465,12 @@ async function handleRemoteSDP(fromSessionId: string, fromNodeId: number, sdp: R
     pc.onicecandidate = (e) => {
       if (e.candidate) {
         wsSend({ t: 'SIGNAL_ICE', targetSessionId: fromSessionId, candidate: e.candidate.toJSON() })
+      } else {
+        wsSend({ t: 'SIGNAL_ICE_END', targetSessionId: fromSessionId })
       }
     }
 
-    pc.oniceconnectionstatechange = async () => {
-      const state = pc!.iceConnectionState
-      if (state === 'connected' || state === 'completed') {
-        iceRestartAttempts.set(fromSessionId, 0)
-        const selectedPath = await getSelectedIcePath(pc!)
-        const ct = selectedPath?.channelType ?? await getSelectedChannelType(pc!)
-        useNetworkStore.setState(s => ({
-          peers: s.peers.map(p =>
-            p.sessionId === fromSessionId
-              ? {
-                  ...p,
-                  status: 'transferring' as NodeStatus,
-                  channelType: ct ?? 'stun',
-                  icePath: selectedPath?.pathText,
-                  icePathMeasuredAt: selectedPath?.pathText ? Date.now() : p.icePathMeasuredAt,
-                }
-              : p,
-          ),
-          connectedPeers: new Set([...s.connectedPeers, fromSessionId]),
-        }))
-      } else if (state === 'disconnected') {
-        useNetworkStore.setState(s => ({
-          peers: s.peers.map(p =>
-            p.sessionId === fromSessionId ? { ...p, status: 'reconnecting' as NodeStatus } : p,
-          ),
-        }))
-      } else if (state === 'failed') {
-        attemptIceRestart(fromSessionId)
-      }
-    }
+    pc.oniceconnectionstatechange = () => handleIceStateChange(pc!, fromSessionId)
 
     await generateECDHKeyPair()
 
@@ -555,6 +514,72 @@ async function handleRemoteICE(fromSessionId: string, candidate: RTCIceCandidate
     pending.push(candidate)
     pendingIceCandidates.set(fromSessionId, pending)
   }
+}
+
+async function handleRemoteICEEnd(fromSessionId: string) {
+  const pc = peerConnections.get(fromSessionId)
+  if (!pc) return
+  // Empty-candidate marker per RFC 8445 §8.1.2 — signals the peer has
+  // finished gathering. Browsers accept this to short-circuit waits.
+  try { await pc.addIceCandidate({ candidate: '', sdpMid: '', sdpMLineIndex: 0 }) }
+  catch { /* some browsers reject the marker; harmless */ }
+}
+
+function handleIceStateChange(pc: RTCPeerConnection, peerSessionId: string) {
+  const state = pc.iceConnectionState
+  if (state === 'connected' || state === 'completed') {
+    clearDisconnectedTimer(peerSessionId)
+    iceRestartAttempts.set(peerSessionId, 0)
+    void onIceConnected(pc, peerSessionId)
+  } else if (state === 'disconnected') {
+    useNetworkStore.setState(s => ({
+      peers: s.peers.map(p =>
+        p.sessionId === peerSessionId ? { ...p, status: 'reconnecting' as NodeStatus } : p,
+      ),
+    }))
+    // Schedule a proactive restart instead of waiting ~30s for 'failed'.
+    if (!disconnectedTimers.has(peerSessionId)) {
+      const t = setTimeout(() => {
+        disconnectedTimers.delete(peerSessionId)
+        const cur = peerConnections.get(peerSessionId)
+        if (!cur) return
+        if (cur.iceConnectionState === 'disconnected' || cur.iceConnectionState === 'failed') {
+          attemptIceRestart(peerSessionId)
+        }
+      }, ICE_DISCONNECTED_RESTART_DELAY_MS)
+      disconnectedTimers.set(peerSessionId, t)
+    }
+  } else if (state === 'failed') {
+    clearDisconnectedTimer(peerSessionId)
+    attemptIceRestart(peerSessionId)
+  }
+}
+
+function clearDisconnectedTimer(peerSessionId: string) {
+  const t = disconnectedTimers.get(peerSessionId)
+  if (t) {
+    clearTimeout(t)
+    disconnectedTimers.delete(peerSessionId)
+  }
+}
+
+async function onIceConnected(pc: RTCPeerConnection, peerSessionId: string) {
+  const selectedPath = await getSelectedIcePath(pc)
+  const ct = selectedPath?.channelType ?? await getSelectedChannelType(pc)
+  useNetworkStore.setState(s => ({
+    peers: s.peers.map(p =>
+      p.sessionId === peerSessionId
+        ? {
+            ...p,
+            status: 'transferring' as NodeStatus,
+            channelType: ct ?? 'stun',
+            icePath: selectedPath?.pathText,
+            icePathMeasuredAt: selectedPath?.pathText ? Date.now() : p.icePathMeasuredAt,
+          }
+        : p,
+    ),
+    connectedPeers: new Set([...s.connectedPeers, peerSessionId]),
+  }))
 }
 
 function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
@@ -724,10 +749,22 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
 async function attemptIceRestart(peerSessionId: string) {
   if (iceRestarting.has(peerSessionId)) return
   const attempts = iceRestartAttempts.get(peerSessionId) ?? 0
-  if (attempts >= MAX_ICE_RESTART_ATTEMPTS) return
+  if (attempts >= MAX_ICE_RESTART_ATTEMPTS) {
+    useNetworkStore.setState(s => ({
+      peers: s.peers.map(p =>
+        p.sessionId === peerSessionId ? { ...p, status: 'offline' as NodeStatus } : p,
+      ),
+    }))
+    return
+  }
 
   iceRestarting.add(peerSessionId)
   iceRestartAttempts.set(peerSessionId, attempts + 1)
+
+  // Exponential backoff: spread out retries so we don't hammer the signaling
+  // server when the network is genuinely down.
+  const delay = ICE_RESTART_BACKOFF_MS[Math.min(attempts, ICE_RESTART_BACKOFF_MS.length - 1)]
+  if (delay > 0) await new Promise(r => setTimeout(r, delay))
 
   useNetworkStore.setState(s => ({
     peers: s.peers.map(p =>
@@ -860,6 +897,7 @@ async function sendResumeRequests(peerSessionId: string, dc: RTCDataChannel) {
 function cleanupPeerConnection(sessionId: string) {
   iceRestartAttempts.delete(sessionId)
   iceRestarting.delete(sessionId)
+  clearDisconnectedTimer(sessionId)
   const dc = dataChannels.get(sessionId)
   if (dc) { dc.close(); dataChannels.delete(sessionId) }
   const pc = peerConnections.get(sessionId)
