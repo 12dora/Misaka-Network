@@ -4,9 +4,16 @@
   <meta charset="utf-8">
   <title>MISAKA NETWORK</title>
   <script>
-    // Preserve the intended path and redirect to base
-    sessionStorage.setItem('misaka-redirect', location.pathname + location.search + location.hash);
-    location.replace('/');
+    (function () {
+      var repoBase = '/Misaka-Network';
+      var base = location.hostname.endsWith('.github.io') &&
+        (location.pathname === repoBase || location.pathname.indexOf(repoBase + '/') === 0)
+        ? repoBase + '/'
+        : '/';
+
+      sessionStorage.setItem('misaka-redirect', location.pathname + location.search + location.hash);
+      location.replace(base);
+    })();
   </script>
 </head>
 <body>

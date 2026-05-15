@@ -4,9 +4,10 @@ import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
 import AppFooter from '@/components/ui/AppFooter'
 import { QUOTES, CHARACTERS, LORE_LOG, LORE_TIMELINE, getCharacterByNodeId } from '@/data/lore'
+import { publicAssetUrl } from '@/lib/appBase'
 
-const HERO_CHARACTER = import.meta.env.BASE_URL + 'assets/misaka.webp'
-const HERO_TITLE     = import.meta.env.BASE_URL + 'assets/misaka-title.webp'
+const HERO_CHARACTER = publicAssetUrl('assets/misaka.webp')
+const HERO_TITLE     = publicAssetUrl('assets/misaka-title.webp')
 
 // ── Section Header ────────────────────────────────────────────────
 function SectionHeader({ kanji, title, furigana }: { kanji: string; title: string; furigana: string }) {

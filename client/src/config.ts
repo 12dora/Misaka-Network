@@ -7,6 +7,7 @@
 interface AppConfig {
   API_BASE: string
   WS_URL: string
+  APP_BASE?: string
 }
 
 declare global {
@@ -23,7 +24,7 @@ export async function loadConfig(): Promise<AppConfig> {
 
   // Try loading runtime config.json
   try {
-    const resp = await fetch(`${import.meta.env.BASE_URL}config.json`)
+    const resp = await fetch(new URL('config.json', document.baseURI))
     if (resp.ok) {
       const data = (await resp.json()) as Partial<AppConfig>
       window.__MISAKA_CONFIG__ = data
