@@ -9,9 +9,12 @@ let handlers = new Set<MessageHandler>()
 let connectHandlers = new Set<ConnectionHandler>()
 let disconnectHandlers = new Set<ConnectionHandler>()
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null
 let token = ''
 let reconnectAttempts = 0
 let serverShutdown = false
+
+const HEARTBEAT_INTERVAL_MS = 45_000
 
 export function onMessage(handler: MessageHandler) {
   handlers.add(handler)
@@ -46,11 +49,13 @@ function doConnect() {
 
   sock.onopen = () => {
     sock.send(JSON.stringify({ t: 'AUTH', token }))
+    startHeartbeat(sock)
     reconnectAttempts = 0
     connectHandlers.forEach(h => h())
   }
 
   sock.onclose = () => {
+    stopHeartbeat()
     disconnectHandlers.forEach(h => h())
     scheduleReconnect()
   }
@@ -67,6 +72,24 @@ function doConnect() {
     } catch {
       // ignore invalid messages
     }
+  }
+}
+
+function startHeartbeat(sock: WebSocket) {
+  stopHeartbeat()
+  heartbeatTimer = setInterval(() => {
+    if (ws !== sock || sock.readyState !== WebSocket.OPEN) {
+      stopHeartbeat()
+      return
+    }
+    sock.send(JSON.stringify({ t: 'PING' }))
+  }, HEARTBEAT_INTERVAL_MS)
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer)
+    heartbeatTimer = null
   }
 }
 
@@ -100,6 +123,7 @@ export function disconnect() {
   handlers.clear()
   connectHandlers.clear()
   disconnectHandlers.clear()
+  stopHeartbeat()
   if (ws) {
     ws.onclose = null // prevent reconnect
     ws.close()

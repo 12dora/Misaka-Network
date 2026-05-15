@@ -3,6 +3,9 @@ export default {
   content: ['./index.html', './src/**/*.{ts,tsx}'],
   theme: {
     extend: {
+      screens: {
+        xs: '390px',
+      },
       colors: {
         'bg-primary':    'var(--bg-primary)',
         'bg-deep':       'var(--bg-deep)',

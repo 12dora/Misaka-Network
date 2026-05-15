@@ -1,4 +1,4 @@
 {
-  "API_BASE": "",
-  "WS_URL": ""
+  "API_BASE": "https://misaka.konata.tv",
+  "WS_URL": "wss://misaka.konata.tv/ws"
 }
