@@ -8,6 +8,7 @@ import QRModal from '@/components/features/QRModal'
 import { useNetworkStore } from '@/store/network'
 import { useAuthStore } from '@/store/auth'
 import { apiUrl } from '@/config'
+import { appUrl } from '@/lib/appBase'
 import { humanizeError } from '@/lib/transfer'
 import { ensureNotificationPermission } from '@/lib/notify'
 import type { Peer, Transfer } from '@/types'
@@ -585,7 +586,7 @@ export default function Network() {
         id: String(auth.identity.nodeId),
         t: data.qrToken,
       })
-      const link = `${location.origin}/join?${params.toString()}`
+      const link = appUrl(`/join?${params.toString()}`)
       await navigator.clipboard.writeText(link)
       setToast('链接已复制到剪贴板')
     } catch (e) {

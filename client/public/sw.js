@@ -4,7 +4,7 @@ const APP_SHELL = [
   './index.html',
   './404.html',
   './config.json',
-  './favicon.svg',
+  './assets/misaka-logo.webp',
 ]
 
 self.addEventListener('install', (event) => {
