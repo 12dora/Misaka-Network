@@ -6,8 +6,7 @@ import { router } from './http.js'
 import { setupWS } from './ws.js'
 import { setWSS } from './activity.js'
 import { startCleanupTask } from './cleanup.js'
-
-const PORT = parseInt(process.env.PORT ?? '8080', 10)
+import { PORT, SHUTDOWN_TIMEOUT_MS } from './config.js'
 
 const app = express()
 
@@ -55,11 +54,10 @@ function gracefulShutdown(signal: string) {
     process.exit(0)
   })
 
-  // Force exit after 5s if connections don't drain
   setTimeout(() => {
     console.log('强制退出')
     process.exit(1)
-  }, 5000)
+  }, SHUTDOWN_TIMEOUT_MS)
 }
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))

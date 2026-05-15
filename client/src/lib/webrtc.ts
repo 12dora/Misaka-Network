@@ -1,9 +1,5 @@
 import { getTurnIceServers, loadTurnSettings } from './turn'
-
-const DEFAULT_STUN: RTCIceServer[] = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun.cloudflare.com:3478' },
-]
+import { DEFAULT_STUN } from '@/constants'
 
 // ICE candidate pair → channel type
 export type ChannelType = 'direct' | 'stun' | 'relay'

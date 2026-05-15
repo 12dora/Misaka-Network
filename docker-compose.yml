@@ -6,8 +6,8 @@ services:
     container_name: misaka-signaling
     restart: unless-stopped
     environment:
-      PORT: 8080
+      PORT: 9080
       MAX_NODES: 10000
       RATE_LIMIT_PER_MIN: 60
     ports:
-      - "8080:8080"
+      - "9080:9080"

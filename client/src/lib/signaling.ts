@@ -1,5 +1,6 @@
 import type { WSServerMessage, WSMessage } from '@/types'
 import { wsUrl } from '@/config'
+import { HEARTBEAT_INTERVAL_MS, RECONNECT_DELAYS_MS } from '@/constants'
 
 type MessageHandler = (msg: WSServerMessage) => void
 type ConnectionHandler = () => void
@@ -13,8 +14,6 @@ let heartbeatTimer: ReturnType<typeof setInterval> | null = null
 let token = ''
 let reconnectAttempts = 0
 let serverShutdown = false
-
-const HEARTBEAT_INTERVAL_MS = 45_000
 
 export function onMessage(handler: MessageHandler) {
   handlers.add(handler)
@@ -95,8 +94,7 @@ function stopHeartbeat() {
 
 function scheduleReconnect() {
   if (reconnectTimer || serverShutdown) return
-  const delays = [1000, 2000, 4000, 8000, 16000] // max 5 attempts with exponential backoff
-  const delay = delays[Math.min(reconnectAttempts, delays.length - 1)]
+  const delay = RECONNECT_DELAYS_MS[Math.min(reconnectAttempts, RECONNECT_DELAYS_MS.length - 1)]
   reconnectAttempts++
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null

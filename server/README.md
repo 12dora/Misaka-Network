@@ -14,8 +14,8 @@ npm run dev
 
 默认监听：
 
-- HTTP API：`http://localhost:8080/api`
-- WebSocket：`ws://localhost:8080/ws`
+- HTTP API：`http://localhost:9080/api`
+- WebSocket：`ws://localhost:9080/ws`
 
 ## Docker 运行
 
@@ -25,26 +25,31 @@ npm run dev
 docker compose up -d --build
 ```
 
-如果 `8080` 被占用，可直接运行镜像并映射到其他端口：
+如果 `9080` 被占用，可直接运行镜像并映射到其他端口：
 
 ```bash
 docker build -t misaka-signaling ./server
-docker run -d --name misaka-signaling -p 18080:8080 misaka-signaling
+docker run -d --name misaka-signaling -p 19080:9080 misaka-signaling
 ```
 
 ## 环境变量
 
-```bash
-PORT=8080                # 容器/进程内监听端口
-MAX_NODES=10000          # 全局节点上限，0 或未设置表示不限制
-RATE_LIMIT_PER_MIN=60    # API 每分钟限流
-```
+所有配置集中在 [`src/config.ts`](src/config.ts)。以下为可通过环境变量覆盖的运行时参数：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `PORT` | `9080` | 监听端口 |
+| `MAX_NODES` | 不限制 | 全局节点上限，`0` 表示不限制 |
+| `RATE_LIMIT_PER_MIN` | `60` | API 每分钟限流次数（按 IP） |
+| `SESSION_TTL_MS` | `1800000` | 登录 token 有效期（毫秒），默认 30 分钟 |
+
+其余参数（节点锁定时长、清理间隔、举报阈值等）为编译时常量，直接在 `src/config.ts` 中修改。
 
 ## 自托管生产部署
 
 生产建议：
 
-- 信令服务跑在 Docker 内部端口 `8080`
+- 信令服务跑在 Docker 内部端口 `9080`
 - 反向代理提供 HTTPS / WSS
 - coturn 单独部署，作为 WebRTC 中继
 
@@ -80,7 +85,7 @@ server {
   server_name signal.example.com;
 
   location / {
-    proxy_pass http://127.0.0.1:8080;
+    proxy_pass http://127.0.0.1:9080;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;

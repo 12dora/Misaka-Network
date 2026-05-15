@@ -6,11 +6,9 @@ import {
   type TransferRecord,
 } from './db'
 import { encryptChunk, decryptChunk } from './crypto'
+import { CHUNK_SIZE, HIGH_WATER_MARK, LOW_WATER_MARK } from '@/constants'
 
-export const CHUNK_SIZE = 64 * 1024
-
-const HIGH_WATER_MARK = 16 * 1024 * 1024
-const LOW_WATER_MARK = 4 * 1024 * 1024
+export { CHUNK_SIZE }
 
 // ── Protocol types ───────────────────────────────────────────────────
 

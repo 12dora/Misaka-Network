@@ -64,7 +64,7 @@ npm install
 npm run dev
 ```
 
-默认：`http://localhost:8080`，WS：`ws://localhost:8080/ws`
+默认：`http://localhost:9080`，WS：`ws://localhost:9080/ws`
 
 2) 启动前端
 
@@ -74,7 +74,7 @@ npm install
 npm run dev
 ```
 
-默认：`http://localhost:5173`（开发代理 `/api` `/ws` 到 `8080`）
+默认：`http://localhost:5173`（开发代理 `/api` `/ws` 到 `9080`）
 
 ## 使用方法（最短路径）
 
