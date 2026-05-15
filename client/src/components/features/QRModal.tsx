@@ -3,6 +3,7 @@ import QRCode from 'qrcode'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
 import { useAuthStore } from '@/store/auth'
+import { apiUrl } from '@/config'
 import { playSound } from '@/lib/sound'
 import { appUrl } from '@/lib/appBase'
 
@@ -43,9 +44,10 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
     if (!session?.token) return
     setLoading(true)
     try {
-      const qrUrl = new URL('/api/qr-token', location.origin)
-      if (passCode) qrUrl.searchParams.set('passCode', passCode)
-      const res = await fetch(qrUrl.toString(), {
+      const qrUrl = apiUrl('/api/qr-token')
+      const qp = new URL(qrUrl, location.origin)
+      if (passCode) qp.searchParams.set('passCode', passCode)
+      const res = await fetch(qp.toString(), {
         headers: { Authorization: `Bearer ${session.token}` },
       })
       if (res.ok) {

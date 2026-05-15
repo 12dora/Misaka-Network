@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
+import { appUrl } from '@/lib/appBase'
 import jsQR from 'jsqr'
 
 interface Props {
@@ -172,8 +173,8 @@ export default function ScanModal({ onClose }: Props) {
       return true
     } catch {
       if (raw.startsWith('misaka://')) {
-        const httpUrl = raw.replace('misaka://', `${location.origin}/`)
-        window.location.href = httpUrl
+        const path = raw.slice('misaka://'.length) || '/'
+        window.location.href = appUrl(path.startsWith('/') ? path : `/${path}`)
         return true
       }
     }
