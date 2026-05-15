@@ -113,6 +113,28 @@ function NodeRadar({ peers, selected, unreadByPeer, onSelect, onShowQR, onCopyLi
   )
 }
 
+// ── Delivery status indicator (WhatsApp-style) ────────────────────
+function DeliveryStatus({ status, onRetry }: { status?: string; onRetry: () => void }) {
+  if (status === 'sending') return (
+    <span className="ml-1 text-[10px] opacity-40 select-none" title="发送中">⏳</span>
+  )
+  if (status === 'sent') return (
+    <span className="ml-1 text-[10px] opacity-50 select-none" title="已发送">✓</span>
+  )
+  if (status === 'delivered') return (
+    <span className="ml-1 text-[10px] select-none" style={{ color: 'var(--accent-cyan)' }} title="已送达">✓✓</span>
+  )
+  if (status === 'failed') return (
+    <button
+      onClick={onRetry}
+      className="ml-1 text-[10px] select-none"
+      style={{ color: 'var(--state-danger)', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}
+      title="发送失败，点击重试"
+    >↺</button>
+  )
+  return null
+}
+
 // ── Channel Chat ───────────────────────────────────────────────────
 function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
   const messages = useNetworkStore(s => s.chatMessages[peerSessionId] ?? [])
@@ -120,6 +142,7 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
   const recvTransfers = useNetworkStore(s => s.transfers.filter(t => t.peerSessionId === peerSessionId))
   const sendPendingFile = useNetworkStore(s => s.sendPendingFile)
   const clearPendingFile = useNetworkStore(s => s.setPendingFile)
+  const retryChatMessage = useNetworkStore(s => s.retryChatMessage)
   const bottomRef = useRef<HTMLDivElement>(null)
   const [downloadedIds, setDownloadedIds] = useState<Set<string>>(new Set())
 
@@ -211,6 +234,9 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
               </span>
               {!isSystem && <span className="mr-1 text-[10px] opacity-80">{mine ? '你' : '对方'}:</span>}
               {m.content}
+              {mine && m.type === 'text' && (
+                <DeliveryStatus status={m.status} onRetry={() => retryChatMessage(peerSessionId, m.id)} />
+              )}
             </div>
           </div>
         )
