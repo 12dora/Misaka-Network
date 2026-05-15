@@ -4,9 +4,9 @@ import path from 'path'
 
 export default defineConfig(({ mode }) => ({
   plugins: [react()],
-  // For GitHub Pages, set VITE_BASE=/your-repo-name/ in the deploy workflow.
-  // Local dev uses '/' (Vite proxy handles API/WS).
-  base: process.env.VITE_BASE ?? '/',
+  // Relative asset URLs let one build work at a custom domain root,
+  // a GitHub Pages repo path, or a self-hosted domain/path.
+  base: process.env.VITE_BASE ?? './',
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),

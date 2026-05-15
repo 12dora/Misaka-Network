@@ -4,6 +4,7 @@ import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
 import { useAuthStore } from '@/store/auth'
 import { playSound } from '@/lib/sound'
+import { appUrl } from '@/lib/appBase'
 
 interface Props {
   nodeId: number
@@ -22,8 +23,7 @@ function buildURL(
   fileSessionId?: string,
   channelId?: string,
 ) {
-  const appBase = import.meta.env.BASE_URL.replace(/\/$/, '')
-  const base = `${location.origin}${appBase}/join`
+  const base = appUrl('/join')
   const params = new URLSearchParams({ type, id: String(nodeId), t: qrToken })
   if (type === 'file' && fileSessionId) params.set('fid', fileSessionId)
   if (type === 'channel' && channelId) params.set('cid', channelId)

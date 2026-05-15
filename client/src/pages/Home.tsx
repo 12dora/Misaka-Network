@@ -3,9 +3,10 @@ import LoginCard from '@/components/features/LoginCard'
 import StatsDashboard from '@/components/features/StatsDashboard'
 import ActivityStream from '@/components/features/ActivityStream'
 import AppFooter from '@/components/ui/AppFooter'
+import { publicAssetUrl } from '@/lib/appBase'
 
-const HERO_CHARACTER = import.meta.env.BASE_URL + 'assets/misaka.webp'
-const HERO_TITLE     = import.meta.env.BASE_URL + 'assets/misaka-title.webp'
+const HERO_CHARACTER = publicAssetUrl('assets/misaka.webp')
+const HERO_TITLE     = publicAssetUrl('assets/misaka-title.webp')
 
 function HeroTitle({ width }: { width: CSSProperties['width'] }) {
   const outlineId = useId().replace(/:/g, '')

@@ -34,8 +34,6 @@ jobs:
 
       - name: Build
         run: cd client && npm run build
-        env:
-          VITE_BASE: /${{ github.event.repository.name }}/
 
       - name: Setup Pages
         uses: actions/configure-pages@v4

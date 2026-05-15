@@ -2,6 +2,7 @@ import { lazy, Suspense } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import TopNav from '@/components/layout/TopNav'
 import { useAuthStore } from '@/store/auth'
+import { appBasePath } from '@/lib/appBase'
 
 const Home = lazy(() => import('@/pages/Home'))
 const Network = lazy(() => import('@/pages/Network'))
@@ -16,9 +17,9 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
   return <>{children}</>
 }
 
-const basename = import.meta.env.BASE_URL.replace(/\/$/, '')
-
 export default function App() {
+  const basename = appBasePath()
+
   return (
     <BrowserRouter basename={basename}>
       <TopNav />
