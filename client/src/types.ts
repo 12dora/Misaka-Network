@@ -90,6 +90,7 @@ export type WSMessage =
   | { t: 'LEAVE_CHANNEL' }
   | { t: 'SIGNAL_SDP'; targetSessionId: string; sdp: RTCSessionDescriptionInit }
   | { t: 'SIGNAL_ICE'; targetSessionId: string; candidate: RTCIceCandidateInit }
+  | { t: 'SIGNAL_ICE_END'; targetSessionId: string }
   | { t: 'PING' }
   | { t: 'BLOCK'; sessionId: string }
 
@@ -97,6 +98,7 @@ export type WSServerMessage =
   | { t: 'WELCOME'; sessionId: string; myNodeId: number; sessionExpiresAt: number }
   | { t: 'SIGNAL_SDP'; fromSessionId: string; fromNodeId: number; sdp: RTCSessionDescriptionInit }
   | { t: 'SIGNAL_ICE'; fromSessionId: string; fromNodeId: number; candidate: RTCIceCandidateInit }
+  | { t: 'SIGNAL_ICE_END'; fromSessionId: string; fromNodeId: number }
   | { t: 'PEER_JOINED'; peer: { sessionId: string; nodeId: number; joinedAt: number }; shouldInitiate: boolean }
   | { t: 'PEER_LEFT'; sessionId: string; nodeId: number }
   | { t: 'ACTIVITY'; event: ActivityEvent }

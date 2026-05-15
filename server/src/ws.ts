@@ -13,7 +13,8 @@ const wsMessageSchema = z.discriminatedUnion('t', [
   z.object({ t: z.literal('JOIN_CLUSTER') }),
   z.object({ t: z.literal('LEAVE_CHANNEL') }),
   z.object({ t: z.literal('SIGNAL_SDP'),   targetSessionId: z.string().min(1).max(64), sdp:       z.object({}).passthrough() }),
-  z.object({ t: z.literal('SIGNAL_ICE'),   targetSessionId: z.string().min(1).max(64), candidate: z.object({}).passthrough() }),
+  z.object({ t: z.literal('SIGNAL_ICE'),     targetSessionId: z.string().min(1).max(64), candidate: z.object({}).passthrough() }),
+  z.object({ t: z.literal('SIGNAL_ICE_END'), targetSessionId: z.string().min(1).max(64) }),
   z.object({ t: z.literal('PING') }),
   z.object({ t: z.literal('BLOCK'),        sessionId:       z.string().min(1).max(64) }),
 ])
@@ -174,6 +175,15 @@ function handleMessage(ws: WebSocket, session: NodeSession, msg: z.infer<typeof 
         fromSessionId: session.sessionId,
         fromNodeId: session.nodeId,
         candidate: msg.candidate,
+      })
+      break
+
+    case 'SIGNAL_ICE_END':
+      if (!assertSameChannel(session, msg.targetSessionId)) return
+      forwardToSession(msg.targetSessionId, {
+        t: 'SIGNAL_ICE_END',
+        fromSessionId: session.sessionId,
+        fromNodeId: session.nodeId,
       })
       break
 

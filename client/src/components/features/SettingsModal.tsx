@@ -7,8 +7,17 @@ import {
   loadBlocklist, removeBlockedNode,
   type TurnServer, type TurnSettings, type Blocklist,
 } from '@/lib/turn'
+import { detectNatType, type NatDetectionResult } from '@/lib/nat'
 import { isSoundEnabled, setSoundEnabled, subscribeSoundPreference, playSound } from '@/lib/sound'
 import { ensureNotificationPermission } from '@/lib/notify'
+
+const NAT_TYPE_LABEL: Record<NatDetectionResult['type'], { label: string; color: string }> = {
+  open:      { label: '开放（无 NAT）',     color: 'var(--state-success)' },
+  cone:      { label: '锥型 NAT（可直连）', color: 'var(--state-success)' },
+  symmetric: { label: '对称 NAT（需 TURN）',color: 'var(--state-warn)' },
+  blocked:   { label: 'UDP 受限',          color: 'var(--state-warn)' },
+  unknown:   { label: '未知',              color: 'var(--text-muted)' },
+}
 
 interface Props {
   onClose: () => void
@@ -23,7 +32,19 @@ export default function SettingsModal({ onClose }: Props) {
   const [editingServer, setEditingServer] = useState<TurnServer | null>(null)
   const [testingId, setTestingId] = useState<string | null>(null)
   const [soundOn, setSoundOn] = useState(isSoundEnabled)
+  const [natResult, setNatResult] = useState<NatDetectionResult | null>(null)
+  const [natDetecting, setNatDetecting] = useState(false)
   const navigate = useNavigate()
+
+  async function handleDetectNat() {
+    setNatDetecting(true)
+    try {
+      const result = await detectNatType()
+      setNatResult(result)
+    } finally {
+      setNatDetecting(false)
+    }
+  }
 
   // Form state
   const [form, setForm] = useState({
@@ -173,6 +194,44 @@ export default function SettingsModal({ onClose }: Props) {
           {/* ── TURN Settings ───────────────────────────────── */}
           {tab === 'turn' && (
             <div className="flex flex-col gap-4">
+              {/* ── NAT type probe ──────────────────────────────── */}
+              <div
+                className="rounded-lg p-3 flex flex-col gap-2"
+                style={{ background: 'var(--surface-tint)', border: '1px solid var(--border-card)' }}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-kanji text-sm text-[var(--text-on-white)]">网络类型检测</span>
+                  <MisakaButton size="sm" onClick={handleDetectNat} disabled={natDetecting}>
+                    {natDetecting ? '检测中…' : (natResult ? '重新检测' : '开始检测')}
+                  </MisakaButton>
+                </div>
+                {natResult && (
+                  <div className="flex flex-col gap-1">
+                    <div className="flex items-center gap-2">
+                      <span
+                        className="inline-block px-2 py-0.5 rounded text-xs font-kanji text-white"
+                        style={{ background: NAT_TYPE_LABEL[natResult.type].color }}
+                      >
+                        {NAT_TYPE_LABEL[natResult.type].label}
+                      </span>
+                      {natResult.publicEndpoints.length > 0 && (
+                        <span className="font-mono text-[11px] text-[var(--text-muted)]">
+                          {natResult.publicEndpoints.length} 个公网映射
+                        </span>
+                      )}
+                    </div>
+                    <p className="font-kanji text-[11px] text-[var(--text-on-white-2)] leading-snug">
+                      {natResult.reason}
+                      {(natResult.type === 'symmetric' || natResult.type === 'blocked') && (
+                        <span className="block mt-1 text-[var(--state-warn)]">
+                          建议在下方启用 TURN 中继，否则与同类网络的对端可能无法直连。
+                        </span>
+                      )}
+                    </p>
+                  </div>
+                )}
+              </div>
+
               <p className="font-kanji text-xs text-[var(--text-on-white-2)] leading-relaxed">
                 当 STUN 穿透失败时通过 TURN 中继转发流量。中继消耗服务器带宽，请使用自己的 TURN 服务器。
               </p>
