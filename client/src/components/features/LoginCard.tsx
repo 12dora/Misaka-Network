@@ -98,7 +98,7 @@ export default function LoginCard() {
           onClose={() => setShowQR(false)}
         />
       )}
-      <MisakaCard padding="lg" className="w-full max-w-[420px]">
+      <MisakaCard padding="lg" className="w-full max-w-[420px] min-w-0 !p-5 xs:!p-6 sm:!p-8">
         <div className="flex items-center gap-2 mb-1">
           <span
             className="pulse-dot inline-block w-2.5 h-2.5 rounded-full"
@@ -184,7 +184,7 @@ export default function LoginCard() {
         </MisakaCard>
       </div>
     )}
-    <MisakaCard padding="lg" className="w-full max-w-[420px]">
+    <MisakaCard padding="lg" className="w-full max-w-[420px] min-w-0 overflow-hidden !p-5 xs:!p-6 sm:!p-8">
       {/* Header */}
       <div className="flex items-center gap-2 mb-1">
         <MisakaKanjiBlock char="同" size="md" />
@@ -201,15 +201,15 @@ export default function LoginCard() {
         <label className="block text-xs font-kanji text-[var(--text-on-white-2)] mb-1.5">
           ◇ 节点编号
         </label>
-        <div className="flex items-center gap-2">
-          <span className="font-kanji text-sm text-[var(--text-on-white-2)]">御坂</span>
+        <div className="grid items-center gap-1.5 xs:gap-2" style={{ gridTemplateColumns: 'auto minmax(0, 1fr) auto auto' }}>
+          <span className="font-kanji text-xs xs:text-sm text-[var(--text-on-white-2)] shrink-0">御坂</span>
           <input
             type="number"
             min={1}
             max={20001}
             value={identity.nodeId}
             onChange={e => handleNodeIdChange(e.target.value)}
-            className="flex-1 px-3 py-2 rounded-lg border text-center font-mono font-bold text-lg text-[var(--text-on-white)] focus:outline-none transition-colors"
+            className="min-w-0 flex-1 px-3 py-2 rounded-lg border text-center font-mono font-bold text-lg text-[var(--text-on-white)] focus:outline-none transition-colors"
             style={{
               borderColor: 'var(--border-card)',
               background: 'var(--surface)',
@@ -217,10 +217,10 @@ export default function LoginCard() {
             onFocus={e => (e.target.style.borderColor = 'var(--bg-deep)')}
             onBlur={e => (e.target.style.borderColor = 'var(--border-card)')}
           />
-          <span className="font-kanji text-sm text-[var(--text-on-white-2)]">号</span>
+          <span className="font-kanji text-xs xs:text-sm text-[var(--text-on-white-2)] shrink-0">号</span>
           <button
             onClick={regenerateNodeId}
-            className="w-8 h-8 rounded-full flex items-center justify-center transition-transform hover:rotate-180 duration-300 cursor-pointer"
+            className="w-8 h-8 rounded-full flex items-center justify-center transition-transform hover:rotate-180 duration-300 cursor-pointer shrink-0"
             style={{ background: 'var(--surface-tint)', color: 'var(--bg-deep)', border: 'none' }}
             title="重新生成"
           >
@@ -244,7 +244,7 @@ export default function LoginCard() {
         <label className="block text-xs font-kanji text-[var(--text-on-white-2)] mb-1.5">
           ◇ 通行码
         </label>
-        <div className="flex items-center gap-1.5">
+        <div className="grid items-center gap-1.5" style={{ gridTemplateColumns: 'repeat(6, minmax(0, 1fr)) auto' }}>
           {getPassChars().map((digit, i) => (
             <input
               key={i}
@@ -262,7 +262,7 @@ export default function LoginCard() {
                 e.target.select()
               }}
               onBlur={e => (e.target.style.borderColor = 'var(--border-card)')}
-              className="w-10 h-12 text-center font-mono font-bold text-lg rounded-lg border focus:outline-none transition-colors"
+              className="w-full min-w-0 h-11 xs:h-12 text-center font-mono font-bold text-lg rounded-lg border focus:outline-none transition-colors"
               style={{
                 borderColor: 'var(--border-card)',
                 background: 'var(--surface)',
@@ -272,7 +272,7 @@ export default function LoginCard() {
           ))}
           <button
             onClick={regeneratePassCode}
-            className="w-8 h-8 rounded-full flex items-center justify-center hover:rotate-180 duration-300 transition-transform cursor-pointer ml-1"
+            className="w-8 h-8 rounded-full flex items-center justify-center hover:rotate-180 duration-300 transition-transform cursor-pointer ml-1 shrink-0"
             style={{ background: 'var(--surface-tint)', color: 'var(--bg-deep)', border: 'none' }}
             title="重新生成"
           >

@@ -1,4 +1,4 @@
 {
-  "API_BASE": "",
-  "WS_URL": ""
+  "API_BASE": "https://misaka.example.org",
+  "WS_URL": "wss://misaka.example.org/ws"
 }
