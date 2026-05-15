@@ -71,12 +71,15 @@ export interface Transfer {
 }
 
 // ── Channel Message ───────────────────────────────────────────────
+export type MessageStatus = 'sending' | 'sent' | 'delivered' | 'failed'
+
 export interface ChannelMessage {
   id: string
   type: 'system' | 'text' | 'file'
   content: string
   timestamp: number
   direction: 'sent' | 'recv' | 'system'
+  status?: MessageStatus   // only meaningful for direction='sent' text messages
   // file-type only
   fileName?: string
   fileSize?: number

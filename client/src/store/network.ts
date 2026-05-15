@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { Peer, Transfer, NodeStatus, ChannelMessage } from '@/types'
+import type { Peer, Transfer, NodeStatus, ChannelMessage, MessageStatus } from '@/types'
 import {
   connect as wsConnect, disconnect as wsDisconnect, send as wsSend,
   onMessage, onConnect, onDisconnect,
@@ -49,10 +49,18 @@ const deliveredTransfers = new Set<string>()  // one file card per transferId
 
 // Messages typed before the DC fully opened, flushed in dc.onopen.
 const outgoingQueue = new Map<string, string[]>()
-function queueOutgoing(peerSessionId: string, payload: string) {
+// Track msgIds in outgoingQueue so we can update their status on flush or failure.
+const queuedMessageIds = new Map<string, Set<string>>()
+
+function queueOutgoing(peerSessionId: string, payload: string, msgId?: string) {
   const q = outgoingQueue.get(peerSessionId) ?? []
   q.push(payload)
   outgoingQueue.set(peerSessionId, q)
+  if (msgId) {
+    const ids = queuedMessageIds.get(peerSessionId) ?? new Set<string>()
+    ids.add(msgId)
+    queuedMessageIds.set(peerSessionId, ids)
+  }
 }
 function flushOutgoing(peerSessionId: string, dc: RTCDataChannel) {
   const q = outgoingQueue.get(peerSessionId)
@@ -60,6 +68,32 @@ function flushOutgoing(peerSessionId: string, dc: RTCDataChannel) {
   for (const p of q) {
     try { dc.send(p) } catch { /* ignore */ }
   }
+  outgoingQueue.delete(peerSessionId)
+  // All queued messages are now in-flight → mark as 'sent'.
+  const ids = queuedMessageIds.get(peerSessionId)
+  if (ids) {
+    for (const id of ids) updateMessageStatus(peerSessionId, id, 'sent')
+    queuedMessageIds.delete(peerSessionId)
+  }
+}
+
+function updateMessageStatus(peerSessionId: string, msgId: string, status: MessageStatus) {
+  useNetworkStore.setState(s => ({
+    chatMessages: {
+      ...s.chatMessages,
+      [peerSessionId]: (s.chatMessages[peerSessionId] ?? []).map(m =>
+        m.id === msgId ? { ...m, status } : m,
+      ),
+    },
+  }))
+}
+
+// Mark queued messages as failed (e.g. peer went offline before DC opened).
+function failPendingMessages(peerSessionId: string) {
+  const ids = queuedMessageIds.get(peerSessionId)
+  if (!ids?.size) return
+  for (const id of ids) updateMessageStatus(peerSessionId, id, 'failed')
+  queuedMessageIds.delete(peerSessionId)
   outgoingQueue.delete(peerSessionId)
 }
 
@@ -90,6 +124,7 @@ interface NetworkState {
   resumeTransfer: (transferId: string, peerSessionId: string) => Promise<void>
   cancelTransferAction: (transferId: string) => void
   sendChatMessage: (peerSessionId: string, text: string) => void
+  retryChatMessage: (peerSessionId: string, msgId: string) => void
   blockPeer: (sessionId: string) => void
 }
 
@@ -250,24 +285,42 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
   sendChatMessage(peerSessionId, text) {
     const msg: ChannelMessage = {
       id: genMsgId(), type: 'text', content: text, timestamp: Date.now(),
-      direction: 'sent',
+      direction: 'sent', status: 'sending',
     }
-    // Always reflect the user's own message locally first — even if the DC
-    // isn't open yet — so the chat box doesn't look like the click was lost.
-    set(s => {
-      const msgs = [...(s.chatMessages[peerSessionId] ?? []), msg]
-      return { chatMessages: { ...s.chatMessages, [peerSessionId]: msgs } }
-    })
+    set(s => ({
+      chatMessages: { ...s.chatMessages, [peerSessionId]: [...(s.chatMessages[peerSessionId] ?? []), msg] },
+    }))
 
-    const payload = JSON.stringify({
-      type: 'chat', id: msg.id, content: msg.content, timestamp: msg.timestamp,
-    })
+    const payload = JSON.stringify({ type: 'chat', id: msg.id, content: msg.content, timestamp: msg.timestamp })
     const dc = dataChannels.get(peerSessionId)
-    if (dc && dc.readyState === 'open') {
-      dc.send(payload)
+    if (dc?.readyState === 'open') {
+      try {
+        dc.send(payload)
+        updateMessageStatus(peerSessionId, msg.id, 'sent')
+      } catch {
+        updateMessageStatus(peerSessionId, msg.id, 'failed')
+      }
     } else {
-      // Will be flushed in flushOutgoing on DC open.
-      queueOutgoing(peerSessionId, payload)
+      // Queued — will be flushed and marked 'sent' when the DC opens.
+      queueOutgoing(peerSessionId, payload, msg.id)
+    }
+  },
+
+  retryChatMessage(peerSessionId, msgId) {
+    const msg = get().chatMessages[peerSessionId]?.find(m => m.id === msgId)
+    if (!msg || msg.type !== 'text') return
+    updateMessageStatus(peerSessionId, msgId, 'sending')
+    const payload = JSON.stringify({ type: 'chat', id: msg.id, content: msg.content, timestamp: msg.timestamp })
+    const dc = dataChannels.get(peerSessionId)
+    if (dc?.readyState === 'open') {
+      try {
+        dc.send(payload)
+        updateMessageStatus(peerSessionId, msgId, 'sent')
+      } catch {
+        updateMessageStatus(peerSessionId, msgId, 'failed')
+      }
+    } else {
+      queueOutgoing(peerSessionId, payload, msgId)
     }
   },
 
@@ -532,11 +585,15 @@ function handleIceStateChange(pc: RTCPeerConnection, peerSessionId: string) {
     iceRestartAttempts.set(peerSessionId, 0)
     void onIceConnected(pc, peerSessionId)
   } else if (state === 'disconnected') {
+    const prevStatus = useNetworkStore.getState().peers.find(p => p.sessionId === peerSessionId)?.status
     useNetworkStore.setState(s => ({
       peers: s.peers.map(p =>
         p.sessionId === peerSessionId ? { ...p, status: 'reconnecting' as NodeStatus } : p,
       ),
     }))
+    if (prevStatus === 'transferring') {
+      appendSystemChat(peerSessionId, '⚠ 连接中断，尝试恢复中…')
+    }
     // Schedule a proactive restart instead of waiting ~30s for 'failed'.
     if (!disconnectedTimers.has(peerSessionId)) {
       const t = setTimeout(() => {
@@ -604,12 +661,18 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
   }
 
   const handleOpen = async () => {
+    // Show reconnection notice if there was prior chat activity.
+    const prevMsgs = useNetworkStore.getState().chatMessages[peerSessionId] ?? []
+    const isReconnect = prevMsgs.some(m => m.type !== 'system')
     useNetworkStore.setState(s => ({
       peers: s.peers.map(p =>
         p.sessionId === peerSessionId ? { ...p, status: 'transferring' as const } : p,
       ),
       connectedPeers: new Set([...s.connectedPeers, peerSessionId]),
     }))
+    if (isReconnect) {
+      appendSystemChat(peerSessionId, '✓ 连接已恢复')
+    }
     try {
       const pub = await getMyPublicKey()
       dc.send(JSON.stringify({ type: 'ecdh-pub', pub }))
@@ -739,6 +802,13 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
                 : s.unreadByPeer,
             }
           })
+          // Acknowledge receipt so the sender's UI can show "delivered".
+          try { dc.send(JSON.stringify({ type: 'msg-ack', id: msg.id })) } catch { /* ignore */ }
+          return
+        }
+
+        if (msg.type === 'msg-ack') {
+          updateMessageStatus(peerSessionId, msg.id, 'delivered')
           return
         }
       } catch { /* not JSON */ }
@@ -755,6 +825,8 @@ async function attemptIceRestart(peerSessionId: string) {
         p.sessionId === peerSessionId ? { ...p, status: 'offline' as NodeStatus } : p,
       ),
     }))
+    failPendingMessages(peerSessionId)
+    appendSystemChat(peerSessionId, '连接已断开，未送达的消息可点击 ↺ 重试')
     return
   }
 
@@ -895,6 +967,7 @@ async function sendResumeRequests(peerSessionId: string, dc: RTCDataChannel) {
 }
 
 function cleanupPeerConnection(sessionId: string) {
+  failPendingMessages(sessionId)
   iceRestartAttempts.delete(sessionId)
   iceRestarting.delete(sessionId)
   clearDisconnectedTimer(sessionId)
