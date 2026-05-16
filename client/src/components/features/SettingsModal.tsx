@@ -11,6 +11,7 @@ import {
 import { detectNatType, type NatDetectionResult } from '@/lib/nat'
 import { isSoundEnabled, setSoundEnabled, subscribeSoundPreference, playSound } from '@/lib/sound'
 import { ensureNotificationPermission } from '@/lib/notify'
+import { useModalExit } from '@/hooks/useModalExit'
 
 const NAT_TYPE_LABEL: Record<NatDetectionResult['type'], { label: string; color: string }> = {
   open:      { label: '开放（无 NAT）',     color: 'var(--state-success)' },
@@ -58,6 +59,7 @@ export default function SettingsModal({ onClose }: Props) {
   const [turnStatus, setTurnStatus] = useState<TurnStatusView | null>(null)
   const [autoTurnActive, setAutoTurnActive] = useState(getAutoTurnState())
   const navigate = useNavigate()
+  const modal = useModalExit(onClose)
 
   // Poll server TURN status while the TURN tab is open — cheap (no secrets),
   // gives the user live view of the kill switch + monthly burn.
@@ -171,17 +173,17 @@ export default function SettingsModal({ onClose }: Props) {
   }
 
   function handleBackdrop(e: React.MouseEvent<HTMLDivElement>) {
-    if (e.target === e.currentTarget) onClose()
+    if (e.target === e.currentTarget) modal.requestClose()
   }
 
   return (
     <div
-      className="fixed inset-0 z-[100] flex items-center justify-center p-4"
+      className={`fixed inset-0 z-[100] flex items-center justify-center p-4 ${modal.backdropClass}`}
       style={{ background: 'rgba(14,42,107,0.55)', backdropFilter: 'blur(8px)' }}
       onClick={handleBackdrop}
     >
       <div
-        className="relative flex flex-col rounded-2xl"
+        className={`relative flex flex-col rounded-2xl ${modal.panelClass}`}
         style={{
           background: 'var(--surface)',
           boxShadow: 'var(--shadow-float)',
@@ -203,7 +205,7 @@ export default function SettingsModal({ onClose }: Props) {
           <button
             className="w-7 h-7 flex items-center justify-center rounded-full cursor-pointer hover:opacity-70 transition-opacity"
             style={{ border: 'none', background: 'var(--surface-tint)', color: 'var(--text-on-white)' }}
-            onClick={onClose}
+            onClick={modal.requestClose}
           >
             ✕
           </button>
@@ -585,11 +587,11 @@ export default function SettingsModal({ onClose }: Props) {
               </div>
               <div className="flex flex-col gap-2">
                 <MisakaButton variant="pill" size="sm" fullWidth
-                  onClick={() => { onClose(); navigate('/tos') }}>
+                  onClick={() => { modal.requestClose(); window.setTimeout(() => navigate('/tos'), 180) }}>
                   服务条款
                 </MisakaButton>
                 <MisakaButton variant="pill" size="sm" fullWidth
-                  onClick={() => { onClose(); navigate('/privacy') }}>
+                  onClick={() => { modal.requestClose(); window.setTimeout(() => navigate('/privacy'), 180) }}>
                   隐私政策
                 </MisakaButton>
               </div>

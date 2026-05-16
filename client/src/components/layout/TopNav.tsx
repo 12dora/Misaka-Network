@@ -127,12 +127,17 @@ export default function TopNav() {
 
           {/* Settings */}
           <button
-            className="w-8 h-8 inline-flex items-center justify-center rounded-full cursor-pointer hover:opacity-70 transition-opacity leading-none"
-            style={{ border: 'none', background: 'transparent', fontSize: '1.1rem', lineHeight: 1 }}
+            className="w-8 h-8 inline-grid place-items-center rounded-full cursor-pointer hover:opacity-70 transition-opacity leading-none"
+            style={{ border: 'none', background: 'transparent', lineHeight: 0, padding: 0 }}
             onClick={() => setShowSettings(true)}
             aria-label="设置"
           >
-            ⚙
+            <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path
+                d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0 0-7.6Zm8.2 4.7v-1.8l-2.1-.4a6.7 6.7 0 0 0-.7-1.7l1.2-1.8-1.3-1.3-1.8 1.2a6.7 6.7 0 0 0-1.7-.7L13.4 4h-1.8l-.4 2.1a6.7 6.7 0 0 0-1.7.7L7.7 5.6 6.4 6.9 7.6 8.7a6.7 6.7 0 0 0-.7 1.7l-2.1.4v1.8l2.1.4c.2.6.4 1.2.7 1.7l-1.2 1.8 1.3 1.3 1.8-1.2c.5.3 1.1.5 1.7.7l.4 2.1h1.8l.4-2.1c.6-.2 1.2-.4 1.7-.7l1.8 1.2 1.3-1.3-1.2-1.8c.3-.5.5-1.1.7-1.7l2.1-.4Z"
+                fill="currentColor"
+              />
+            </svg>
           </button>
 
           {/* Status */}

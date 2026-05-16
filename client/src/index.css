@@ -312,6 +312,46 @@ body {
   animation: channel-enter 0.28s ease-out;
 }
 
+@keyframes page-enter {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.page-enter {
+  animation: page-enter 0.24s ease-out both;
+}
+
+@keyframes modal-backdrop-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.modal-backdrop-in {
+  animation: modal-backdrop-in 0.18s ease-out both;
+}
+
+@keyframes modal-panel-in {
+  from { opacity: 0; transform: translateY(14px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+.modal-panel-in {
+  animation: modal-panel-in 0.22s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+@keyframes modal-backdrop-out {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+.modal-backdrop-out {
+  animation: modal-backdrop-out 0.18s ease-in both;
+}
+
+@keyframes modal-panel-out {
+  from { opacity: 1; transform: translateY(0) scale(1); }
+  to   { opacity: 0; transform: translateY(10px) scale(0.985); }
+}
+.modal-panel-out {
+  animation: modal-panel-out 0.18s ease-in both;
+}
+
 @keyframes lore-log-drift {
   0%, 18% { transform: translateY(0); }
   82%, 100% { transform: translateY(-28px); }

@@ -38,7 +38,7 @@ process.env.TURN_BAN_DURATION_SEC = '60'
 // Stub global fetch for CF endpoints
 const originalFetch = globalThis.fetch
 globalThis.fetch = async (url, _init) => {
-  if (typeof url === 'string' && url.includes('credentials/generate-ica')) {
+  if (typeof url === 'string' && url.includes('credentials/generate')) {
     return new Response(JSON.stringify({
       iceServers: {
         urls: ['turn:turn.cloudflare.com:3478'],

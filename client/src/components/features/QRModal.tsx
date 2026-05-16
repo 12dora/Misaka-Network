@@ -6,6 +6,7 @@ import { useAuthStore } from '@/store/auth'
 import { apiUrl } from '@/config'
 import { playSound } from '@/lib/sound'
 import { appUrl } from '@/lib/appBase'
+import { useModalExit } from '@/hooks/useModalExit'
 
 interface Props {
   nodeId: number
@@ -38,11 +39,15 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
   const [expiresAt, setExpiresAt] = useState<number>(0)
   const [includePass, setIncludePass] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [qrError, setQrError] = useState<string | null>(null)
+  const [qrImageUrl, setQrImageUrl] = useState<string | null>(null)
   const session = useAuthStore(s => s.session)
+  const modal = useModalExit(onClose)
 
   const fetchToken = useCallback(async () => {
     if (!session?.token) return
     setLoading(true)
+    setQrError(null)
     try {
       const qrUrl = apiUrl('/api/qr-token')
       const qp = new URL(qrUrl, location.origin)
@@ -57,8 +62,12 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
         playSound('scan')
         // No channel-switch needed: clusters are now identity-scoped, so a
         // scanner who joins with the same nodeId+passcode lands automatically.
+      } else {
+        setQrError(`QR 令牌获取失败（HTTP ${res.status}）`)
       }
-    } catch { /* ignore */ }
+    } catch {
+      setQrError('QR 令牌获取失败，请检查后端连接')
+    }
     setLoading(false)
   }, [session?.token])
 
@@ -71,10 +80,23 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
     const canvas = canvasRef.current
     if (!canvas || !qrToken) return
     const url = buildURL(qrType, nodeId, qrToken, includePass ? passCode : undefined, fileSessionId, channelId)
+    setQrError(null)
     QRCode.toCanvas(canvas, url, {
       width: 220,
       margin: 2,
       color: { dark: '#0E2A6B', light: '#FFFFFF' },
+    }, (err) => {
+      if (!err) {
+        setQrImageUrl(canvas.toDataURL('image/png'))
+        return
+      }
+      QRCode.toDataURL(url, {
+        width: 220,
+        margin: 2,
+        color: { dark: '#0E2A6B', light: '#FFFFFF' },
+      })
+        .then(setQrImageUrl)
+        .catch(() => setQrError('QR 渲染失败，请刷新重试'))
     })
   }, [qrToken, nodeId, passCode, includePass, qrType, fileSessionId, channelId])
 
@@ -85,7 +107,7 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
   }
 
   function handleBackdrop(e: React.MouseEvent<HTMLDivElement>) {
-    if (e.target === e.currentTarget) onClose()
+    if (e.target === e.currentTarget) modal.requestClose()
   }
 
   const qrLabel = {
@@ -96,12 +118,12 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
 
   return (
     <div
-      className="fixed inset-0 z-[100] flex items-center justify-center p-4"
+      className={`fixed inset-0 z-[100] flex items-center justify-center p-4 ${modal.backdropClass}`}
       style={{ background: 'rgba(14,42,107,0.75)', backdropFilter: 'blur(10px)' }}
       onClick={handleBackdrop}
     >
       <div
-        className="relative flex flex-col items-center gap-5 rounded-2xl p-8"
+        className={`relative flex flex-col items-center gap-5 rounded-2xl p-8 ${modal.panelClass}`}
         style={{
           background: 'var(--surface)',
           boxShadow: 'var(--shadow-float)',
@@ -114,7 +136,7 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
         <button
           className="absolute top-4 right-4 w-7 h-7 flex items-center justify-center rounded-full cursor-pointer hover:opacity-70 transition-opacity"
           style={{ border: 'none', background: 'var(--surface-tint)', color: 'var(--text-on-white)' }}
-          onClick={onClose}
+          onClick={modal.requestClose}
           aria-label="关闭"
         >
           ✕
@@ -150,9 +172,15 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
             <div className="w-[220px] h-[220px] flex items-center justify-center">
               <span className="font-kanji text-sm text-[var(--text-muted)]">生成中…</span>
             </div>
+          ) : qrError ? (
+            <div className="w-[220px] h-[220px] flex flex-col items-center justify-center gap-2 px-4 text-center">
+              <MisakaKanjiBlock char="失" size="lg" />
+              <span className="font-kanji text-sm text-[var(--state-danger)]">{qrError}</span>
+            </div>
           ) : (
             <>
-              <canvas ref={canvasRef} />
+              <canvas ref={canvasRef} width={220} height={220} className={qrImageUrl ? 'hidden' : ''} />
+              {qrImageUrl && <img src={qrImageUrl} alt="接入 QR" width={220} height={220} />}
               <div className="scan-line" />
               <div
                 className="absolute inset-0 flex items-center justify-center pointer-events-none"
@@ -212,7 +240,7 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
           </MisakaButton>
         </div>
 
-        <MisakaButton variant="pill" size="sm" fullWidth onClick={onClose}>
+        <MisakaButton variant="pill" size="sm" fullWidth onClick={modal.requestClose}>
           关闭
         </MisakaButton>
       </div>

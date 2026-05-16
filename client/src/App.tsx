@@ -1,5 +1,5 @@
 import { lazy, Suspense } from 'react'
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import TopNav from '@/components/layout/TopNav'
 import { useAuthStore } from '@/store/auth'
 import { appBasePath } from '@/lib/appBase'
@@ -23,12 +23,22 @@ export default function App() {
   return (
     <BrowserRouter basename={basename}>
       <TopNav />
-      <Suspense fallback={
-        <div className="min-h-screen pt-24 text-center font-kanji text-sm" style={{ background: 'var(--bg-primary)', color: 'var(--text-on-blue)' }}>
-          正在同步网络…
-        </div>
-      }>
-        <Routes>
+      <AnimatedRoutes />
+    </BrowserRouter>
+  )
+}
+
+function AnimatedRoutes() {
+  const location = useLocation()
+
+  return (
+    <Suspense fallback={
+      <div className="min-h-screen pt-24 text-center font-kanji text-sm page-enter" style={{ background: 'var(--bg-primary)', color: 'var(--text-on-blue)' }}>
+        正在同步网络…
+      </div>
+    }>
+      <div key={location.pathname} className="page-enter">
+        <Routes location={location}>
           <Route path="/" element={<Home />} />
           <Route path="/join" element={<Join />} />
           <Route path="/network" element={
@@ -39,7 +49,7 @@ export default function App() {
           <Route path="/privacy" element={<Privacy />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
-      </Suspense>
-    </BrowserRouter>
+      </div>
+    </Suspense>
   )
 }

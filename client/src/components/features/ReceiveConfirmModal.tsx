@@ -37,12 +37,12 @@ export default function ReceiveConfirmModal({ transfer, onAccept, onReject, onBl
 
   return (
     <div
-      className="fixed inset-0 z-[110] flex items-center justify-center p-4"
+      className="fixed inset-0 z-[110] flex items-center justify-center p-4 modal-backdrop-in"
       style={{ background: 'rgba(14,42,107,0.55)', backdropFilter: 'blur(8px)' }}
     >
       {/* Modal card */}
       <div
-        className="relative flex flex-col items-center gap-5 rounded-2xl p-8 card-in"
+        className="relative flex flex-col items-center gap-5 rounded-2xl p-8 modal-panel-in"
         style={{
           background: 'var(--surface)',
           boxShadow: 'var(--shadow-float)',
