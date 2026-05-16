@@ -203,6 +203,61 @@ npm run build
 }
 ```
 
+## 测试
+
+### 快速开始
+
+```bash
+# 安装所有依赖
+npm run install:all
+
+# 运行全部测试（服务端集成 + 客户端单元/契约）
+npm test
+
+# 仅服务端
+npm --prefix server test
+
+# 仅客户端
+npm --prefix client test
+
+# 端到端测试（Playwright，自动启动 server + Vite）
+npm run test:e2e
+```
+
+### 目录结构
+
+```text
+├── server/tests/        # 服务端集成测试 (Node.js spawn + fetch + WS)
+│   ├── register-edge.test.mjs   # /api/register schema 校验、多设备、Bearer 保护
+│   ├── brute-force.test.mjs     # 通行码穷举锁定、IP 上限、速率限制
+│   ├── ws-auth.test.mjs         # WS AUTH 4001/4002 关闭码
+│   ├── signaling-end.test.mjs   # SIGNAL_ICE_END 转发 + 跨 channel 隔离
+│   ├── turn-policy.test.mjs     # TURN 颁发门控 (deny list / IP cap / 熔断)
+│   ├── turn-lifecycle.test.mjs  # deny list 过期、月度滚月、永久封禁
+│   └── turn-http.test.mjs       # /api/turn-status / /api/turn-credentials HTTP 形态
+├── client/tests/unit/           # 客户端 Vitest 单测 (jsdom)
+│   ├── nat-classify.test.ts     # NAT 分类纯函数
+│   ├── authedFetch.test.ts      # authedFetch 401 自愈状态机
+│   └── transfer-frame.test.ts   # chunk 帧编码 / IV 派生 / AES-GCM round-trip
+├── client/tests/e2e/            # Playwright 端到端 (真实 server + 真实 WebRTC)
+│   ├── transfer.spec.ts         # 两 peer 单文件 / 多文件传输
+│   └── auth-recovery.spec.ts    # authedFetch 401 自愈 (QR 路径)
+├── client/tests/ui-contract.test.mjs   # 前端关键行为源码契约
+└── client/tests/manual-test.mjs        # 人工 Playwright 调试入口
+```
+
+### 查看覆盖率
+
+```bash
+cd client
+npm run test:unit -- --coverage
+# 打开 coverage/index.html
+```
+
+### CI
+
+PR 必须通过 `.github/workflows/test.yml` 中全部 job 才能合并。改动了 `src/` 但未改动 `tests/` 的 PR 会被 `guard-tests-touched` job 拦截（可用 `[skip-test-guard]` 显式放行）。
+
 ## 文档入口
 
 - 总览：`docs/00-overview.md`

@@ -7,7 +7,11 @@
     "dev": "tsx watch src/bootstrap.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && npm run test:integration && npm run test:turn",
+    "test:integration": "node tests/register-edge.test.mjs && node tests/brute-force.test.mjs && node tests/signaling-end.test.mjs && node tests/ws-auth.test.mjs",
+    "test:turn": "node tests/turn-policy.test.mjs && node tests/turn-lifecycle.test.mjs && node tests/turn-http.test.mjs",
+    "test:stress": "node tests/stress-1gb.test.mjs"
   },
   "dependencies": {
     "cors": "^2.8.5",

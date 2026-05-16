@@ -1,0 +1,15 @@
+{
+  "name": "misaka-network",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Top-level wrapper for the misaka-network test suite. Not a workspace — each sub-project (client/ server/) keeps its own package.json and lockfile. This file only orchestrates `npm test` and a CI guard script.",
+  "scripts": {
+    "test": "npm run test:server && npm run test:client",
+    "test:server": "npm --prefix server test",
+    "test:client": "npm --prefix client test",
+    "test:e2e": "npm --prefix client run test:e2e",
+    "test:all": "npm run test && npm run test:e2e",
+    "install:all": "npm --prefix server install && npm --prefix client install",
+    "guard:tests-touched": "node scripts/guard-tests-touched.mjs"
+  }
+}
