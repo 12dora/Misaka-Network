@@ -97,6 +97,7 @@ export async function sendFile(
   file: File,
   transferId: string,
   peerNodeId: number,
+  peerSessionId: string,
   existingRecord?: TransferRecord, // for resume
   callbacks?: SendCallbacks,
   peerReceivedChunks?: number[], // actual chunks the receiver reports having
@@ -175,7 +176,7 @@ export async function sendFile(
     const raw = await file.slice(start, end).arrayBuffer()
 
     // Encrypt
-    const { iv, encrypted } = await encryptChunk(raw)
+    const { iv, encrypted } = await encryptChunk(raw, peerSessionId)
 
     // Send header as text
     dc.send(JSON.stringify({
@@ -225,13 +226,14 @@ export async function sendFileParallel(
   file: File,
   transferId: string,
   peerNodeId: number,
+  peerSessionId: string,
   existingRecord?: TransferRecord,
   callbacks?: SendCallbacks,
   peerReceivedChunks?: number[],
 ): Promise<void> {
   const lanes = dcs.filter(dc => dc.readyState === 'open').slice(0, TRANSFER_LANE_COUNT)
   if (lanes.length <= 1) {
-    await sendFile(lanes[0] ?? dcs[0], file, transferId, peerNodeId, existingRecord, callbacks, peerReceivedChunks)
+    await sendFile(lanes[0] ?? dcs[0], file, transferId, peerNodeId, peerSessionId, existingRecord, callbacks, peerReceivedChunks)
     return
   }
 
@@ -320,7 +322,7 @@ export async function sendFileParallel(
       const start = i * CHUNK_SIZE
       const end = Math.min(start + CHUNK_SIZE, file.size)
       const raw = await file.slice(start, end).arrayBuffer()
-      const { iv, encrypted } = await encryptChunk(raw)
+      const { iv, encrypted } = await encryptChunk(raw, peerSessionId)
 
       await waitForBuffer(dc)
       dc.send(JSON.stringify({
@@ -420,6 +422,7 @@ export async function receiveChunk(
   header: ChunkHeader,
   iv: Uint8Array<ArrayBuffer>,
   encrypted: ArrayBuffer,
+  peerSessionId: string,
   callbacks?: ReceiveCallbacks,
 ): Promise<{ ack: AckMessage; decrypted: ArrayBuffer; storageMode: 'stream' | 'indexeddb' } | undefined> {
   const session = receiveSessions.get(transferId)
@@ -437,7 +440,7 @@ export async function receiveChunk(
   }
 
   // Decrypt
-  const decrypted = await decryptChunk(iv, encrypted)
+  const decrypted = await decryptChunk(iv, encrypted, peerSessionId)
 
   const hasStreamingTarget = getWriteHandle(transferId) || getOPFSHandle(transferId)
   if (session.storageMode === 'pending') {

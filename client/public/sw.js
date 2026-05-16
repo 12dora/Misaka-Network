@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'misaka-shell-v2'
+const CACHE_VERSION = 'misaka-shell-v3'
 const APP_SHELL = [
   './',
   './index.html',
@@ -47,8 +47,6 @@ self.addEventListener('fetch', (event) => {
   }
 
   event.respondWith((async () => {
-    const cached = await caches.match(req)
-    if (cached) return cached
     try {
       const fresh = await fetch(req)
       if (fresh.ok && (req.destination === 'script' || req.destination === 'style' || req.destination === 'image' || req.destination === 'font')) {
@@ -57,6 +55,8 @@ self.addEventListener('fetch', (event) => {
       }
       return fresh
     } catch {
+      const cached = await caches.match(req)
+      if (cached) return cached
       return new Response('Offline', { status: 503, statusText: 'Offline' })
     }
   })())
