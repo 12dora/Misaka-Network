@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import type { Identity, Session } from '@/types'
 import { apiUrl } from '@/config'
 import { NODE_ID_MIN, NODE_ID_MAX } from '@/constants'
+import { onAuthInvalid } from '@/lib/signaling'
 
 function randomInt(min: number, max: number) {
   return Math.floor(Math.random() * (max - min + 1)) + min
@@ -54,6 +55,7 @@ interface AuthState {
   regeneratePassCode: () => void
   connect: () => Promise<void>
   disconnect: () => Promise<void>
+  clearSession: () => void
   releaseAllFromIp: () => Promise<number>
   dismissIpFullPrompt: () => void
 }
@@ -165,6 +167,11 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     set({ ipFullPrompt: false })
   },
 
+  clearSession() {
+    sessionStorage.removeItem('misaka.session')
+    set({ session: null, isConnected: false })
+  },
+
   async disconnect() {
     const { session } = get()
     if (session) {
@@ -178,3 +185,12 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     set({ session: null, isConnected: false, error: null })
   },
 }))
+
+// WS reports our cached token is unknown (server restarted, session GC'd):
+// drop the dead session and re-register from the cached identity so all
+// downstream API/QR calls get a fresh Bearer instead of looping on 401.
+onAuthInvalid(() => {
+  const store = useAuthStore.getState()
+  store.clearSession()
+  void store.connect()
+})

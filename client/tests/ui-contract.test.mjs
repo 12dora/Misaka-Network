@@ -15,6 +15,9 @@ const scan = read('src/components/features/ScanModal.tsx')
 const receive = read('src/components/features/ReceiveConfirmModal.tsx')
 const network = read('src/pages/Network.tsx')
 const networkStore = read('src/store/network.ts')
+const authStore = read('src/store/auth.ts')
+const signaling = read('src/lib/signaling.ts')
+const api = read('src/lib/api.ts')
 const crypto = read('src/lib/crypto.ts')
 const transfer = read('src/lib/transfer.ts')
 const serviceWorker = read('public/sw.js')
@@ -40,6 +43,34 @@ assert.match(qr, /QRCode\.toCanvas/)
 assert.match(qr, /QRCode\.toDataURL/)
 assert.match(qr, /qrImageUrl/)
 assert.match(qr, /QR 渲染失败/)
+
+// QR fetch must go through authedFetch so a stale session (server restarted,
+// token unknown server-side) auto-recovers via re-register-and-retry instead
+// of leaving the user staring at "HTTP 401". Same for the copy-link path.
+assert.match(qr, /authedFetch\(path\)/)
+assert.match(qr, /AuthRequiredError/)
+assert.match(qr, /会话已失效/)
+assert.doesNotMatch(qr, /Authorization:\s*`Bearer\s*\$\{session\.token\}`/)
+assert.match(network, /authedFetch\(path\)/)
+assert.match(network, /AuthRequiredError/)
+assert.match(network, /会话已失效/)
+assert.doesNotMatch(network, /headers:\s*\{\s*Authorization:\s*`Bearer\s*\$\{auth\.session\.token\}`/)
+
+// authedFetch core contract: retry once with a fresh token after 401, then
+// throw AuthRequiredError (not just resolve a 401 response).
+assert.match(api, /export class AuthRequiredError/)
+assert.match(api, /export async function authedFetch/)
+assert.match(api, /res\.status !== 401/)
+assert.match(api, /throw new AuthRequiredError\(\)/)
+assert.match(api, /sessionStorage\.removeItem\('misaka\.session'\)/)
+
+// WS close codes 4001/4002 (AUTH_REQUIRED / INVALID_TOKEN) must trigger the
+// auth-invalid signal — otherwise the client loops on the dead token forever.
+assert.match(signaling, /e\.code === 4001 \|\| e\.code === 4002/)
+assert.match(signaling, /export function onAuthInvalid/)
+assert.match(authStore, /onAuthInvalid\(\(\)\s*=>/)
+assert.match(authStore, /store\.clearSession\(\)/)
+assert.match(authStore, /void store\.connect\(\)/)
 
 assert.match(network, /type="file" multiple/)
 assert.match(network, /webkitdirectory/)
