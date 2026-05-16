@@ -7,7 +7,7 @@ export const NODE_ID_MIN = 1
 export const NODE_ID_MAX = 20001
 
 // ── File transfer ─────────────────────────────────────────────────────
-export const CHUNK_SIZE = 256 * 1024             // 256 KB per chunk — fewer frames without stressing DataChannel limits
+export const CHUNK_SIZE = 252 * 1024             // 252 KB — must stay ≤ 256 KiB SCTP max after AES-GCM (+16 B) + IV (+12 B) overhead
 export const HIGH_WATER_MARK = 32 * 1024 * 1024  // 32 MB — keep the DataChannel fed on fast local links
 export const LOW_WATER_MARK = 12 * 1024 * 1024   // 12 MB — resume before the sender drains completely
 export const TRANSFER_PROGRESS_INTERVAL_MS = 200

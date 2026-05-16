@@ -36,8 +36,14 @@ export async function loadConfig(): Promise<AppConfig> {
   const runtime = window.__MISAKA_CONFIG__ ?? {}
 
   _config = {
-    API_BASE: runtime.API_BASE || import.meta.env.VITE_API_BASE || '',
-    WS_URL: runtime.WS_URL || import.meta.env.VITE_WS_URL || '',
+    // In dev mode VITE_ env vars take precedence so the Vite proxy is used.
+    // In production, config.json (runtime) defines where the server lives.
+    API_BASE: import.meta.env.DEV
+      ? (import.meta.env.VITE_API_BASE || runtime.API_BASE || '')
+      : (runtime.API_BASE || import.meta.env.VITE_API_BASE || ''),
+    WS_URL: import.meta.env.DEV
+      ? (import.meta.env.VITE_WS_URL || runtime.WS_URL || '')
+      : (runtime.WS_URL || import.meta.env.VITE_WS_URL || ''),
   }
 
   return _config
@@ -48,8 +54,12 @@ export function getConfig(): AppConfig {
     // If loadConfig hasn't been called yet, use what's available synchronously
     const runtime = window.__MISAKA_CONFIG__ ?? {}
     return {
-      API_BASE: runtime.API_BASE || import.meta.env.VITE_API_BASE || '',
-      WS_URL: runtime.WS_URL || import.meta.env.VITE_WS_URL || '',
+      API_BASE: import.meta.env.DEV
+        ? (import.meta.env.VITE_API_BASE || runtime.API_BASE || '')
+        : (runtime.API_BASE || import.meta.env.VITE_API_BASE || ''),
+      WS_URL: import.meta.env.DEV
+        ? (import.meta.env.VITE_WS_URL || runtime.WS_URL || '')
+        : (runtime.WS_URL || import.meta.env.VITE_WS_URL || ''),
     }
   }
   return _config

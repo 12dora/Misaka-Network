@@ -10,3 +10,4 @@ server/data/
 *.log
 .vscode/
 .idea/
+test-results/
