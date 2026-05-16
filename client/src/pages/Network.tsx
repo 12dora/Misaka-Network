@@ -4,6 +4,7 @@ import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
 import MisakaStatusBadge from '@/components/ui/MisakaStatusBadge'
 import MisakaProgressBar from '@/components/ui/MisakaProgressBar'
+import AppFooter from '@/components/ui/AppFooter'
 import QRModal from '@/components/features/QRModal'
 import { useNetworkStore } from '@/store/network'
 import { useAuthStore } from '@/store/auth'
@@ -641,9 +642,9 @@ export default function Network() {
   const peerEntity = store.peers.find(p => p.sessionId === store.selectedSessionId) ?? null
 
   return (
-    <div className="min-h-screen pt-16" style={{ background: 'var(--bg-primary)' }}>
+    <div className="min-h-screen pt-16 flex flex-col" style={{ background: 'var(--bg-primary)' }}>
       {/* Desktop 3-column */}
-      <div className="hidden md:grid h-[calc(100vh-64px)] gap-6 p-6" style={{ gridTemplateColumns: '1fr 2fr 1fr' }}>
+      <div className="hidden md:grid min-h-[calc(100vh-64px-73px)] gap-6 p-6" style={{ gridTemplateColumns: '1fr 2fr 1fr' }}>
         <div className="overflow-y-auto">
           <NodeRadar
             peers={store.peers}
@@ -750,6 +751,7 @@ export default function Network() {
           onClose={() => setShowQR(false)}
         />
       )}
+      <AppFooter />
     </div>
   )
 }

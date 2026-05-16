@@ -6,7 +6,10 @@ import {
   type TransferRecord,
 } from './db'
 import { encryptChunk, decryptChunk } from './crypto'
-import { CHUNK_SIZE, HIGH_WATER_MARK, LOW_WATER_MARK } from '@/constants'
+import {
+  CHUNK_SIZE, HIGH_WATER_MARK, LOW_WATER_MARK,
+  TRANSFER_PROGRESS_INTERVAL_MS, TRANSFER_RECORD_INTERVAL_MS,
+} from '@/constants'
 
 export { CHUNK_SIZE }
 
@@ -84,6 +87,10 @@ export interface SendCallbacks {
   onError?: (error: string) => void
 }
 
+function shouldFlushProgress(lastAt: number, done: number, total: number) {
+  return done === total || performance.now() - lastAt >= TRANSFER_PROGRESS_INTERVAL_MS
+}
+
 export async function sendFile(
   dc: RTCDataChannel,
   file: File,
@@ -137,6 +144,10 @@ export async function sendFile(
 
   let sent = skipSet.size
   callbacks?.onProgress?.(sent, totalChunks)
+  const sentChunkIndexes = new Set(record.receivedChunks)
+  let lastProgressAt = performance.now()
+  let lastRecordAt = performance.now()
+  let recordDirty = false
 
   for (let i = 0; i < totalChunks; i++) {
     if (skipSet.has(i)) continue
@@ -164,7 +175,6 @@ export async function sendFile(
 
     // Encrypt
     const { iv, encrypted } = await encryptChunk(raw)
-    const checksum = await computeChunkChecksum(encrypted)
 
     // Send header as text
     dc.send(JSON.stringify({
@@ -172,7 +182,7 @@ export async function sendFile(
       transferId,
       index: i,
       total: totalChunks,
-      checksum,
+      checksum: '',
     } satisfies ChunkHeader))
 
     // Pack iv + encrypted into one binary message
@@ -185,15 +195,27 @@ export async function sendFile(
     dc.send(packet.buffer)
 
     sent++
-    callbacks?.onProgress?.(sent, totalChunks)
+    if (shouldFlushProgress(lastProgressAt, sent, totalChunks)) {
+      callbacks?.onProgress?.(sent, totalChunks)
+      lastProgressAt = performance.now()
+    }
 
-    // Persist chunk locally for crash recovery fallback
-    await saveChunk(transferId, i, encrypted)
-    // Track which chunks we've sent this session
-    record.receivedChunks = [...new Set([...record.receivedChunks, i])]
-    await updateTransfer(transferId, { receivedChunks: record.receivedChunks })
+    // Track which chunks we've sent this session. The receiver's resume bitmap
+    // is still authoritative, so avoid writing every outgoing chunk body to IDB.
+    sentChunkIndexes.add(i)
+    recordDirty = true
+    if (performance.now() - lastRecordAt >= TRANSFER_RECORD_INTERVAL_MS || sent === totalChunks) {
+      record.receivedChunks = Array.from(sentChunkIndexes).sort((a, b) => a - b)
+      await updateTransfer(transferId, { receivedChunks: record.receivedChunks })
+      recordDirty = false
+      lastRecordAt = performance.now()
+    }
   }
 
+  if (recordDirty) {
+    record.receivedChunks = Array.from(sentChunkIndexes).sort((a, b) => a - b)
+    await updateTransfer(transferId, { receivedChunks: record.receivedChunks })
+  }
   await updateTransfer(transferId, { status: 'completed' })
 }
 
@@ -213,6 +235,8 @@ type ReceiveSession = {
   totalChunks: number
   mime: string
   received: Set<number>
+  lastRecordAt: number
+  storageMode: 'pending' | 'stream' | 'indexeddb'
   direction: 'recv'
 }
 
@@ -231,6 +255,8 @@ export async function handleMetaMessage(msg: MetaMessage, peerNodeId: number): P
     totalChunks: msg.totalChunks,
     mime: msg.mime,
     received: new Set(),
+    lastRecordAt: performance.now(),
+    storageMode: 'pending',
     direction: 'recv',
   }
   receiveSessions.set(msg.transferId, session)
@@ -259,35 +285,51 @@ export async function receiveChunk(
   iv: Uint8Array<ArrayBuffer>,
   encrypted: ArrayBuffer,
   callbacks?: ReceiveCallbacks,
-): Promise<{ ack: AckMessage; decrypted: ArrayBuffer } | undefined> {
+): Promise<{ ack: AckMessage; decrypted: ArrayBuffer; storageMode: 'stream' | 'indexeddb' } | undefined> {
   const session = receiveSessions.get(transferId)
   if (!session) return
 
-  // Verify checksum
-  const actualChecksum = await computeChunkChecksum(encrypted)
-  if (actualChecksum !== header.checksum) {
-    callbacks?.onError?.('Chunk checksum mismatch')
-    return
+  // AES-GCM authenticates the encrypted payload. Keep checksum verification
+  // only for older senders that still populate it; skipping the duplicate hash
+  // removes a hot-path CPU bottleneck on local transfers.
+  if (header.checksum) {
+    const actualChecksum = await computeChunkChecksum(encrypted)
+    if (actualChecksum !== header.checksum) {
+      callbacks?.onError?.('Chunk checksum mismatch')
+      return
+    }
   }
 
   // Decrypt
   const decrypted = await decryptChunk(iv, encrypted)
 
-  // Save to IndexedDB
-  await saveChunk(transferId, header.index, decrypted)
+  const hasStreamingTarget = getWriteHandle(transferId) || getOPFSHandle(transferId)
+  if (session.storageMode === 'pending') {
+    session.storageMode = hasStreamingTarget ? 'stream' : 'indexeddb'
+  }
+  if (session.storageMode === 'indexeddb') {
+    await saveChunk(transferId, header.index, decrypted)
+  }
 
   session.received.add(header.index)
 
-  await updateTransfer(transferId, {
-    receivedChunks: Array.from(session.received).sort((a, b) => a - b),
-    updatedAt: Date.now(),
-  })
+  if (
+    performance.now() - session.lastRecordAt >= TRANSFER_RECORD_INTERVAL_MS ||
+    session.received.size === session.totalChunks
+  ) {
+    await updateTransfer(transferId, {
+      receivedChunks: Array.from(session.received).sort((a, b) => a - b),
+      updatedAt: Date.now(),
+    })
+    session.lastRecordAt = performance.now()
+  }
 
   callbacks?.onProgress?.(session.received.size, session.totalChunks)
 
   return {
     ack: { type: 'ack', transferId, index: header.index },
     decrypted,
+    storageMode: session.storageMode,
   }
 }
 
@@ -330,7 +372,10 @@ export function cancelReceive(transferId: string) {
 export async function buildResumeRequest(transferId: string): Promise<ResumeRequest | null> {
   const record = await getTransfer(transferId)
   if (!record || record.status !== 'active') return null
-  const chunks = await getSavedChunkIndexes(transferId)
+  const chunks = [...new Set([
+    ...record.receivedChunks,
+    ...await getSavedChunkIndexes(transferId),
+  ])].sort((a, b) => a - b)
   return {
     type: 'resume',
     transferId,

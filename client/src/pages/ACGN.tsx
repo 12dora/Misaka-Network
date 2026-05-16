@@ -3,11 +3,11 @@ import MisakaCard from '@/components/ui/MisakaCard'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
 import AppFooter from '@/components/ui/AppFooter'
+import MisakaHeroTitle from '@/components/ui/MisakaHeroTitle'
 import { QUOTES, CHARACTERS, LORE_LOG, LORE_TIMELINE, getCharacterByNodeId } from '@/data/lore'
 import { publicAssetUrl } from '@/lib/appBase'
 
 const HERO_CHARACTER = publicAssetUrl('assets/misaka.webp')
-const HERO_TITLE     = publicAssetUrl('assets/misaka-title.webp')
 
 // ── Section Header ────────────────────────────────────────────────
 function SectionHeader({ kanji, title, furigana }: { kanji: string; title: string; furigana: string }) {
@@ -191,36 +191,64 @@ export default function ACGN() {
     <div className="min-h-screen" style={{ background: 'var(--bg-primary)' }}>
 
       {/* ── Mobile Hero ───────────────────────────────────────────── */}
-      <section className="md:hidden flex flex-col pt-16">
-        <div className="relative w-full overflow-visible flex-shrink-0" style={{ height: '38vw', maxHeight: 210 }}>
+      <section className="md:hidden relative overflow-hidden pt-16">
+        <div
+          className="absolute inset-0 pointer-events-none dot-grid"
+          style={{
+            opacity: 0.5,
+            maskImage: 'linear-gradient(to bottom, #000 0%, transparent 72%)',
+            WebkitMaskImage: 'linear-gradient(to bottom, #000 0%, transparent 72%)',
+          }}
+        />
+
+        <div
+          className="relative w-full overflow-hidden"
+          style={{
+            height: 'clamp(310px, 50svh, 430px)',
+            background: 'linear-gradient(180deg, rgba(14,42,107,0.18) 0%, rgba(255,255,255,0.08) 100%)',
+          }}
+        >
+          <div
+            className="absolute inset-x-0 bottom-0 pointer-events-none"
+            style={{
+              height: '38%',
+              background: 'linear-gradient(to top, var(--bg-primary) 0%, rgba(26,79,196,0.72) 44%, transparent 100%)',
+              zIndex: 2,
+            }}
+          />
+          <div
+            className="absolute left-1/2 bottom-3 h-8 w-[68vw] max-w-[320px] -translate-x-1/2 rounded-[50%] pointer-events-none"
+            style={{
+              background: 'rgba(14,42,107,0.22)',
+              filter: 'blur(14px)',
+              zIndex: 1,
+            }}
+          />
           <img
             src={HERO_CHARACTER}
             alt="御坂美琴"
             className="animate-float select-none pointer-events-none"
+            loading="eager"
+            fetchPriority="high"
+            decoding="async"
             style={{
               position: 'absolute',
-              bottom: 0,
+              bottom: 10,
               left: '50%',
-              transform: 'translateX(-50%)',
-              height: '200%',
+              height: 'min(calc(100% - 18px), clamp(290px, 46svh, 390px))',
+              maxWidth: '82vw',
               objectFit: 'contain',
               objectPosition: 'bottom center',
+              transform: 'translateX(-50%)',
+              ['--float-x' as string]: '-50%',
+              zIndex: 1,
             }}
             draggable={false}
           />
-          <div
-            className="absolute inset-0 pointer-events-none"
-            style={{ background: 'linear-gradient(to bottom, var(--bg-primary) 0%, transparent 40%)' }}
-          />
         </div>
-        <div className="flex flex-col items-center px-5 pt-4 pb-8 gap-4">
-          <img
-            src={HERO_TITLE}
-            alt="とある科学 御坂网络"
-            className="select-none pointer-events-none"
-            style={{ width: 'min(240px, 68vw)', filter: 'drop-shadow(0 4px 12px rgba(0,0,0,0.22))' }}
-            draggable={false}
-          />
+
+        <div className="relative z-10 flex flex-col items-center px-5 -mt-8 pb-10 gap-4">
+          <MisakaHeroTitle width="min(230px, 62vw)" />
           <p className="font-jp text-sm text-[var(--text-on-blue-2)] text-center leading-loose">
             连接全部御坂妹妹的脑量子波共享网络<br />
             <span className="text-xs">全ての御坂妹妹を繋ぐ脳量子波ネットワーク</span>
@@ -249,8 +277,11 @@ export default function ACGN() {
             src={HERO_CHARACTER}
             alt="御坂美琴"
             className="animate-float select-none pointer-events-none"
+            loading="eager"
+            fetchPriority="high"
+            decoding="async"
             style={{
-              maxHeight: 'calc(min(80vh, 680px) - 64px)',
+              maxHeight: 'calc(min(100vh, 820px) - 64px)',
               width: '100%',
               objectFit: 'contain',
               objectPosition: 'bottom center',
@@ -259,19 +290,10 @@ export default function ACGN() {
           />
         </div>
         <div
-          className="flex flex-col justify-center pr-12 pl-8 gap-6"
+          className="flex flex-col justify-center pr-12 pl-8 gap-6 relative z-10"
           style={{ paddingBottom: '3rem', paddingTop: '2rem' }}
         >
-          <img
-            src={HERO_TITLE}
-            alt="とある科学 御坂网络"
-            className="select-none pointer-events-none"
-            style={{
-              width: 'clamp(240px, 28vw, 400px)',
-              filter: 'drop-shadow(0 6px 16px rgba(0,0,0,0.18))',
-            }}
-            draggable={false}
-          />
+          <MisakaHeroTitle width="clamp(280px, 32vw, 460px)" />
           <p className="font-jp text-lg text-[var(--text-on-blue)] leading-loose">
             连接全部御坂妹妹的脑量子波共享网络<br />
             <span className="text-sm text-[var(--text-on-blue-2)]">全ての御坂妹妹を繋ぐ脳量子波ネットワーク</span>
