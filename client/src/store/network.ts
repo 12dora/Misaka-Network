@@ -1,8 +1,8 @@
 import { create } from 'zustand'
-import type { Peer, Transfer, NodeStatus, ChannelMessage, MessageStatus } from '@/types'
+import type { Peer, Transfer, NodeStatus, ChannelMessage, MessageStatus, PendingFileItem } from '@/types'
 import {
   connect as wsConnect, disconnect as wsDisconnect, send as wsSend,
-  onMessage, onConnect, onDisconnect,
+  onMessage, onConnect, onDisconnect, reconnectNow,
 } from '@/lib/signaling'
 import {
   createPeerConnection, createDataChannel, createOffer, createAnswer,
@@ -13,7 +13,7 @@ import {
   resetCrypto, hasAESKey,
 } from '@/lib/crypto'
 import {
-  sendFile as engineSendFile, handleMetaMessage, receiveChunk,
+  sendFileParallel as engineSendFileParallel, handleMetaMessage, receiveChunk,
   completeReceive, cancelReceive, createTransferId, buildResumeRequest,
   pauseTransfer, resumeTransfer, cancelTransfer as engineCancelTransfer,
   supportsFileSystemAccess, streamChunkToDisk,
@@ -28,6 +28,7 @@ import { refreshAutoTurn, clearAutoTurn } from '@/lib/turn'
 import {
   MAX_ICE_RESTART_ATTEMPTS, ICE_RESTART_BACKOFF_MS, ICE_DISCONNECTED_RESTART_DELAY_MS,
   DC_OPEN_TIMEOUT_MS, ENCRYPTION_TIMEOUT_MS,
+  TRANSFER_LANE_COUNT,
 } from '@/constants'
 
 // ── Non-reactive WebRTC state ────────────────────────────────────────
@@ -35,6 +36,7 @@ import {
 // may share a nodeId; sessionId is the unique key.
 const peerConnections = new Map<string, RTCPeerConnection>()
 const dataChannels = new Map<string, RTCDataChannel>()
+const transferLanes = new Map<string, RTCDataChannel[]>()
 const configuredDataChannels = new WeakSet<RTCDataChannel>()
 const pendingIceCandidates = new Map<string, RTCIceCandidateInit[]>()
 const ecdhResolvers: Map<string, () => void> = new Map()
@@ -48,6 +50,7 @@ const sendingFiles = new Map<string, File>()  // transferId → File
 let initialized = false   // see init() — prevents StrictMode double-registration
 const deliveredTransfers = new Set<string>()  // one file card per transferId
 const transferSpeedSamples = new Map<string, { bytes: number; at: number }>()
+let currentToken = ''
 
 // Messages typed before the DC fully opened, flushed in dc.onopen.
 const outgoingQueue = new Map<string, string[]>()
@@ -99,6 +102,52 @@ function failPendingMessages(peerSessionId: string) {
   outgoingQueue.delete(peerSessionId)
 }
 
+let recoveryInstalled = false
+let lastRecoverAt = 0
+
+function installForegroundRecovery() {
+  if (recoveryInstalled || typeof window === 'undefined') return
+  recoveryInstalled = true
+  const recover = () => {
+    if (document.visibilityState && document.visibilityState !== 'visible') return
+    recoverConnections()
+  }
+  window.addEventListener('online', recover)
+  window.addEventListener('focus', recover)
+  window.addEventListener('pageshow', recover)
+  document.addEventListener('visibilitychange', recover)
+}
+
+function recoverConnections() {
+  const now = Date.now()
+  if (now - lastRecoverAt < 1_500) return
+  lastRecoverAt = now
+  if (currentToken) {
+    reconnectNow()
+    void refreshAutoTurn(currentToken)
+  }
+  for (const peer of useNetworkStore.getState().peers) {
+    const pc = peerConnections.get(peer.sessionId)
+    const dc = dataChannels.get(peer.sessionId)
+    const needsReconnect =
+      peer.status === 'offline' ||
+      peer.status === 'reconnecting' ||
+      !pc ||
+      pc.connectionState === 'closed' ||
+      pc.connectionState === 'failed' ||
+      pc.iceConnectionState === 'failed' ||
+      !dc ||
+      dc.readyState === 'closed'
+
+    if (needsReconnect) {
+      cleanupPeerConnection(peer.sessionId)
+      initiateWebRTC(peer.sessionId).catch(() => {})
+    } else if (pc.iceConnectionState === 'disconnected') {
+      attemptIceRestart(peer.sessionId).catch(() => {})
+    }
+  }
+}
+
 function genMsgId(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
 }
@@ -111,23 +160,26 @@ interface NetworkState {
   selectedSessionId: string | null
   transfers: Transfer[]
   chatMessages: Record<string, ChannelMessage[]>   // keyed by peer sessionId
-  pendingFiles: Record<string, File>               // peer sessionId -> file awaiting send
+  pendingFiles: Record<string, PendingFileItem[]>  // peer sessionId -> files awaiting send
   connectedPeers: Set<string>                      // sessionIds with open DC
   unreadByPeer: Record<string, { message: number; file: number }>
 
   init: (token: string) => void
   destroy: () => void
   selectPeer: (sessionId: string | null) => void
-  setPendingFile: (sessionId: string, file: File | null) => void
+  addPendingFiles: (sessionId: string, files: File[]) => void
+  removePendingFile: (sessionId: string, itemId: string) => void
+  clearPendingFiles: (sessionId: string) => void
   sendPendingFile: (sessionId: string) => Promise<void>
   sendFile: (file: File) => Promise<void>
-  sendFileToAll: (file: File) => Promise<void>
+  sendFilesToAll: (files: File[]) => Promise<void>
   pauseTransfer: (transferId: string) => void
   resumeTransfer: (transferId: string, peerSessionId: string) => Promise<void>
   cancelTransferAction: (transferId: string) => void
   sendChatMessage: (peerSessionId: string, text: string) => void
   retryChatMessage: (peerSessionId: string, msgId: string) => void
   blockPeer: (sessionId: string) => void
+  recoverConnections: () => void
 }
 
 export const useNetworkStore = create<NetworkState>((set, get) => ({
@@ -149,6 +201,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     // application) and spawn a second WebSocket. Guard with a module flag.
     if (initialized) return
     initialized = true
+    currentToken = token
     onMessage(async (msg) => {
       switch (msg.t) {
         case 'WELCOME': {
@@ -230,6 +283,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     onDisconnect(() => set({ wsConnected: false }))
 
     wsConnect(token)
+    installForegroundRecovery()
   },
 
   destroy() {
@@ -238,6 +292,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     resetCrypto()
     clearAutoTurn()
     initialized = false
+    currentToken = ''
     set({
       wsConnected: false, mySessionId: null, channelId: null,
       peers: [], selectedSessionId: null, transfers: [],
@@ -256,27 +311,51 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     })
   },
 
-  setPendingFile(sessionId, file) {
+  addPendingFiles(sessionId, files) {
     set(s => {
-      if (!file) {
+      const current = s.pendingFiles[sessionId] ?? []
+      const incoming = files.map(file => ({
+        id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+        file,
+        displayName: (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name,
+      }))
+      return { pendingFiles: { ...s.pendingFiles, [sessionId]: [...current, ...incoming] } }
+    })
+  },
+
+  removePendingFile(sessionId, itemId) {
+    set(s => {
+      const next = (s.pendingFiles[sessionId] ?? []).filter(item => item.id !== itemId)
+      if (next.length === 0) {
         const { [sessionId]: _drop, ...rest } = s.pendingFiles
         return { pendingFiles: rest }
       }
-      return { pendingFiles: { ...s.pendingFiles, [sessionId]: file } }
+      return { pendingFiles: { ...s.pendingFiles, [sessionId]: next } }
+    })
+  },
+
+  clearPendingFiles(sessionId) {
+    set(s => {
+      const { [sessionId]: _drop, ...rest } = s.pendingFiles
+      return { pendingFiles: rest }
     })
   },
 
   async sendPendingFile(sessionId) {
-    const file = get().pendingFiles[sessionId]
-    if (!file) return
-    const ok = await sendFileToPeer(file, sessionId)
-    if (ok) {
+    const items = get().pendingFiles[sessionId] ?? []
+    if (items.length === 0) return
+    let allOk = true
+    for (const item of items) {
+      const ok = await sendFileToPeer(item.file, sessionId, item.displayName)
+      if (!ok) allOk = false
+    }
+    if (allOk) {
       set(s => {
         const { [sessionId]: _drop, ...rest } = s.pendingFiles
         return { pendingFiles: rest }
       })
     }
-    // On failure leave the staged file in place so the user can retry / cancel.
+    // On failure leave the staged queue in place so the user can retry / prune.
   },
 
   async sendFile(file) {
@@ -285,10 +364,10 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     await sendFileToPeer(file, sid)
   },
 
-  async sendFileToAll(file) {
+  async sendFilesToAll(files) {
     const targets = get().peers.filter(p => p.status !== 'offline').map(p => p.sessionId)
     if (targets.length === 0) throw new Error('没有可用的目标节点')
-    await Promise.allSettled(targets.map(sid => sendFileToPeer(file, sid)))
+    await Promise.allSettled(targets.flatMap(sid => files.map(file => sendFileToPeer(file, sid))))
   },
 
   sendChatMessage(peerSessionId, text) {
@@ -346,6 +425,10 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     cleanupPeerConnection(sessionId)
   },
 
+  recoverConnections() {
+    recoverConnections()
+  },
+
   pauseTransfer(transferId) {
     pauseTransfer(transferId)
     set(s => ({
@@ -365,7 +448,8 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
       if (record) {
         const request = await buildResumeRequest(transferId)
         const peerNodeId = get().peers.find(p => p.sessionId === peerSessionId)?.nodeId ?? 0
-        engineSendFile(dc, file, transferId, peerNodeId, record, undefined, request?.receivedChunks)
+        const lanes = await ensureTransferLanes(peerSessionId)
+        engineSendFileParallel(lanes, file, transferId, peerNodeId, record, undefined, request?.receivedChunks)
           .then(() => sendingFiles.delete(transferId))
           .catch(() => {})
       }
@@ -408,13 +492,24 @@ async function ensureConnected(peerSessionId: string): Promise<RTCDataChannel> {
   return dc
 }
 
-async function sendFileToPeer(file: File, peerSessionId: string): Promise<boolean> {
+async function ensureTransferLanes(peerSessionId: string): Promise<RTCDataChannel[]> {
+  const primary = await ensureConnected(peerSessionId)
+  let lanes = transferLanes.get(peerSessionId) ?? []
+  lanes = lanes.filter(dc => dc.readyState !== 'closed')
+  transferLanes.set(peerSessionId, lanes)
+
+  const openLanes = lanes.filter(dc => dc.readyState === 'open')
+  if (openLanes.length > 0) return openLanes
+  return [primary]
+}
+
+async function sendFileToPeer(file: File, peerSessionId: string, displayName = file.name): Promise<boolean> {
   const peer = useNetworkStore.getState().peers.find(p => p.sessionId === peerSessionId)
   const peerNodeId = peer?.nodeId ?? 0
 
-  let dc: RTCDataChannel
+  let dcs: RTCDataChannel[]
   try {
-    dc = await ensureConnected(peerSessionId)
+    dcs = await ensureTransferLanes(peerSessionId)
   } catch (e) {
     appendSystemChat(peerSessionId, `发送失败：${String((e as Error).message ?? e)}`)
     return false
@@ -424,12 +519,12 @@ async function sendFileToPeer(file: File, peerSessionId: string): Promise<boolea
   const transfer: Transfer = {
     id: transferId, direction: 'send',
     peerSessionId, peerNodeId,
-    fileName: file.name, fileSize: file.size,
+    fileName: displayName, fileSize: file.size,
     progress: 0, speedBps: 0, status: 'pending', startedAt: Date.now(),
   }
   useNetworkStore.setState(s => ({ transfers: [...s.transfers, transfer] }))
   // Surface the send intent in the chat history immediately.
-  appendSystemChat(peerSessionId, `开始发送文件 ${file.name}`, 'sent')
+  appendSystemChat(peerSessionId, `开始发送文件 ${displayName}`, 'sent')
 
   const callbacks: SendCallbacks = {
     onProgress(sent, total) {
@@ -456,14 +551,14 @@ async function sendFileToPeer(file: File, peerSessionId: string): Promise<boolea
 
   try {
     sendingFiles.set(transferId, file)
-    await engineSendFile(dc, file, transferId, peerNodeId, undefined, callbacks)
+    await engineSendFileParallel(dcs, file, transferId, peerNodeId, undefined, callbacks)
     sendingFiles.delete(transferId)
     useNetworkStore.setState(s => ({
       transfers: s.transfers.map(t =>
         t.id === transferId ? { ...t, progress: 1, status: 'completed' as const } : t,
       ),
     }))
-    appendSystemChat(peerSessionId, `已发送文件 ${file.name}`, 'sent')
+    appendSystemChat(peerSessionId, `已发送文件 ${displayName}`, 'sent')
     playSound('complete')
     transferSpeedSamples.delete(transferId)
     return true
@@ -474,7 +569,7 @@ async function sendFileToPeer(file: File, peerSessionId: string): Promise<boolea
         t.id === transferId ? { ...t, status: 'failed' as const, error: String(e) } : t,
       ),
     }))
-    appendSystemChat(peerSessionId, `发送失败：${String((e as Error).message ?? e)}`, 'sent')
+    appendSystemChat(peerSessionId, `发送失败：${displayName} · ${String((e as Error).message ?? e)}`, 'sent')
     playSound('error')
     return false
   }
@@ -496,6 +591,13 @@ async function initiateWebRTC(peerSessionId: string) {
   const dc = createDataChannel(pc)
   dataChannels.set(peerSessionId, dc)
   setupDataChannel(dc, peerSessionId)
+  for (let i = 0; i < TRANSFER_LANE_COUNT; i++) {
+    const lane = createDataChannel(pc, `misaka-transfer-${i}`)
+    const lanes = transferLanes.get(peerSessionId) ?? []
+    lanes.push(lane)
+    transferLanes.set(peerSessionId, lanes)
+    setupDataChannel(lane, peerSessionId)
+  }
 
   await generateECDHKeyPair()
 
@@ -529,9 +631,16 @@ async function handleRemoteSDP(fromSessionId: string, fromNodeId: number, sdp: R
     pc = createPeerConnection()
     peerConnections.set(fromSessionId, pc)
 
-    const dcPromise = new Promise<RTCDataChannel>(resolve => {
-      pc!.ondatachannel = (e) => resolve(e.channel)
-    })
+    pc.ondatachannel = (e) => {
+      if (e.channel.label.startsWith('misaka-transfer-')) {
+        const lanes = transferLanes.get(fromSessionId) ?? []
+        lanes.push(e.channel)
+        transferLanes.set(fromSessionId, lanes)
+      } else {
+        dataChannels.set(fromSessionId, e.channel)
+      }
+      setupDataChannel(e.channel, fromSessionId)
+    }
 
     pc.onicecandidate = (e) => {
       if (e.candidate) {
@@ -544,11 +653,6 @@ async function handleRemoteSDP(fromSessionId: string, fromNodeId: number, sdp: R
     pc.oniceconnectionstatechange = () => handleIceStateChange(pc!, fromSessionId)
 
     await generateECDHKeyPair()
-
-    dcPromise.then(dc => {
-      dataChannels.set(fromSessionId, dc)
-      setupDataChannel(dc, fromSessionId)
-    })
 
     // Make sure the peer is in our radar (PEER_JOINED may have arrived before
     // the SDP, but on race we surface them here too).
@@ -753,8 +857,10 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
       if (result) {
         const { ack, decrypted: decryptedData, storageMode } = result
         if (storageMode === 'stream') {
-          streamChunkToDisk(header.transferId, header.index, decryptedData).catch(() => {})
-          writeChunkToOPFS(header.transferId, header.index, decryptedData).catch(() => {})
+          await Promise.all([
+            streamChunkToDisk(header.transferId, header.index, decryptedData),
+            writeChunkToOPFS(header.transferId, header.index, decryptedData),
+          ])
         }
         dc.send(JSON.stringify(ack))
       }
@@ -804,7 +910,8 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
           const record = await getTransfer(resumeRequest.transferId)
           if (file && record) {
             const peerNodeId = useNetworkStore.getState().peers.find(p => p.sessionId === peerSessionId)?.nodeId ?? 0
-            engineSendFile(dc, file, resumeRequest.transferId, peerNodeId, record, undefined, resumeRequest.receivedChunks)
+            const lanes = await ensureTransferLanes(peerSessionId)
+            engineSendFileParallel(lanes, file, resumeRequest.transferId, peerNodeId, record, undefined, resumeRequest.receivedChunks)
               .then(() => sendingFiles.delete(resumeRequest.transferId))
               .catch(() => {})
           }
@@ -986,6 +1093,7 @@ function failTransferRecord(transferId: string, error: string) {
 }
 
 async function sendResumeRequests(peerSessionId: string, dc: RTCDataChannel) {
+  if (dc.label.startsWith('misaka-transfer-')) return
   const active = await getActiveTransfers()
   const peerNodeId = useNetworkStore.getState().peers.find(p => p.sessionId === peerSessionId)?.nodeId ?? 0
   for (const record of active) {
@@ -1003,6 +1111,11 @@ function cleanupPeerConnection(sessionId: string) {
   clearDisconnectedTimer(sessionId)
   const dc = dataChannels.get(sessionId)
   if (dc) { dc.close(); dataChannels.delete(sessionId) }
+  const lanes = transferLanes.get(sessionId)
+  if (lanes) {
+    for (const lane of lanes) lane.close()
+    transferLanes.delete(sessionId)
+  }
   const pc = peerConnections.get(sessionId)
   if (pc) { pc.close(); peerConnections.delete(sessionId) }
   ecdhResolvers.delete(sessionId)

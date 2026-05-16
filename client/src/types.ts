@@ -70,6 +70,12 @@ export interface Transfer {
   startedAt: number
 }
 
+export interface PendingFileItem {
+  id: string
+  file: File
+  displayName: string
+}
+
 // ── Channel Message ───────────────────────────────────────────────
 export type MessageStatus = 'sending' | 'sent' | 'delivered' | 'failed'
 
