@@ -52,7 +52,7 @@ globalThis.fetch = async (url, _init) => {
   }
   if (typeof url === 'string' && url.includes('/graphql')) {
     return new Response(JSON.stringify({
-      data: { viewer: { accounts: [{ rtcRelayedTrafficAdaptiveGroups: [] }] } },
+      data: { viewer: { accounts: [{ callsTurnUsageAdaptiveGroups: [] }] } },
     }), { status: 200 })
   }
   throw new Error(`unexpected fetch: ${url}`)

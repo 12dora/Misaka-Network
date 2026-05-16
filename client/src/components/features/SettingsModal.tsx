@@ -31,6 +31,9 @@ interface TurnStatusView {
   enabled: boolean
   configured: boolean
   monthlyBytesUsed: number
+  monthlyBytesEffective: number
+  monthlyUsageSource: 'cloudflare' | 'pessimistic'
+  lastCfSyncError?: string
   monthlyBytesLimit: number
   percentUsed: number
   thresholdPct: number
@@ -71,7 +74,9 @@ export default function SettingsModal({ onClose }: Props) {
       if (cancelled || !s) return
       setTurnStatus({
         enabled: s.enabled, configured: s.configured,
-        monthlyBytesUsed: s.monthlyBytesUsed, monthlyBytesLimit: s.monthlyBytesLimit,
+        monthlyBytesUsed: s.monthlyBytesUsed, monthlyBytesEffective: s.monthlyBytesEffective,
+        monthlyUsageSource: s.monthlyUsageSource, lastCfSyncError: s.lastCfSyncError,
+        monthlyBytesLimit: s.monthlyBytesLimit,
         percentUsed: s.percentUsed, thresholdPct: s.thresholdPct,
         killSwitchActive: s.killSwitchActive, monthKey: s.monthKey,
         credentialTtlSec: s.credentialTtlSec,
@@ -321,9 +326,9 @@ export default function SettingsModal({ onClose }: Props) {
                       <div className="flex items-center justify-between">
                         <span className="font-kanji text-[11px] text-[var(--text-on-white-2)]">本月用量</span>
                         <span className="font-mono text-[11px] text-[var(--text-on-white)]">
-                          {formatBytes(turnStatus.monthlyBytesUsed)} / {formatBytes(turnStatus.monthlyBytesLimit)}
-                        </span>
-                      </div>
+                        {formatBytes(turnStatus.monthlyBytesUsed)} / {formatBytes(turnStatus.monthlyBytesLimit)}
+                      </span>
+                    </div>
                       <div
                         className="w-full h-1.5 rounded-full overflow-hidden"
                         style={{ background: 'rgba(0,0,0,0.08)' }}
@@ -341,8 +346,13 @@ export default function SettingsModal({ onClose }: Props) {
                       <p className="font-kanji text-[10px] text-[var(--text-muted)] leading-snug">
                         {turnStatus.killSwitchActive
                           ? `已达 ${turnStatus.thresholdPct}% 熔断阈值，停止下发自动 TURN 直至下月`
-                          : `${turnStatus.percentUsed.toFixed(2)}% · 熔断阈值 ${turnStatus.thresholdPct}% · ${turnStatus.monthKey}`}
+                          : `${turnStatus.percentUsed.toFixed(2)}% · 熔断阈值 ${turnStatus.thresholdPct}% · ${turnStatus.monthKey} · ${turnStatus.monthlyUsageSource === 'cloudflare' ? 'CF Analytics' : '本地估算'}`}
                       </p>
+                      {turnStatus.lastCfSyncError && (
+                        <p className="font-mono text-[10px] text-[var(--state-warn)] leading-snug">
+                          CF 同步失败：{turnStatus.lastCfSyncError}
+                        </p>
+                      )}
                     </>
                   )}
 

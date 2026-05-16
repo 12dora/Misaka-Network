@@ -43,6 +43,7 @@ export const TURN_PROVIDER = (process.env.TURN_PROVIDER ?? 'cloudflare').toLower
 export const TURN_CF_KEY_ID = process.env.TURN_CF_KEY_ID ?? ''
 export const TURN_CF_API_TOKEN = process.env.TURN_CF_API_TOKEN ?? ''
 export const TURN_CF_ACCOUNT_TAG = process.env.TURN_CF_ACCOUNT_TAG ?? ''
+export const TURN_CF_ANALYTICS_API_TOKEN = process.env.TURN_CF_ANALYTICS_API_TOKEN ?? TURN_CF_API_TOKEN
 
 // Per-credential lifetime. Short on purpose: revoke + deny-list take effect
 // at most one TTL later even if a CF revoke call fails.

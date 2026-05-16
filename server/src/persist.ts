@@ -30,8 +30,12 @@ export interface IssuanceRecord {
 
 export interface MonthlyUsage {
   monthKey: string                  // "YYYY-MM" in UTC
-  bytesObserved: number             // last known total from CF analytics (+ local pessimistic delta)
+  bytesObserved: number             // effective guardrail bytes: max(CF monthly, local pessimistic)
+  cfBytesObserved: number           // Cloudflare Analytics source-of-truth monthly bytes
+  pessimisticBytesObserved: number  // local no-delay estimate before Analytics catches up
+  usageSource: 'cloudflare' | 'pessimistic'
   lastCfSyncAt: number
+  lastCfSyncError?: string
   killSwitchActive: boolean
   killSwitchTriggeredAt: number
 }
@@ -56,6 +60,9 @@ function emptyState(): TurnState {
     monthlyUsage: {
       monthKey: currentMonthKey(),
       bytesObserved: 0,
+      cfBytesObserved: 0,
+      pessimisticBytesObserved: 0,
+      usageSource: 'pessimistic',
       lastCfSyncAt: 0,
       killSwitchActive: false,
       killSwitchTriggeredAt: 0,
@@ -100,6 +107,7 @@ export async function loadTurnState(): Promise<TurnState> {
       if (state.monthlyUsage.monthKey !== nowKey) {
         rollMonth(nowKey)
       }
+      normalizeMonthlyUsage()
       console.log(`[persist] loaded turn-state.json (month=${state.monthlyUsage.monthKey}, denyList sessions=${Object.keys(state.denyList.sessions).length} ips=${Object.keys(state.denyList.ips).length})`)
     } else {
       console.warn('[persist] state file has unexpected shape, starting empty')
@@ -128,11 +136,27 @@ function rollMonth(newKey: string) {
   state.monthlyUsage = {
     monthKey: newKey,
     bytesObserved: 0,
+    cfBytesObserved: 0,
+    pessimisticBytesObserved: 0,
+    usageSource: 'pessimistic',
     lastCfSyncAt: 0,
     killSwitchActive: false,
     killSwitchTriggeredAt: 0,
   }
   markDirty()
+}
+
+function normalizeMonthlyUsage() {
+  const u = state.monthlyUsage as MonthlyUsage & {
+    cfBytesObserved?: number
+    pessimisticBytesObserved?: number
+    usageSource?: 'cloudflare' | 'pessimistic'
+    lastCfSyncError?: string
+  }
+  u.cfBytesObserved ??= u.lastCfSyncAt > 0 ? u.bytesObserved : 0
+  u.pessimisticBytesObserved ??= u.lastCfSyncAt > 0 ? 0 : u.bytesObserved
+  u.usageSource ??= u.lastCfSyncAt > 0 ? 'cloudflare' : 'pessimistic'
+  u.bytesObserved = Math.max(u.cfBytesObserved, u.pessimisticBytesObserved)
 }
 
 export function rollMonthIfNeeded(): boolean {

@@ -12,7 +12,7 @@
 //     bounds the abuse window. CF revoke is best-effort on top.
 
 import {
-  TURN_AUTO_ENABLED, TURN_PROVIDER, TURN_CF_KEY_ID, TURN_CF_API_TOKEN, TURN_CF_ACCOUNT_TAG,
+  TURN_AUTO_ENABLED, TURN_PROVIDER, TURN_CF_KEY_ID, TURN_CF_API_TOKEN, TURN_CF_ACCOUNT_TAG, TURN_CF_ANALYTICS_API_TOKEN,
   TURN_CREDENTIAL_TTL_SEC,
   TURN_MAX_BYTES_PER_SESSION, TURN_MAX_BYTES_PER_HOUR_PER_IP, TURN_MAX_ISSUE_PER_HOUR_PER_IP,
   TURN_GLOBAL_MONTHLY_BYTES_LIMIT, TURN_GLOBAL_THRESHOLD_PCT, TURN_REVOKE_ALL_ON_KILL,
@@ -129,8 +129,13 @@ export async function issueCredentials(sessionId: string, ip: string): Promise<I
   }
   state.activeCredentials[customIdentifier] = active
   state.ipIssuanceHistory.push({ ip, issuedAt: now })
-  // Pre-add the pessimistic delta to monthly counter; CF analytics will reset to actual.
-  state.monthlyUsage.bytesObserved += pessimisticBytes
+  // Pre-add the pessimistic delta to the guardrail counter; CF Analytics
+  // supplies the displayed monthly source-of-truth when it syncs.
+  state.monthlyUsage.pessimisticBytesObserved += pessimisticBytes
+  state.monthlyUsage.bytesObserved = Math.max(
+    state.monthlyUsage.cfBytesObserved,
+    state.monthlyUsage.pessimisticBytesObserved,
+  )
   markDirty()
 
   // Check global kill threshold after pessimistic add
@@ -200,9 +205,12 @@ export function getTurnStatus() {
     provider: TURN_PROVIDER,
     credentialTtlSec: TURN_CREDENTIAL_TTL_SEC,
     monthKey: u.monthKey,
-    monthlyBytesUsed: u.bytesObserved,
+    monthlyBytesUsed: u.lastCfSyncAt > 0 ? u.cfBytesObserved : u.bytesObserved,
+    monthlyBytesEffective: u.bytesObserved,
+    monthlyUsageSource: u.lastCfSyncAt > 0 ? 'cloudflare' : 'pessimistic',
+    lastCfSyncError: u.lastCfSyncError,
     monthlyBytesLimit: limit,
-    percentUsed: limit > 0 ? (u.bytesObserved / limit) * 100 : 0,
+    percentUsed: limit > 0 ? ((u.lastCfSyncAt > 0 ? u.cfBytesObserved : u.bytesObserved) / limit) * 100 : 0,
     thresholdPct: TURN_GLOBAL_THRESHOLD_PCT,
     killSwitchActive: u.killSwitchActive,
     killSwitchTriggeredAt: u.killSwitchTriggeredAt,
@@ -361,7 +369,7 @@ async function cfGraphQL<T>(query: string, variables: Record<string, unknown>): 
   const res = await fetch(CF_GRAPHQL, {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${TURN_CF_API_TOKEN}`,
+      'Authorization': `Bearer ${TURN_CF_ANALYTICS_API_TOKEN}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ query, variables }),
@@ -376,14 +384,14 @@ async function cfGraphQL<T>(query: string, variables: Record<string, unknown>): 
 }
 
 interface AnalyticsAggregateRow {
-  sum: { bytesEgressed?: number; bytesIngressed?: number }
+  sum: { egressBytes?: number; ingressBytes?: number }
   dimensions: { customIdentifier?: string }
 }
 
 interface AnalyticsViewerResp {
   viewer: {
     accounts: Array<{
-      rtcRelayedTrafficAdaptiveGroups?: AnalyticsAggregateRow[]
+      callsTurnUsageAdaptiveGroups?: AnalyticsAggregateRow[]
     }>
   }
 }
@@ -404,11 +412,11 @@ async function pollPerIdentifierUsage() {
     query($accountTag: String!, $since: Time!, $until: Time!) {
       viewer {
         accounts(filter: { accountTag: $accountTag }) {
-          rtcRelayedTrafficAdaptiveGroups(
+          callsTurnUsageAdaptiveGroups(
             limit: 1000
             filter: { datetime_geq: $since, datetime_leq: $until }
           ) {
-            sum { bytesEgressed bytesIngressed }
+            sum { egressBytes ingressBytes }
             dimensions { customIdentifier }
           }
         }
@@ -427,12 +435,12 @@ async function pollPerIdentifierUsage() {
     return
   }
 
-  const rows = data.viewer.accounts[0]?.rtcRelayedTrafficAdaptiveGroups ?? []
+  const rows = data.viewer.accounts[0]?.callsTurnUsageAdaptiveGroups ?? []
   const byCid = new Map<string, number>()
   for (const r of rows) {
     const cid = r.dimensions.customIdentifier
     if (!cid) continue
-    const bytes = (r.sum.bytesEgressed ?? 0) + (r.sum.bytesIngressed ?? 0)
+    const bytes = (r.sum.egressBytes ?? 0) + (r.sum.ingressBytes ?? 0)
     byCid.set(cid, (byCid.get(cid) ?? 0) + bytes)
   }
 
@@ -443,7 +451,11 @@ async function pollPerIdentifierUsage() {
     // already-counted pessimistic (analytics is the source of truth from now on).
     if (actualBytes > active.pessimisticBytes) {
       const delta = actualBytes - active.pessimisticBytes
-      state.monthlyUsage.bytesObserved += delta
+      state.monthlyUsage.pessimisticBytesObserved += delta
+      state.monthlyUsage.bytesObserved = Math.max(
+        state.monthlyUsage.cfBytesObserved,
+        state.monthlyUsage.pessimisticBytesObserved,
+      )
       active.pessimisticBytes = actualBytes
       markDirty()
     }
@@ -466,21 +478,6 @@ async function pollGlobalUsage() {
   const now = new Date()
   const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))
 
-  const query = `
-    query($accountTag: String!, $since: Date!, $until: Date!) {
-      viewer {
-        accounts(filter: { accountTag: $accountTag }) {
-          rtcRelayedTrafficAdaptiveGroups(
-            limit: 1
-            filter: { date_geq: $since, date_leq: $until }
-          ) {
-            sum { bytesEgressed bytesIngressed }
-            dimensions { customIdentifier }
-          }
-        }
-      }
-    }
-  `
   let data: AnalyticsViewerResp
   try {
     // Need aggregate sum across all rows — query with the same shape but
@@ -489,11 +486,11 @@ async function pollGlobalUsage() {
       query($accountTag: String!, $since: Date!, $until: Date!) {
         viewer {
           accounts(filter: { accountTag: $accountTag }) {
-            rtcRelayedTrafficAdaptiveGroups(
+            callsTurnUsageAdaptiveGroups(
               limit: 10000
               filter: { date_geq: $since, date_leq: $until }
             ) {
-              sum { bytesEgressed bytesIngressed }
+              sum { egressBytes ingressBytes }
               dimensions { customIdentifier }
             }
           }
@@ -506,23 +503,28 @@ async function pollGlobalUsage() {
       until: isoDate(now),
     })
   } catch (err) {
+    state.monthlyUsage.lastCfSyncError = (err as Error).message
+    markDirty()
     console.error('[turn] global analytics query failed:', (err as Error).message)
     return
   }
 
-  void query  // keep tsc happy if linters get strict
-  const rows = data.viewer.accounts[0]?.rtcRelayedTrafficAdaptiveGroups ?? []
+  const rows = data.viewer.accounts[0]?.callsTurnUsageAdaptiveGroups ?? []
   let total = 0
   for (const r of rows) {
-    total += (r.sum.bytesEgressed ?? 0) + (r.sum.bytesIngressed ?? 0)
+    total += (r.sum.egressBytes ?? 0) + (r.sum.ingressBytes ?? 0)
   }
 
-  // CF analytics is the source of truth. If our pessimistic counter is higher,
-  // we keep the pessimistic value (defensive — analytics may be incomplete).
-  if (total > state.monthlyUsage.bytesObserved) {
-    state.monthlyUsage.bytesObserved = total
-  }
+  state.monthlyUsage.cfBytesObserved = total
+  state.monthlyUsage.bytesObserved = Math.max(total, state.monthlyUsage.pessimisticBytesObserved)
+  state.monthlyUsage.usageSource = 'cloudflare'
   state.monthlyUsage.lastCfSyncAt = Date.now()
+  delete state.monthlyUsage.lastCfSyncError
   markDirty()
   evaluateGlobalKillSwitch()
+}
+
+export async function syncTurnUsageNow() {
+  await pollGlobalUsage()
+  return getTurnStatus()
 }
