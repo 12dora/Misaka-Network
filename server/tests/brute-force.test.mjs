@@ -14,6 +14,9 @@
 import { spawn } from 'child_process'
 import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
+import { runTest, killChild } from './_harness.mjs'
+
+runTest(main)
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const SERVER_DIR = join(__dirname, '..')
@@ -37,12 +40,7 @@ async function main() {
     process.exitCode = 1
   } finally {
     // ── Cleanup ───────────────────────────────────────────────
-    if (serverProcess) {
-      serverProcess.kill('SIGTERM')
-      setTimeout(() => {
-        if (serverProcess) serverProcess.kill('SIGKILL')
-      }, 3000)
-    }
+    killChild(serverProcess)
   }
 }
 
@@ -175,5 +173,3 @@ async function waitForServer() {
   }
   throw new Error('服务器启动超时')
 }
-
-main()

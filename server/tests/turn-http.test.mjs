@@ -4,6 +4,11 @@ import { spawn } from 'node:child_process'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { runTest, killChild } from './_harness.mjs'
+
+runTest(main)
+
+async function main() {
 
 const port = 19080 + Math.floor(Math.random() * 1000)
 const tmp = mkdtempSync(join(tmpdir(), 'misaka-turn-http-'))
@@ -82,7 +87,8 @@ try {
 
   console.log('✅ TURN HTTP 自动下发测试通过')
 } finally {
-  proc.kill('SIGTERM')
+  killChild(proc)
   await wait(200)
   rmSync(tmp, { recursive: true, force: true })
+}
 }
