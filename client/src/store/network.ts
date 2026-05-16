@@ -807,24 +807,29 @@ function handleIceStateChange(pc: RTCPeerConnection, peerSessionId: string) {
     iceRestartAttempts.set(peerSessionId, 0)
     void onIceConnected(pc, peerSessionId)
   } else if (state === 'disconnected') {
-    const prevStatus = useNetworkStore.getState().peers.find(p => p.sessionId === peerSessionId)?.status
-    useNetworkStore.setState(s => ({
-      peers: s.peers.map(p =>
-        p.sessionId === peerSessionId ? { ...p, status: 'reconnecting' as NodeStatus } : p,
-      ),
-    }))
-    if (prevStatus === 'transferring') {
-      appendSystemChat(peerSessionId, '⚠ 连接中断，尝试恢复中…')
-    }
-    // Schedule a proactive restart instead of waiting ~30s for 'failed'.
+    // Browsers (esp. mobile Safari + Chrome on Wi-Fi/cellular handoff) flap
+    // ICE through 'disconnected' briefly before snapping back to 'connected'
+    // on their own. Flipping status='reconnecting' synchronously caused a
+    // visible "正在尝试重新协商连接…" banner the instant the user did anything
+    // that woke the page (focusing the chat input, tapping send) even though
+    // the channel was healthy. Defer the status update — let the same timer
+    // that schedules the proactive restart also do the UI flip.
     if (!disconnectedTimers.has(peerSessionId)) {
       const t = setTimeout(() => {
         disconnectedTimers.delete(peerSessionId)
         const cur = peerConnections.get(peerSessionId)
         if (!cur) return
-        if (cur.iceConnectionState === 'disconnected' || cur.iceConnectionState === 'failed') {
-          attemptIceRestart(peerSessionId)
+        if (cur.iceConnectionState !== 'disconnected' && cur.iceConnectionState !== 'failed') return
+        const prevStatus = useNetworkStore.getState().peers.find(p => p.sessionId === peerSessionId)?.status
+        useNetworkStore.setState(s => ({
+          peers: s.peers.map(p =>
+            p.sessionId === peerSessionId ? { ...p, status: 'reconnecting' as NodeStatus } : p,
+          ),
+        }))
+        if (prevStatus === 'transferring') {
+          appendSystemChat(peerSessionId, '⚠ 连接中断，尝试恢复中…')
         }
+        attemptIceRestart(peerSessionId)
       }, ICE_DISCONNECTED_RESTART_DELAY_MS)
       disconnectedTimers.set(peerSessionId, t)
     }
@@ -1217,11 +1222,24 @@ function cleanupPeerConnection(sessionId: string, options: { failQueuedMessages?
   iceRestartAttempts.delete(sessionId)
   iceRestarting.delete(sessionId)
   clearDisconnectedTimer(sessionId)
+  // Detach dc.onclose BEFORE calling dc.close(). Otherwise the listener set in
+  // setupDataChannel sees pc still alive (we close dc first, pc second) and
+  // fires attemptIceRestart for a connection we're intentionally tearing down,
+  // which flips the peer status to 'reconnecting' the moment the user does
+  // anything that triggers a fresh ensureConnected() — the "click send → 重新协商中"
+  // symptom on LAN peers.
   const dc = dataChannels.get(sessionId)
-  if (dc) { dc.close(); dataChannels.delete(sessionId) }
+  if (dc) {
+    dc.onclose = null
+    dc.close()
+    dataChannels.delete(sessionId)
+  }
   const lanes = transferLanes.get(sessionId)
   if (lanes) {
-    for (const lane of lanes) lane.close()
+    for (const lane of lanes) {
+      lane.onclose = null
+      lane.close()
+    }
     transferLanes.delete(sessionId)
   }
   const pc = peerConnections.get(sessionId)
