@@ -8,8 +8,8 @@ import AppFooter from '@/components/ui/AppFooter'
 import QRModal from '@/components/features/QRModal'
 import { useNetworkStore } from '@/store/network'
 import { useAuthStore } from '@/store/auth'
-import { apiUrl } from '@/config'
 import { appUrl } from '@/lib/appBase'
+import { authedFetch, AuthRequiredError } from '@/lib/api'
 import { humanizeError } from '@/lib/transfer'
 import { ensureNotificationPermission } from '@/lib/notify'
 import type { Peer, Transfer, PendingFileItem } from '@/types'
@@ -647,11 +647,10 @@ export default function Network() {
   async function handleCopyLink() {
     if (!auth.session?.token) return
     try {
-      const url = new URL(apiUrl('/api/qr-token'), location.origin)
-      if (auth.identity.passCode) url.searchParams.set('passCode', auth.identity.passCode)
-      const res = await fetch(url.toString(), {
-        headers: { Authorization: `Bearer ${auth.session.token}` },
-      })
+      const path = auth.identity.passCode
+        ? `/api/qr-token?passCode=${encodeURIComponent(auth.identity.passCode)}`
+        : '/api/qr-token'
+      const res = await authedFetch(path)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json() as { qrToken: string }
       const params = new URLSearchParams({
@@ -663,7 +662,11 @@ export default function Network() {
       await navigator.clipboard.writeText(link)
       setToast('链接已复制到剪贴板')
     } catch (e) {
-      setToast(`复制失败：${String(e)}`)
+      if (e instanceof AuthRequiredError) {
+        setToast('会话已失效，请重新接入后再试')
+      } else {
+        setToast(`复制失败：${String(e)}`)
+      }
     }
     setTimeout(() => setToast(null), 2400)
   }

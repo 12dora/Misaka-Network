@@ -3,7 +3,7 @@ import QRCode from 'qrcode'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
 import { useAuthStore } from '@/store/auth'
-import { apiUrl } from '@/config'
+import { authedFetch, AuthRequiredError } from '@/lib/api'
 import { playSound } from '@/lib/sound'
 import { appUrl } from '@/lib/appBase'
 import { useModalExit } from '@/hooks/useModalExit'
@@ -49,12 +49,10 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
     setLoading(true)
     setQrError(null)
     try {
-      const qrUrl = apiUrl('/api/qr-token')
-      const qp = new URL(qrUrl, location.origin)
-      if (passCode) qp.searchParams.set('passCode', passCode)
-      const res = await fetch(qp.toString(), {
-        headers: { Authorization: `Bearer ${session.token}` },
-      })
+      const path = passCode
+        ? `/api/qr-token?passCode=${encodeURIComponent(passCode)}`
+        : '/api/qr-token'
+      const res = await authedFetch(path)
       if (res.ok) {
         const data = await res.json() as { qrToken: string; channelId: string; expiresAt: number }
         setQrToken(data.qrToken)
@@ -65,11 +63,15 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
       } else {
         setQrError(`QR 令牌获取失败（HTTP ${res.status}）`)
       }
-    } catch {
-      setQrError('QR 令牌获取失败，请检查后端连接')
+    } catch (e) {
+      if (e instanceof AuthRequiredError) {
+        setQrError('会话已失效，请重新接入后再试')
+      } else {
+        setQrError('QR 令牌获取失败，请检查后端连接')
+      }
     }
     setLoading(false)
-  }, [session?.token])
+  }, [session?.token, passCode])
 
   useEffect(() => {
     fetchToken()

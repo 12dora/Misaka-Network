@@ -9,6 +9,7 @@ let ws: WebSocket | null = null
 let handlers = new Set<MessageHandler>()
 let connectHandlers = new Set<ConnectionHandler>()
 let disconnectHandlers = new Set<ConnectionHandler>()
+let authInvalidHandlers = new Set<ConnectionHandler>()
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null
 let token = ''
@@ -28,6 +29,11 @@ export function onConnect(handler: ConnectionHandler) {
 export function onDisconnect(handler: ConnectionHandler) {
   disconnectHandlers.add(handler)
   return () => { disconnectHandlers.delete(handler) }
+}
+
+export function onAuthInvalid(handler: ConnectionHandler) {
+  authInvalidHandlers.add(handler)
+  return () => { authInvalidHandlers.delete(handler) }
 }
 
 export function connect(t: string) {
@@ -71,9 +77,17 @@ function doConnect() {
     connectHandlers.forEach(h => h())
   }
 
-  sock.onclose = () => {
+  sock.onclose = (e) => {
     stopHeartbeat()
     disconnectHandlers.forEach(h => h())
+    // Server-side sessions are in-memory; after a server restart our cached
+    // token comes back as 4002 INVALID_TOKEN. Stop reconnecting with the
+    // dead token and let the auth store re-register from sessionStorage.
+    if (e.code === 4001 || e.code === 4002) {
+      serverShutdown = true
+      authInvalidHandlers.forEach(h => h())
+      return
+    }
     scheduleReconnect()
   }
 
@@ -135,6 +149,7 @@ export function disconnect() {
   handlers.clear()
   connectHandlers.clear()
   disconnectHandlers.clear()
+  authInvalidHandlers.clear()
   stopHeartbeat()
   if (ws) {
     ws.onclose = null // prevent reconnect
