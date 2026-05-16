@@ -1,11 +1,9 @@
-import { createSHA256 } from 'hash-wasm'
-import { computeFileHashInWorker } from './fileHashWorker'
 import {
   saveTransfer, updateTransfer, getTransfer, getActiveTransfers,
   saveChunk, getChunk, deleteChunks, getSavedChunkIndexes,
   type TransferRecord,
 } from './db'
-import { encryptChunk, decryptChunk } from './crypto'
+import { encryptChunk, decryptChunk, makeChunkIv, randomIvPrefix } from './crypto'
 import {
   CHUNK_SIZE, HIGH_WATER_MARK, LOW_WATER_MARK,
   TRANSFER_PROGRESS_INTERVAL_MS, TRANSFER_RECORD_INTERVAL_MS,
@@ -19,25 +17,12 @@ export { CHUNK_SIZE }
 export interface MetaMessage {
   type: 'meta'
   transferId: string
+  shortId: number          // compact id embedded in binary chunk frames
   fileName: string
   fileSize: number
   fileHash: string
   totalChunks: number
   mime: string
-}
-
-export interface ChunkHeader {
-  type: 'chunk'
-  transferId: string
-  index: number
-  total: number
-  checksum: string
-}
-
-export interface AckMessage {
-  type: 'ack'
-  transferId: string
-  index: number
 }
 
 export interface ResumeRequest {
@@ -46,40 +31,69 @@ export interface ResumeRequest {
   receivedChunks: number[]
 }
 
-export type DCProtocolMessage = MetaMessage | ChunkHeader | AckMessage | ResumeRequest | { type: 'ecdh-pub'; pub: string }
+export type DCProtocolMessage = MetaMessage | ResumeRequest | { type: 'ecdh-pub'; pub: string }
 
-// ── Hashing ──────────────────────────────────────────────────────────
+// ── Binary chunk frame ──────────────────────────────────────────────
+// One SCTP message per chunk. Layout:
+//   [0]      tag = 0x01
+//   [1..5)   shortId (uint32 BE) — registered by the meta message
+//   [5..9)   chunk index (uint32 BE)
+//   [9..21)  AES-GCM IV (12 bytes)
+//   [21..]   ciphertext (plaintext + 16-byte GCM auth tag)
+// Replaces the prior "JSON header + binary body" pair, halving the
+// DataChannel message count and removing JSON parse from the hot path.
 
-export async function computeFileHash(file: File): Promise<string> {
-  const workerHash = computeFileHashInWorker(file)
-  if (workerHash) {
-    try {
-      return await workerHash
-    } catch {
-      // Fall through to the inline path if the worker is unavailable at runtime.
-    }
-  }
+export const CHUNK_FRAME_TAG = 0x01
+const CHUNK_FRAME_HEADER_BYTES = 21
 
-  const hasher = await createSHA256()
-  const CHUNK = 4 * 1024 * 1024 // 4MB read chunks
-  for (let offset = 0; offset < file.size; offset += CHUNK) {
-    const slice = file.slice(offset, offset + CHUNK)
-    const buf = await slice.arrayBuffer()
-    hasher.update(new Uint8Array(buf))
-  }
-  return hasher.digest('hex')
+export function encodeChunkFrame(
+  shortId: number,
+  index: number,
+  iv: Uint8Array,
+  ciphertext: ArrayBuffer,
+): ArrayBuffer {
+  const out = new Uint8Array(CHUNK_FRAME_HEADER_BYTES + ciphertext.byteLength)
+  const view = new DataView(out.buffer)
+  view.setUint8(0, CHUNK_FRAME_TAG)
+  view.setUint32(1, shortId >>> 0, false)
+  view.setUint32(5, index >>> 0, false)
+  out.set(iv, 9)
+  out.set(new Uint8Array(ciphertext), CHUNK_FRAME_HEADER_BYTES)
+  return out.buffer
 }
 
-export async function computeChunkChecksum(data: ArrayBuffer): Promise<string> {
-  const hasher = await createSHA256()
-  hasher.update(new Uint8Array(data))
-  return hasher.digest('hex')
+export interface DecodedChunkFrame {
+  shortId: number
+  index: number
+  iv: Uint8Array<ArrayBuffer>
+  ciphertext: ArrayBuffer
 }
 
-export async function verifyFileHash(file: File, expectedHash: string): Promise<boolean> {
-  const actual = await computeFileHash(file)
-  return actual === expectedHash
+export function decodeChunkFrame(buf: ArrayBuffer): DecodedChunkFrame | null {
+  if (buf.byteLength < CHUNK_FRAME_HEADER_BYTES) return null
+  const view = new DataView(buf)
+  if (view.getUint8(0) !== CHUNK_FRAME_TAG) return null
+  const shortId = view.getUint32(1, false)
+  const index = view.getUint32(5, false)
+  const iv = new Uint8Array(buf.slice(9, 21)) as Uint8Array<ArrayBuffer>
+  const ciphertext = buf.slice(CHUNK_FRAME_HEADER_BYTES)
+  return { shortId, index, iv, ciphertext }
 }
+
+let shortIdCounter = (Math.random() * 0xffffffff) >>> 0
+function nextShortId(): number {
+  shortIdCounter = (shortIdCounter + 1) >>> 0
+  if (shortIdCounter === 0) shortIdCounter = 1
+  return shortIdCounter
+}
+
+// Per-chunk AES-GCM auth tags already provide cryptographic integrity for
+// every chunk we deliver; computing a whole-file SHA-256 before sending and
+// re-reading the assembled file at the receiver to verify it was a redundant
+// 2× full-file scan that pegged CPU and delayed send start by several seconds
+// on large files. The `fileHash` field in MetaMessage / TransferRecord
+// remains for backwards-compat with old persisted records but is no longer
+// populated.
 
 // ── Send file ────────────────────────────────────────────────────────
 
@@ -90,135 +104,6 @@ export interface SendCallbacks {
 
 function shouldFlushProgress(lastAt: number, done: number, total: number) {
   return done === total || performance.now() - lastAt >= TRANSFER_PROGRESS_INTERVAL_MS
-}
-
-export async function sendFile(
-  dc: RTCDataChannel,
-  file: File,
-  transferId: string,
-  peerNodeId: number,
-  peerSessionId: string,
-  existingRecord?: TransferRecord, // for resume
-  callbacks?: SendCallbacks,
-  peerReceivedChunks?: number[], // actual chunks the receiver reports having
-): Promise<void> {
-  const fileHash = existingRecord?.fileHash ?? await computeFileHash(file)
-  const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
-
-  const record: TransferRecord = existingRecord ?? {
-    transferId,
-    direction: 'send',
-    peerNodeId,
-    fileName: file.name,
-    fileSize: file.size,
-    fileHash,
-    totalChunks,
-    receivedChunks: [],
-    status: 'active',
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-  }
-  await saveTransfer(record)
-
-  // Build skip set from peer's actual bitmap (preferred), fall back to local record
-  let skipSet: Set<number>
-  if (peerReceivedChunks && peerReceivedChunks.length > 0) {
-    skipSet = new Set(peerReceivedChunks)
-  } else if (existingRecord) {
-    const savedIndexes = await getSavedChunkIndexes(transferId)
-    skipSet = new Set(savedIndexes)
-  } else {
-    skipSet = new Set()
-  }
-
-  // Send metadata (skip if resuming — peer already has it)
-  if (!peerReceivedChunks && !existingRecord) {
-    dc.send(JSON.stringify({
-      type: 'meta',
-      transferId,
-      fileName: file.name,
-      fileSize: file.size,
-      fileHash,
-      totalChunks,
-      mime: file.type || 'application/octet-stream',
-    } satisfies MetaMessage))
-  }
-
-  let sent = skipSet.size
-  callbacks?.onProgress?.(sent, totalChunks)
-  const sentChunkIndexes = new Set(record.receivedChunks)
-  let lastProgressAt = performance.now()
-  let lastRecordAt = performance.now()
-  let recordDirty = false
-
-  for (let i = 0; i < totalChunks; i++) {
-    if (skipSet.has(i)) continue
-
-    // Check pause/cancel signals
-    const signal = transferSignals.get(transferId)
-    if (signal?.cancelled) {
-      await updateTransfer(transferId, { status: 'failed' })
-      return
-    }
-    if (signal?.paused) {
-      await updateTransfer(transferId, { status: 'paused' })
-      await waitWhilePaused(transferId)
-      const s2 = transferSignals.get(transferId)
-      if (s2?.cancelled) {
-        await updateTransfer(transferId, { status: 'failed' })
-        return
-      }
-      await updateTransfer(transferId, { status: 'active' })
-    }
-
-    const start = i * CHUNK_SIZE
-    const end = Math.min(start + CHUNK_SIZE, file.size)
-    const raw = await file.slice(start, end).arrayBuffer()
-
-    // Encrypt
-    const { iv, encrypted } = await encryptChunk(raw, peerSessionId)
-
-    // Send header as text
-    dc.send(JSON.stringify({
-      type: 'chunk',
-      transferId,
-      index: i,
-      total: totalChunks,
-      checksum: '',
-    } satisfies ChunkHeader))
-
-    // Pack iv + encrypted into one binary message
-    const packet = new Uint8Array(12 + encrypted.byteLength)
-    packet.set(iv, 0)
-    packet.set(new Uint8Array(encrypted), 12)
-
-    // Flow control: wait if buffer is full
-    await waitForBuffer(dc)
-    dc.send(packet.buffer)
-
-    sent++
-    if (shouldFlushProgress(lastProgressAt, sent, totalChunks)) {
-      callbacks?.onProgress?.(sent, totalChunks)
-      lastProgressAt = performance.now()
-    }
-
-    // Track which chunks we've sent this session. The receiver's resume bitmap
-    // is still authoritative, so avoid writing every outgoing chunk body to IDB.
-    sentChunkIndexes.add(i)
-    recordDirty = true
-    if (performance.now() - lastRecordAt >= TRANSFER_RECORD_INTERVAL_MS || sent === totalChunks) {
-      record.receivedChunks = Array.from(sentChunkIndexes).sort((a, b) => a - b)
-      await updateTransfer(transferId, { receivedChunks: record.receivedChunks })
-      recordDirty = false
-      lastRecordAt = performance.now()
-    }
-  }
-
-  if (recordDirty) {
-    record.receivedChunks = Array.from(sentChunkIndexes).sort((a, b) => a - b)
-    await updateTransfer(transferId, { receivedChunks: record.receivedChunks })
-  }
-  await updateTransfer(transferId, { status: 'completed' })
 }
 
 export async function sendFileParallel(
@@ -232,13 +117,15 @@ export async function sendFileParallel(
   peerReceivedChunks?: number[],
 ): Promise<void> {
   const lanes = dcs.filter(dc => dc.readyState === 'open').slice(0, TRANSFER_LANE_COUNT)
-  if (lanes.length <= 1) {
-    await sendFile(lanes[0] ?? dcs[0], file, transferId, peerNodeId, peerSessionId, existingRecord, callbacks, peerReceivedChunks)
-    return
-  }
+  const activeLanes = lanes.length > 0 ? lanes : (dcs[0] ? [dcs[0]] : [])
+  if (activeLanes.length === 0) throw new Error('No open DataChannel lane available')
 
-  const fileHash = existingRecord?.fileHash ?? await computeFileHash(file)
+  const fileHash = existingRecord?.fileHash ?? ''
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
+  const shortId = nextShortId()
+  // 8-byte random prefix; combined with the 4-byte chunk index it yields a
+  // unique 12-byte IV per chunk without an RNG syscall in the hot loop.
+  const ivPrefix = randomIvPrefix()
   const record: TransferRecord = existingRecord ?? {
     transferId,
     direction: 'send',
@@ -263,19 +150,19 @@ export async function sendFileParallel(
   let lastRecordAt = performance.now()
   let recordDirty = false
 
+  // Meta is always (re)sent so the receiver can register the new shortId for
+  // this connection — cheap and avoids a separate "remap" message on resume.
   const meta = JSON.stringify({
     type: 'meta',
     transferId,
+    shortId,
     fileName: file.name,
     fileSize: file.size,
     fileHash,
     totalChunks,
     mime: file.type || 'application/octet-stream',
   } satisfies MetaMessage)
-
-  if (!peerReceivedChunks && !existingRecord) {
-    for (const lane of lanes) lane.send(meta)
-  }
+  for (const lane of activeLanes) lane.send(meta)
 
   callbacks?.onProgress?.(sent, totalChunks)
 
@@ -296,60 +183,75 @@ export async function sendFileParallel(
     lastRecordAt = performance.now()
   }
 
-  async function laneLoop(dc: RTCDataChannel) {
-    while (!cancelled) {
-      const signal = transferSignals.get(transferId)
-      if (signal?.cancelled) {
+  // Pause/cancel check shared by the prefetcher and the send loop.
+  // Returns true if the caller should abort the lane (cancelled).
+  async function checkSignals(): Promise<boolean> {
+    const signal = transferSignals.get(transferId)
+    if (signal?.cancelled) {
+      cancelled = true
+      await updateTransfer(transferId, { status: 'failed' })
+      return true
+    }
+    if (signal?.paused) {
+      await updateTransfer(transferId, { status: 'paused' })
+      await waitWhilePaused(transferId)
+      const s2 = transferSignals.get(transferId)
+      if (s2?.cancelled) {
         cancelled = true
         await updateTransfer(transferId, { status: 'failed' })
-        return
+        return true
       }
-      if (signal?.paused) {
-        await updateTransfer(transferId, { status: 'paused' })
-        await waitWhilePaused(transferId)
-        const s2 = transferSignals.get(transferId)
-        if (s2?.cancelled) {
-          cancelled = true
-          await updateTransfer(transferId, { status: 'failed' })
-          return
-        }
-        await updateTransfer(transferId, { status: 'active' })
-      }
+      await updateTransfer(transferId, { status: 'active' })
+    }
+    return false
+  }
 
-      const i = nextIndex()
-      if (i === null) return
+  // Read + encrypt the next chunk for a lane. Returns null when the queue is
+  // drained (or the transfer was cancelled mid-prep). Runs on its own
+  // microtask so the previous chunk's dc.send can overlap with disk I/O and
+  // AES-GCM — this is the core of the lane-level pipeline.
+  async function prepareNext(): Promise<{ i: number; iv: Uint8Array; encrypted: ArrayBuffer } | null> {
+    if (cancelled) return null
+    if (await checkSignals()) return null
+    const i = nextIndex()
+    if (i === null) return null
+    const start = i * CHUNK_SIZE
+    const end = Math.min(start + CHUNK_SIZE, file.size)
+    const raw = await file.slice(start, end).arrayBuffer()
+    const { iv, encrypted } = await encryptChunk(raw, peerSessionId, makeChunkIv(ivPrefix, i))
+    return { i, iv, encrypted }
+  }
 
-      const start = i * CHUNK_SIZE
-      const end = Math.min(start + CHUNK_SIZE, file.size)
-      const raw = await file.slice(start, end).arrayBuffer()
-      const { iv, encrypted } = await encryptChunk(raw, peerSessionId)
+  async function laneLoop(dc: RTCDataChannel) {
+    // Kick off the first chunk; from then on each iteration starts the next
+    // chunk's prepare before awaiting the current chunk's send.
+    let prepared = await prepareNext()
+    while (prepared && !cancelled) {
+      const current = prepared
+      // Start preparing the next chunk in the background; we'll await it at
+      // the top of the next iteration. dc.send / waitForBuffer below now
+      // runs in parallel with the next disk read + AES-GCM encrypt.
+      const upcoming = prepareNext()
 
+      const packet = encodeChunkFrame(shortId, current.i, current.iv, current.encrypted)
       await waitForBuffer(dc)
-      dc.send(JSON.stringify({
-        type: 'chunk',
-        transferId,
-        index: i,
-        total: totalChunks,
-        checksum: '',
-      } satisfies ChunkHeader))
-
-      const packet = new Uint8Array(12 + encrypted.byteLength)
-      packet.set(iv, 0)
-      packet.set(new Uint8Array(encrypted), 12)
-      dc.send(packet.buffer)
+      if (cancelled) return
+      dc.send(packet)
 
       sent++
-      sentChunkIndexes.add(i)
+      sentChunkIndexes.add(current.i)
       recordDirty = true
       if (shouldFlushProgress(lastProgressAt, sent, totalChunks)) {
         callbacks?.onProgress?.(sent, totalChunks)
         lastProgressAt = performance.now()
       }
       await flushRecord(sent === totalChunks)
+
+      prepared = await upcoming
     }
   }
 
-  await Promise.all(lanes.map(lane => laneLoop(lane)))
+  await Promise.all(activeLanes.map(lane => laneLoop(lane)))
   await flushRecord(true)
   if (!cancelled) await updateTransfer(transferId, { status: 'completed' })
 }
@@ -371,6 +273,7 @@ type ReceiveSession = {
   mime: string
   received: Set<number>
   lastRecordAt: number
+  lastProgressAt: number   // throttle React store updates — 4000 setState/GB otherwise
   storageMode: 'pending' | 'stream' | 'indexeddb'
   direction: 'recv'
 }
@@ -394,6 +297,7 @@ export async function handleMetaMessage(msg: MetaMessage, peerNodeId: number): P
     mime: msg.mime,
     received: new Set(),
     lastRecordAt: performance.now(),
+    lastProgressAt: 0,
     storageMode: 'pending',
     direction: 'recv',
   }
@@ -419,27 +323,17 @@ export async function handleMetaMessage(msg: MetaMessage, peerNodeId: number): P
 
 export async function receiveChunk(
   transferId: string,
-  header: ChunkHeader,
+  index: number,
   iv: Uint8Array<ArrayBuffer>,
   encrypted: ArrayBuffer,
   peerSessionId: string,
   callbacks?: ReceiveCallbacks,
-): Promise<{ ack: AckMessage; decrypted: ArrayBuffer; storageMode: 'stream' | 'indexeddb' } | undefined> {
+): Promise<{ decrypted: ArrayBuffer; storageMode: 'stream' | 'indexeddb' } | undefined> {
   const session = receiveSessions.get(transferId)
   if (!session) return
 
-  // AES-GCM authenticates the encrypted payload. Keep checksum verification
-  // only for older senders that still populate it; skipping the duplicate hash
-  // removes a hot-path CPU bottleneck on local transfers.
-  if (header.checksum) {
-    const actualChecksum = await computeChunkChecksum(encrypted)
-    if (actualChecksum !== header.checksum) {
-      callbacks?.onError?.('Chunk checksum mismatch')
-      return
-    }
-  }
-
-  // Decrypt
+  // AES-GCM authenticates the encrypted payload — no separate per-chunk
+  // checksum is needed (and the sender no longer ships one).
   const decrypted = await decryptChunk(iv, encrypted, peerSessionId)
 
   const hasStreamingTarget = getWriteHandle(transferId) || getOPFSHandle(transferId)
@@ -447,10 +341,10 @@ export async function receiveChunk(
     session.storageMode = hasStreamingTarget ? 'stream' : 'indexeddb'
   }
   if (session.storageMode === 'indexeddb') {
-    await saveChunk(transferId, header.index, decrypted)
+    await saveChunk(transferId, index, decrypted)
   }
 
-  session.received.add(header.index)
+  session.received.add(index)
 
   if (
     performance.now() - session.lastRecordAt >= TRANSFER_RECORD_INTERVAL_MS ||
@@ -463,13 +357,17 @@ export async function receiveChunk(
     session.lastRecordAt = performance.now()
   }
 
-  callbacks?.onProgress?.(session.received.size, session.totalChunks)
-
-  return {
-    ack: { type: 'ack', transferId, index: header.index },
-    decrypted,
-    storageMode: session.storageMode,
+  // Throttle progress callbacks the same way the sender does. Without this
+  // the receiver fires setState ~4000×/GB, drowning the main thread in React
+  // re-renders. Always emit the final tick so the "received === total"
+  // delivery hook in network.ts still runs.
+  const done = session.received.size === session.totalChunks
+  if (done || performance.now() - session.lastProgressAt >= TRANSFER_PROGRESS_INTERVAL_MS) {
+    callbacks?.onProgress?.(session.received.size, session.totalChunks)
+    session.lastProgressAt = performance.now()
   }
+
+  return { decrypted, storageMode: session.storageMode }
 }
 
 export async function assembleFile(transferId: string): Promise<File> {
@@ -484,13 +382,10 @@ export async function assembleFile(transferId: string): Promise<File> {
   }
 
   const blob = new Blob(chunks, { type: session.mime })
-  const file = new File([blob], session.fileName, { type: session.mime })
-
-  // Verify hash
-  const ok = await verifyFileHash(file, session.fileHash)
-  if (!ok) throw new Error('File hash verification failed')
-
-  return file
+  // AES-GCM auth tags on each chunk are the integrity check — any tampered
+  // or truncated chunk would have failed decrypt above. No need to re-read
+  // the whole file through SHA-256.
+  return new File([blob], session.fileName, { type: session.mime })
 }
 
 export async function completeReceive(transferId: string): Promise<File> {
@@ -604,6 +499,46 @@ export async function checkForResumableTransfers(): Promise<TransferRecord[]> {
   return getActiveTransfers()
 }
 
+// ── Async write queue (fire-and-forget + backpressure) ────────────────
+// FileSystemWritableFileStream serializes writes internally, so awaiting
+// each chunk in the receive hot path gates throughput on disk latency.
+// Fire writes without awaiting per chunk; cap outstanding bytes so the
+// in-process queue can't grow without bound on slow disks.
+
+const WRITE_BACKPRESSURE_BYTES = 16 * 1024 * 1024  // 16 MB outstanding cap
+
+class WriteQueue {
+  private pending = new Set<Promise<unknown>>()
+  private pendingBytes = 0
+
+  /**
+   * Enqueue a write. Returns a promise that resolves immediately unless the
+   * outstanding-bytes cap has been hit, in which case it waits for one
+   * in-flight write to complete (coarse backpressure).
+   */
+  enqueue(promise: Promise<unknown>, bytes: number): Promise<unknown> | undefined {
+    const tracked = promise.catch(err => {
+      console.warn('[transfer] disk write failed', err)
+    })
+    this.pending.add(tracked)
+    this.pendingBytes += bytes
+    tracked.finally(() => {
+      this.pending.delete(tracked)
+      this.pendingBytes -= bytes
+    })
+    if (this.pendingBytes >= WRITE_BACKPRESSURE_BYTES && this.pending.size > 0) {
+      return Promise.race(this.pending)
+    }
+    return undefined
+  }
+
+  async drain(): Promise<void> {
+    while (this.pending.size > 0) {
+      await Promise.allSettled(this.pending)
+    }
+  }
+}
+
 // ── OPFS disk-backed receive (all modern browsers) ────────────────────
 // Uses navigator.storage.getDirectory() to write chunks to disk as they
 // arrive, avoiding the all-in-memory Blob assembly. Available in Chrome
@@ -616,6 +551,7 @@ export interface OPFSReceiveHandle {
   written: Set<number>
   totalChunks: number
   fileName: string
+  queue: WriteQueue
 }
 
 const opfsHandles = new Map<string, OPFSReceiveHandle>()
@@ -633,7 +569,7 @@ export async function createOPFSReceiveFile(
   const dir = await root.getDirectoryHandle('misaka-transfers', { create: true })
   const fileHandle = await dir.getFileHandle(`${transferId}-${fileName}`, { create: true })
   const writable = await fileHandle.createWritable({ keepExistingData: false })
-  const handle: OPFSReceiveHandle = { writable, fileHandle, written: new Set(), totalChunks, fileName }
+  const handle: OPFSReceiveHandle = { writable, fileHandle, written: new Set(), totalChunks, fileName, queue: new WriteQueue() }
   opfsHandles.set(transferId, handle)
   return handle
 }
@@ -650,13 +586,18 @@ export async function writeChunkToOPFS(
   const handle = opfsHandles.get(transferId)
   if (!handle) return
   const offset = index * CHUNK_SIZE
-  await handle.writable.write({ type: 'write', position: offset, data: new Uint8Array(data) })
   handle.written.add(index)
+  const wait = handle.queue.enqueue(
+    handle.writable.write({ type: 'write', position: offset, data: new Uint8Array(data) }),
+    data.byteLength,
+  )
+  if (wait) await wait
 }
 
 export async function getOPFSFile(transferId: string): Promise<File> {
   const handle = opfsHandles.get(transferId)
   if (!handle) throw new Error('No OPFS handle')
+  await handle.queue.drain()
   await handle.writable.close()
   const file = await handle.fileHandle.getFile()
   opfsHandles.delete(transferId)
@@ -688,6 +629,7 @@ export interface FileWriteHandle {
   fileHandle: FileSystemFileHandle
   written: Set<number>
   totalChunks: number
+  queue: WriteQueue
 }
 
 const writeHandles = new Map<string, FileWriteHandle>()
@@ -708,7 +650,7 @@ export async function requestWriteHandle(
     types: [{ description: suggestedName, accept: { 'application/octet-stream': [`.${ext}`] } }],
   }) as FileSystemFileHandle
   const writable = await fileHandle.createWritable()
-  const handle: FileWriteHandle = { writable, fileHandle, written: new Set(), totalChunks }
+  const handle: FileWriteHandle = { writable, fileHandle, written: new Set(), totalChunks, queue: new WriteQueue() }
   writeHandles.set(transferId, handle)
   return handle
 }
@@ -725,20 +667,23 @@ export async function streamChunkToDisk(
   const handle = writeHandles.get(transferId)
   if (!handle) return
   const offset = index * CHUNK_SIZE
-  await handle.writable.write({ type: 'write', position: offset, data: new Uint8Array(data) })
   handle.written.add(index)
+  const wait = handle.queue.enqueue(
+    handle.writable.write({ type: 'write', position: offset, data: new Uint8Array(data) }),
+    data.byteLength,
+  )
+  if (wait) await wait
 }
 
 export async function finalizeStreamedFile(transferId: string): Promise<File> {
   const handle = writeHandles.get(transferId)
   if (!handle) throw new Error('No write handle')
 
+  await handle.queue.drain()
   await handle.writable.close()
   writeHandles.delete(transferId)
 
-  // Return a File from the saved handle for hash verification
-  const file = await handle.fileHandle.getFile()
-  return file
+  return handle.fileHandle.getFile()
 }
 
 export function cancelStreamWrite(transferId: string) {

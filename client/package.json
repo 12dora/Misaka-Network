@@ -10,7 +10,6 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "hash-wasm": "^4.11.0",
     "idb": "^8.0.0",
     "jsqr": "^1.4.0",
     "qrcode": "^1.5.3",

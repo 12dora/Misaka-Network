@@ -8,8 +8,13 @@ export const NODE_ID_MAX = 20001
 
 // ── File transfer ─────────────────────────────────────────────────────
 export const CHUNK_SIZE = 252 * 1024             // 252 KB — must stay ≤ 256 KiB SCTP max after AES-GCM (+16 B) + IV (+12 B) overhead
-export const HIGH_WATER_MARK = 32 * 1024 * 1024  // 32 MB — keep the DataChannel fed on fast local links
-export const LOW_WATER_MARK = 12 * 1024 * 1024   // 12 MB — resume before the sender drains completely
+// Sized for LAN: a 32 MB high-water mark pushed Chrome's SCTP send buffer
+// into stop-and-go territory (bufferedAmountLow fired late, lane loops
+// stalled in bursts). 8 MB is ~30 chunks of headroom, enough to absorb a
+// disk-read + AES-GCM hiccup but small enough that the pipeline stays
+// rhythm-steady on a saturated gigabit link.
+export const HIGH_WATER_MARK = 8 * 1024 * 1024   // 8 MB — keep the DataChannel fed without overshooting SCTP
+export const LOW_WATER_MARK = 2 * 1024 * 1024    // 2 MB — resume early so the lane never empties
 export const TRANSFER_PROGRESS_INTERVAL_MS = 200
 export const TRANSFER_RECORD_INTERVAL_MS = 1_000
 export const TRANSFER_LANE_COUNT = 4
