@@ -53,7 +53,7 @@ export default function Privacy() {
           <h2 className="font-bold mt-4">客户端本地存储</h2>
           <p className="text-[var(--text-on-white-2)]">
             以下数据存储在用户浏览器本地：身份信息（sessionStorage）、TURN 服务器配置（localStorage）、
-            黑名单（localStorage）、传输进度（IndexedDB）。这些数据不上传服务器。
+            传输进度（IndexedDB）。这些数据不上传服务器。
           </p>
 
           <h2 className="font-bold mt-4">用户权利</h2>

@@ -164,7 +164,7 @@ function recoverConnections() {
   lastRecoverAt = now
   if (currentToken) {
     reconnectNow()
-    void refreshAutoTurn(currentToken)
+    void refreshAutoTurn()
   }
   for (const peer of useNetworkStore.getState().peers) {
     const pc = peerConnections.get(peer.sessionId)
@@ -320,7 +320,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
       // Prefetch auto TURN once authed. Server may reply 503 if disabled —
       // that's fine, we just fall back to STUN + manual TURN. Re-fetch on
       // every reconnect because credentials are short-lived.
-      void refreshAutoTurn(token)
+      void refreshAutoTurn()
     })
     onDisconnect(() => set({ wsConnected: false }))
 

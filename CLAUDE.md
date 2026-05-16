@@ -37,7 +37,7 @@ server/tests/         # spawn-process integration tests
 - WS close codes 4001/4002 must trigger `onAuthInvalid` → clear cached session → re-register. See `client/src/lib/signaling.ts` and `client/src/store/auth.ts`.
 - `CHUNK_FRAME_TAG = 0x01`. Frame layout: [tag:1][shortId:4][index:4][iv:12][ciphertext]. See `client/src/lib/transfer.ts`.
 - `makeChunkIv` merges an 8-byte random prefix (same per transfer) with a 4-byte BE index. See `client/src/lib/crypto.ts`.
-- TURN deny list bans with `expiresAt=0` are permanent and must survive month rollover. See `server/src/turn.ts` and `server/src/persist.ts`.
+- TURN relay is controlled by `turnSettings.enabled` — when off, neither auto nor manual TURN servers are added to the peer connection. See `client/src/lib/webrtc.ts`.
 
 ## CI
 

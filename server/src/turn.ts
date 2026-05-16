@@ -7,7 +7,7 @@
 //     returned to clients.
 //   - All enforcement runs server-side. Clients are pure consumers: a hooked
 //     client cannot grant itself credentials, raise its byte cap, or evade
-//     the deny list — every issuance round-trips through this module.
+//     — every issuance round-trips through this module.
 //   - Credentials are short (default 5 min) so a failed CF revoke still
 //     bounds the abuse window. CF revoke is best-effort on top.
 
@@ -18,11 +18,10 @@ import {
   TURN_GLOBAL_MONTHLY_BYTES_LIMIT, TURN_GLOBAL_THRESHOLD_PCT, TURN_REVOKE_ALL_ON_KILL,
   TURN_PESSIMISTIC_RATE_BPS,
   TURN_ABUSE_POLL_SEC, TURN_GLOBAL_POLL_SEC,
-  TURN_BAN_DURATION_SEC,
 } from './config.js'
 import {
   getTurnState, markDirty, rollMonthIfNeeded,
-  type ActiveCredential, type DenyEntry,
+  type ActiveCredential,
 } from './persist.js'
 
 const CF_API_BASE = 'https://rtc.live.cloudflare.com/v1'
@@ -36,8 +35,6 @@ export type IssueReject =
   | 'DISABLED'
   | 'NOT_CONFIGURED'
   | 'GLOBAL_QUOTA_EXCEEDED'
-  | 'SESSION_BANNED'
-  | 'IP_BANNED'
   | 'IP_RATE_LIMITED'
   | 'IP_BYTES_LIMITED'
   | 'CF_ERROR'
@@ -79,7 +76,6 @@ export async function issueCredentials(sessionId: string, ip: string): Promise<I
   const now = Date.now()
 
   rollMonthIfNeeded()
-  pruneDenyList(now)
   pruneIssuanceHistory(now)
   pruneActiveCredentials(now)
 
@@ -87,10 +83,6 @@ export async function issueCredentials(sessionId: string, ip: string): Promise<I
   if (state.monthlyUsage.killSwitchActive) {
     return { ok: false, reason: 'GLOBAL_QUOTA_EXCEEDED' }
   }
-
-  // Deny list checks
-  if (state.denyList.sessions[sessionId]) return { ok: false, reason: 'SESSION_BANNED' }
-  if (state.denyList.ips[ip]) return { ok: false, reason: 'IP_BANNED' }
 
   // Per-IP issuance rate (anti-spam: small file with the request count itself)
   const issueWindowMs = 60 * 60 * 1000
@@ -169,30 +161,6 @@ export async function revokeCustomIdentifier(customIdentifier: string): Promise<
   }
 }
 
-export function banSession(sessionId: string, reason: string) {
-  const state = getTurnState()
-  const now = Date.now()
-  const entry: DenyEntry = {
-    reason,
-    bannedAt: now,
-    expiresAt: TURN_BAN_DURATION_SEC > 0 ? now + TURN_BAN_DURATION_SEC * 1000 : 0,
-  }
-  state.denyList.sessions[sessionId] = entry
-  markDirty()
-}
-
-export function banIp(ip: string, reason: string) {
-  const state = getTurnState()
-  const now = Date.now()
-  const entry: DenyEntry = {
-    reason,
-    bannedAt: now,
-    expiresAt: TURN_BAN_DURATION_SEC > 0 ? now + TURN_BAN_DURATION_SEC * 1000 : 0,
-  }
-  state.denyList.ips[ip] = entry
-  markDirty()
-}
-
 // ── Status (safe to expose; no secrets) ──────────────────────────────
 
 export function getTurnStatus() {
@@ -216,10 +184,6 @@ export function getTurnStatus() {
     killSwitchTriggeredAt: u.killSwitchTriggeredAt,
     lastCfSyncAt: u.lastCfSyncAt,
     activeCredentials: Object.keys(state.activeCredentials).length,
-    denyListSize: {
-      sessions: Object.keys(state.denyList.sessions).length,
-      ips: Object.keys(state.denyList.ips).length,
-    },
   }
 }
 
@@ -294,18 +258,6 @@ async function cfGenerateCredentials(customIdentifier: string, ttlSec: number): 
   }
   const data = await res.json() as CfCredentialsResponse
   return data
-}
-
-function pruneDenyList(now: number) {
-  const state = getTurnState()
-  let changed = false
-  for (const [k, v] of Object.entries(state.denyList.sessions)) {
-    if (v.expiresAt > 0 && v.expiresAt < now) { delete state.denyList.sessions[k]; changed = true }
-  }
-  for (const [k, v] of Object.entries(state.denyList.ips)) {
-    if (v.expiresAt > 0 && v.expiresAt < now) { delete state.denyList.ips[k]; changed = true }
-  }
-  if (changed) markDirty()
 }
 
 function pruneIssuanceHistory(now: number) {
@@ -460,9 +412,7 @@ async function pollPerIdentifierUsage() {
       markDirty()
     }
     if (actualBytes >= TURN_MAX_BYTES_PER_SESSION) {
-      console.warn(`[turn] abuse: ${cid} used ${actualBytes} bytes (cap ${TURN_MAX_BYTES_PER_SESSION}), revoking + banning`)
-      banSession(active.sessionId, `BYTES_EXCEEDED:${actualBytes}`)
-      banIp(active.ip, `BYTES_EXCEEDED:${actualBytes}`)
+      console.warn(`[turn] abuse: ${cid} used ${actualBytes} bytes (cap ${TURN_MAX_BYTES_PER_SESSION}), revoking`)
       await revokeCustomIdentifier(cid)
       delete state.activeCredentials[cid]
       markDirty()

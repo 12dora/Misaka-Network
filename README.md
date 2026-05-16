@@ -151,7 +151,7 @@ curl -s https://signal.example.com/api/health
 |---|---|---|
 | `TURN_AUTO_ENABLED` | `true` | 总开关 |
 | `TURN_CREDENTIAL_TTL_SEC` | `300` | 凭证有效期（短=即使 revoke 失败也兜底） |
-| `TURN_MAX_BYTES_PER_SESSION` | 1 GB | 单 session 累计字节超额 → revoke + 入 deny list |
+| `TURN_MAX_BYTES_PER_SESSION` | 1 GB | 单 session 累计字节超额 → revoke |
 | `TURN_MAX_BYTES_PER_HOUR_PER_IP` | 10 GB | 单 IP 一小时悲观字节上限 |
 | `TURN_MAX_ISSUE_PER_HOUR_PER_IP` | 60 | 单 IP 一小时签发次数 |
 | `TURN_GLOBAL_MONTHLY_BYTES_LIMIT` | 1 TB | CF 免费额度上限（按 UTC 月份重置） |
@@ -159,11 +159,11 @@ curl -s https://signal.example.com/api/health
 | `TURN_REVOKE_ALL_ON_KILL` | `false` | 熔断时是否批量 revoke 所有活动凭证 |
 | `TURN_ABUSE_POLL_SEC` | `30` | 按 customIdentifier 查 CF Analytics 周期 |
 | `TURN_GLOBAL_POLL_SEC` | `120` | 全局月度用量查询周期 |
-| `TURN_BAN_DURATION_SEC` | `86400` | deny list 自动解禁时长（0=永久） |
+| `TURN_BAN_DURATION_SEC` | `86400` | 已移除（不再使用封禁机制） |
 
 #### 持久化
 
-服务端把 TURN 状态（月度字节、deny list、活动凭证、签发历史）原子写到 `/app/data/turn-state.json`（默认挂 `./data`），重启不丢。其余数据（节点 / 会话 / 上报）维持现有内存策略。
+服务端把 TURN 状态（月度字节、活动凭证、签发历史）原子写到 `/app/data/turn-state.json`（默认挂 `./data`），重启不丢。其余数据（节点 / 会话 / 上报）维持现有内存策略。
 
 #### 用户手工 TURN
 
@@ -232,8 +232,8 @@ npm run test:e2e
 │   ├── brute-force.test.mjs     # 通行码穷举锁定、IP 上限、速率限制
 │   ├── ws-auth.test.mjs         # WS AUTH 4001/4002 关闭码
 │   ├── signaling-end.test.mjs   # SIGNAL_ICE_END 转发 + 跨 channel 隔离
-│   ├── turn-policy.test.mjs     # TURN 颁发门控 (deny list / IP cap / 熔断)
-│   ├── turn-lifecycle.test.mjs  # deny list 过期、月度滚月、永久封禁
+│   ├── turn-policy.test.mjs     # TURN 颁发门控 (IP cap / 熔断)
+│   ├── turn-lifecycle.test.mjs  # 凭证过期清理、月度滚月
 │   └── turn-http.test.mjs       # /api/turn-status / /api/turn-credentials HTTP 形态
 ├── client/tests/unit/           # 客户端 Vitest 单测 (jsdom)
 │   ├── nat-classify.test.ts     # NAT 分类纯函数

@@ -172,7 +172,7 @@ router.get('/stats', (_req, res) => {
 // GET /api/turn-credentials
 // Auth: Bearer <session token>. Returns short-lived TURN credentials issued
 // by Cloudflare and tagged with customIdentifier=`misaka-${sessionId}`.
-// All enforcement (deny list / per-IP rate / global kill switch) lives in
+// All enforcement (per-IP rate / global kill switch) lives in
 // turn.issueCredentials — clients are pure consumers.
 router.get('/turn-credentials', async (req, res) => {
   const authHeader = req.headers.authorization
@@ -186,7 +186,6 @@ router.get('/turn-credentials', async (req, res) => {
     // Map abuse reasons to HTTP status; client should fall back to no auto TURN.
     const status = result.reason === 'DISABLED' || result.reason === 'NOT_CONFIGURED' ? 503
       : result.reason === 'GLOBAL_QUOTA_EXCEEDED' ? 503
-      : result.reason === 'SESSION_BANNED' || result.reason === 'IP_BANNED' ? 403
       : result.reason === 'IP_RATE_LIMITED' || result.reason === 'IP_BYTES_LIMITED' ? 429
       : 502
     res.status(status).json({ enabled: false, reason: result.reason })
