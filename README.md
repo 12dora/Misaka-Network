@@ -24,6 +24,7 @@
 - v1/v2 核心功能完成
 - PWA 基础能力完成（SW + Manifest + 安装提示）
 - 性能项已完成 desktop Lighthouse 实测（首页 Performance 99）
+- 测试基线已加固：服务端集成脚本统一 `runTest` 退出守卫，CI 不再因悬挂句柄被卡住
 - 剩余主要工作为实网验证闭环（ICE 三场景、TURN 公网可达）
 
 ## 主要功能
@@ -228,19 +229,22 @@ npm run test:e2e
 
 ```text
 ├── server/tests/        # 服务端集成测试 (Node.js spawn + fetch + WS)
+│   ├── _harness.mjs             # runTest / killChild：强制显式退出，防止悬挂句柄
 │   ├── register-edge.test.mjs   # /api/register schema 校验、多设备、Bearer 保护
 │   ├── brute-force.test.mjs     # 通行码穷举锁定、IP 上限、速率限制
 │   ├── ws-auth.test.mjs         # WS AUTH 4001/4002 关闭码
 │   ├── signaling-end.test.mjs   # SIGNAL_ICE_END 转发 + 跨 channel 隔离
 │   ├── turn-policy.test.mjs     # TURN 颁发门控 (IP cap / 熔断)
 │   ├── turn-lifecycle.test.mjs  # 凭证过期清理、月度滚月
-│   └── turn-http.test.mjs       # /api/turn-status / /api/turn-credentials HTTP 形态
+│   ├── turn-http.test.mjs       # /api/turn-status / /api/turn-credentials HTTP 形态
+│   └── stress-1gb.test.mjs      # 1GB 文件内存压测 (sender 流式 / 接收写盘)
 ├── client/tests/unit/           # 客户端 Vitest 单测 (jsdom)
 │   ├── nat-classify.test.ts     # NAT 分类纯函数
 │   ├── authedFetch.test.ts      # authedFetch 401 自愈状态机
-│   └── transfer-frame.test.ts   # chunk 帧编码 / IV 派生 / AES-GCM round-trip
+│   ├── transfer-frame.test.ts   # chunk 帧编码 / IV 派生 / AES-GCM round-trip
+│   └── network-cleanup.test.ts  # peer 离线清理、重连不残留监听器
 ├── client/tests/e2e/            # Playwright 端到端 (真实 server + 真实 WebRTC)
-│   ├── transfer.spec.ts         # 两 peer 单文件 / 多文件传输
+│   ├── transfer.spec.ts         # 两 peer 单文件 / 多文件传输 + LAN 重协商抑制
 │   └── auth-recovery.spec.ts    # authedFetch 401 自愈 (QR 路径)
 ├── client/tests/ui-contract.test.mjs   # 前端关键行为源码契约
 └── client/tests/manual-test.mjs        # 人工 Playwright 调试入口
@@ -257,6 +261,14 @@ npm run test:unit -- --coverage
 ### CI
 
 PR 必须通过 `.github/workflows/test.yml` 中全部 job 才能合并。改动了 `src/` 但未改动 `tests/` 的 PR 会被 `guard-tests-touched` job 拦截（可用 `[skip-test-guard]` 显式放行）。
+
+### 贡献准则
+
+详细的测试纪律 / PR 描述要求 / 测试分层见 [CONTRIBUTING.md](./CONTRIBUTING.md) 与 [CLAUDE.md](./CLAUDE.md)。要点：
+
+- 改动前先跑 `npm test` 建立绿基线，再开工
+- 修 bug 必须先写复现失败用例，再改代码
+- 服务端集成脚本必须用 `server/tests/_harness.mjs` 的 `runTest` 包裹 `main`，避免悬挂句柄拖死 CI
 
 ## 文档入口
 
