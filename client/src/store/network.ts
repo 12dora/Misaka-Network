@@ -40,6 +40,9 @@ const transferLanes = new Map<string, RTCDataChannel[]>()
 const configuredDataChannels = new WeakSet<RTCDataChannel>()
 const pendingIceCandidates = new Map<string, RTCIceCandidateInit[]>()
 const ecdhResolvers: Map<string, () => void> = new Map()
+const connectingPeers = new Map<string, Promise<RTCDataChannel>>()
+const remoteInitiatingPeers = new Set<string>()
+const primaryChannelResolvers = new Map<string, Set<() => void>>()
 const iceRestarting = new Set<string>()
 const iceRestartAttempts = new Map<string, number>()
 // Schedule an ICE restart when state is 'disconnected' for too long. The
@@ -100,6 +103,37 @@ function failPendingMessages(peerSessionId: string) {
   for (const id of ids) updateMessageStatus(peerSessionId, id, 'failed')
   queuedMessageIds.delete(peerSessionId)
   outgoingQueue.delete(peerSessionId)
+}
+
+function startQueuedDelivery(peerSessionId: string) {
+  ensureConnected(peerSessionId)
+    .then(dc => flushOutgoing(peerSessionId, dc))
+    .catch(() => failPendingMessages(peerSessionId))
+}
+
+function notifyPrimaryChannel(peerSessionId: string) {
+  const resolvers = primaryChannelResolvers.get(peerSessionId)
+  if (!resolvers) return
+  primaryChannelResolvers.delete(peerSessionId)
+  for (const resolve of resolvers) resolve()
+}
+
+function waitForPrimaryChannel(peerSessionId: string, timeoutMs = 10_000): Promise<void> {
+  const dc = dataChannels.get(peerSessionId)
+  if (dc && dc.readyState !== 'closed' && dc.readyState !== 'closing') return Promise.resolve()
+  return new Promise(resolve => {
+    const resolvers = primaryChannelResolvers.get(peerSessionId) ?? new Set<() => void>()
+    let timeout: ReturnType<typeof setTimeout>
+    const done = () => {
+      clearTimeout(timeout)
+      resolvers.delete(done)
+      if (resolvers.size === 0) primaryChannelResolvers.delete(peerSessionId)
+      resolve()
+    }
+    timeout = setTimeout(done, timeoutMs)
+    resolvers.add(done)
+    primaryChannelResolvers.set(peerSessionId, resolvers)
+  })
 }
 
 let recoveryInstalled = false
@@ -223,6 +257,8 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
           // The existing peers receive shouldInitiate=false and just wait.
           if (msg.shouldInitiate) {
             initiateWebRTC(sessionId).catch(err => console.warn('[net] auto-initiate failed', err))
+          } else {
+            remoteInitiatingPeers.add(sessionId)
           }
           break
         }
@@ -391,6 +427,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     } else {
       // Queued — will be flushed and marked 'sent' when the DC opens.
       queueOutgoing(peerSessionId, payload, msg.id)
+      startQueuedDelivery(peerSessionId)
     }
   },
 
@@ -409,6 +446,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
       }
     } else {
       queueOutgoing(peerSessionId, payload, msgId)
+      startQueuedDelivery(peerSessionId)
     }
   },
 
@@ -449,7 +487,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
         const request = await buildResumeRequest(transferId)
         const peerNodeId = get().peers.find(p => p.sessionId === peerSessionId)?.nodeId ?? 0
         const lanes = await ensureTransferLanes(peerSessionId)
-        engineSendFileParallel(lanes, file, transferId, peerNodeId, record, undefined, request?.receivedChunks)
+        engineSendFileParallel(lanes, file, transferId, peerNodeId, peerSessionId, record, undefined, request?.receivedChunks)
           .then(() => sendingFiles.delete(transferId))
           .catch(() => {})
       }
@@ -470,23 +508,67 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
 // ── WebRTC helpers ────────────────────────────────────────────────────
 
 async function ensureConnected(peerSessionId: string): Promise<RTCDataChannel> {
+  const existing = connectingPeers.get(peerSessionId)
+  if (existing) return existing
+
+  const task = ensureConnectedInner(peerSessionId)
+  connectingPeers.set(peerSessionId, task)
+  try {
+    return await task
+  } finally {
+    if (connectingPeers.get(peerSessionId) === task) connectingPeers.delete(peerSessionId)
+  }
+}
+
+async function ensureConnectedInner(peerSessionId: string): Promise<RTCDataChannel> {
+  if ((remoteInitiatingPeers.has(peerSessionId) || peerConnections.has(peerSessionId)) && !dataChannels.has(peerSessionId)) {
+    await waitForPrimaryChannel(peerSessionId)
+  }
   let dc = dataChannels.get(peerSessionId)
-  if (!dc) {
+  if (!dc || dc.readyState === 'closed' || dc.readyState === 'closing') {
+    cleanupPeerConnection(peerSessionId, { failQueuedMessages: false })
     await initiateWebRTC(peerSessionId)
     dc = dataChannels.get(peerSessionId)
     if (!dc) throw new Error('无法建立连接')
   }
   if (dc.readyState !== 'open') {
     await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('DataChannel 打开超时')), DC_OPEN_TIMEOUT_MS)
-      const onOpen = () => { clearTimeout(timeout); resolve() }
-      dc!.addEventListener('open', onOpen, { once: true })
+      const timeout = setTimeout(() => {
+        cleanup()
+        reject(new Error('DataChannel 打开超时'))
+      }, DC_OPEN_TIMEOUT_MS)
+      const cleanup = () => {
+        clearTimeout(timeout)
+        dc!.removeEventListener('open', onOpen)
+        dc!.removeEventListener('close', onClose)
+        dc!.removeEventListener('error', onError)
+      }
+      const onOpen = () => { cleanup(); resolve() }
+      const onClose = () => { cleanup(); reject(new Error('DataChannel 已关闭')) }
+      const onError = () => { cleanup(); reject(new Error('DataChannel 连接失败')) }
+      dc!.addEventListener('open', onOpen)
+      dc!.addEventListener('close', onClose)
+      dc!.addEventListener('error', onError)
     })
   }
-  if (!hasAESKey()) {
+  if (!hasAESKey(peerSessionId)) {
     await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('加密协商超时')), ENCRYPTION_TIMEOUT_MS)
-      ecdhResolvers.set(peerSessionId, () => { clearTimeout(timeout); resolve() })
+      if (hasAESKey(peerSessionId)) {
+        resolve()
+        return
+      }
+      const timeout = setTimeout(() => {
+        ecdhResolvers.delete(peerSessionId)
+        reject(new Error('加密协商超时'))
+      }, ENCRYPTION_TIMEOUT_MS)
+      ecdhResolvers.set(peerSessionId, () => {
+        clearTimeout(timeout)
+        ecdhResolvers.delete(peerSessionId)
+        resolve()
+      })
+      if (hasAESKey(peerSessionId)) {
+        ecdhResolvers.get(peerSessionId)?.()
+      }
     })
   }
   return dc
@@ -551,7 +633,7 @@ async function sendFileToPeer(file: File, peerSessionId: string, displayName = f
 
   try {
     sendingFiles.set(transferId, file)
-    await engineSendFileParallel(dcs, file, transferId, peerNodeId, undefined, callbacks)
+    await engineSendFileParallel(dcs, file, transferId, peerNodeId, peerSessionId, undefined, callbacks)
     sendingFiles.delete(transferId)
     useNetworkStore.setState(s => ({
       transfers: s.transfers.map(t =>
@@ -590,6 +672,7 @@ async function initiateWebRTC(peerSessionId: string) {
 
   const dc = createDataChannel(pc)
   dataChannels.set(peerSessionId, dc)
+  notifyPrimaryChannel(peerSessionId)
   setupDataChannel(dc, peerSessionId)
   for (let i = 0; i < TRANSFER_LANE_COUNT; i++) {
     const lane = createDataChannel(pc, `misaka-transfer-${i}`)
@@ -599,7 +682,7 @@ async function initiateWebRTC(peerSessionId: string) {
     setupDataChannel(lane, peerSessionId)
   }
 
-  await generateECDHKeyPair()
+  await generateECDHKeyPair(peerSessionId)
 
   pc.onicecandidate = (e) => {
     if (e.candidate) {
@@ -625,6 +708,12 @@ async function initiateWebRTC(peerSessionId: string) {
 
 async function handleRemoteSDP(fromSessionId: string, fromNodeId: number, sdp: RTCSessionDescriptionInit) {
   let pc = peerConnections.get(fromSessionId)
+  if (sdp.type === 'offer') remoteInitiatingPeers.delete(fromSessionId)
+
+  if (!pc && sdp.type !== 'offer') {
+    console.warn('[net] ignoring SDP without peer connection', fromSessionId, sdp.type)
+    return
+  }
 
   if (!pc) {
     // Inbound offer from a peer who joined before us — accept it.
@@ -638,6 +727,7 @@ async function handleRemoteSDP(fromSessionId: string, fromNodeId: number, sdp: R
         transferLanes.set(fromSessionId, lanes)
       } else {
         dataChannels.set(fromSessionId, e.channel)
+        notifyPrimaryChannel(fromSessionId)
       }
       setupDataChannel(e.channel, fromSessionId)
     }
@@ -652,7 +742,7 @@ async function handleRemoteSDP(fromSessionId: string, fromNodeId: number, sdp: R
 
     pc.oniceconnectionstatechange = () => handleIceStateChange(pc!, fromSessionId)
 
-    await generateECDHKeyPair()
+    await generateECDHKeyPair(fromSessionId)
 
     // Make sure the peer is in our radar (PEER_JOINED may have arrived before
     // the SDP, but on race we surface them here too).
@@ -670,6 +760,10 @@ async function handleRemoteSDP(fromSessionId: string, fromNodeId: number, sdp: R
     const answer = await createAnswer(pc, sdp)
     wsSend({ t: 'SIGNAL_SDP', targetSessionId: fromSessionId, sdp: answer })
   } else {
+    if (pc.signalingState !== 'have-local-offer') {
+      console.warn('[net] ignoring stale SDP answer', fromSessionId, pc.signalingState)
+      return
+    }
     await applyAnswer(pc, sdp)
   }
 
@@ -795,13 +889,15 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
     if (isReconnect) {
       appendSystemChat(peerSessionId, '✓ 连接已恢复')
     }
-    try {
-      const pub = await getMyPublicKey()
-      dc.send(JSON.stringify({ type: 'ecdh-pub', pub }))
-    } catch (err) {
-      console.warn('[net] ecdh-pub send failed', err)
+    if (!dc.label.startsWith('misaka-transfer-')) {
+      try {
+        const pub = await getMyPublicKey(peerSessionId)
+        dc.send(JSON.stringify({ type: 'ecdh-pub', pub }))
+      } catch (err) {
+        console.warn('[net] ecdh-pub send failed', err)
+      }
+      if (hasAESKey(peerSessionId)) flushOutgoing(peerSessionId, dc)
     }
-    flushOutgoing(peerSessionId, dc)
   }
 
   // Race: on the answerer side, the channel may already be open by the time
@@ -824,7 +920,7 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
       const encrypted = packet.slice(12).buffer as ArrayBuffer
 
       const result = await receiveChunk(
-        header.transferId, header, iv, encrypted,
+        header.transferId, header, iv, encrypted, peerSessionId,
         {
           onProgress(received, total) {
             const now = performance.now()
@@ -872,9 +968,9 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
         const msg = JSON.parse(e.data)
 
         if (msg.type === 'ecdh-pub') {
-          await setPeerPublicKey(msg.pub)
+          await setPeerPublicKey(peerSessionId, msg.pub)
           ecdhResolvers.get(peerSessionId)?.()
-          ecdhResolvers.delete(peerSessionId)
+          flushOutgoing(peerSessionId, dc)
           sendResumeRequests(peerSessionId, dc)
           return
         }
@@ -886,16 +982,21 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
           if (supportsOPFS() && !supportsFileSystemAccess()) {
             createOPFSReceiveFile(meta.transferId, meta.fileName, meta.totalChunks).catch(() => {})
           }
-          useNetworkStore.setState(s => ({
-            transfers: [...s.transfers, {
-              id: meta.transferId, direction: 'recv' as const,
-              peerSessionId, peerNodeId,
-              fileName: meta.fileName, fileSize: meta.fileSize,
-              progress: 0, speedBps: 0, status: 'transferring' as const,
-              startedAt: Date.now(),
-            }],
-          }))
-          appendSystemChat(peerSessionId, `正在接收文件 ${meta.fileName}`)
+          useNetworkStore.setState(s => {
+            if (s.transfers.some(t => t.id === meta.transferId)) return s
+            return {
+              transfers: [...s.transfers, {
+                id: meta.transferId, direction: 'recv' as const,
+                peerSessionId, peerNodeId,
+                fileName: meta.fileName, fileSize: meta.fileSize,
+                progress: 0, speedBps: 0, status: 'transferring' as const,
+                startedAt: Date.now(),
+              }],
+            }
+          })
+          const alreadyAnnounced = useNetworkStore.getState().chatMessages[peerSessionId]
+            ?.some(m => m.type === 'system' && m.content === `正在接收文件 ${meta.fileName}`)
+          if (!alreadyAnnounced) appendSystemChat(peerSessionId, `正在接收文件 ${meta.fileName}`)
           return
         }
 
@@ -911,7 +1012,7 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
           if (file && record) {
             const peerNodeId = useNetworkStore.getState().peers.find(p => p.sessionId === peerSessionId)?.nodeId ?? 0
             const lanes = await ensureTransferLanes(peerSessionId)
-            engineSendFileParallel(lanes, file, resumeRequest.transferId, peerNodeId, record, undefined, resumeRequest.receivedChunks)
+            engineSendFileParallel(lanes, file, resumeRequest.transferId, peerNodeId, peerSessionId, record, undefined, resumeRequest.receivedChunks)
               .then(() => sendingFiles.delete(resumeRequest.transferId))
               .catch(() => {})
           }
@@ -982,7 +1083,7 @@ async function attemptIceRestart(peerSessionId: string) {
   try {
     const pc = peerConnections.get(peerSessionId)
     if (!pc || pc.connectionState === 'closed' || pc.connectionState === 'failed') {
-      cleanupPeerConnection(peerSessionId)
+      cleanupPeerConnection(peerSessionId, { failQueuedMessages: false })
       await initiateWebRTC(peerSessionId)
       return
     }
@@ -1104,8 +1205,9 @@ async function sendResumeRequests(peerSessionId: string, dc: RTCDataChannel) {
   }
 }
 
-function cleanupPeerConnection(sessionId: string) {
-  failPendingMessages(sessionId)
+function cleanupPeerConnection(sessionId: string, options: { failQueuedMessages?: boolean } = {}) {
+  const { failQueuedMessages = true } = options
+  if (failQueuedMessages) failPendingMessages(sessionId)
   iceRestartAttempts.delete(sessionId)
   iceRestarting.delete(sessionId)
   clearDisconnectedTimer(sessionId)
@@ -1119,5 +1221,13 @@ function cleanupPeerConnection(sessionId: string) {
   const pc = peerConnections.get(sessionId)
   if (pc) { pc.close(); peerConnections.delete(sessionId) }
   ecdhResolvers.delete(sessionId)
+  connectingPeers.delete(sessionId)
+  remoteInitiatingPeers.delete(sessionId)
+  const resolvers = primaryChannelResolvers.get(sessionId)
+  if (resolvers) {
+    primaryChannelResolvers.delete(sessionId)
+    for (const resolve of resolvers) resolve()
+  }
+  resetCrypto(sessionId)
   pendingIceCandidates.delete(sessionId)
 }

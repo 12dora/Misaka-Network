@@ -1,45 +1,66 @@
-// ── ECDH Key Exchange + AES-GCM per-chunk encryption ────────────────
+// ── ECDH Key Exchange + AES-GCM per-peer chunk encryption ───────────
 
-let myKeyPair: CryptoKeyPair | null = null
-let aesKey: CryptoKey | null = null
+type PeerCryptoState = {
+  myKeyPair: CryptoKeyPair | null
+  aesKey: CryptoKey | null
+}
 
-export async function generateECDHKeyPair(): Promise<CryptoKeyPair> {
-  myKeyPair = await crypto.subtle.generateKey(
+const peerStates = new Map<string, PeerCryptoState>()
+
+function stateFor(peerSessionId: string): PeerCryptoState {
+  let state = peerStates.get(peerSessionId)
+  if (!state) {
+    state = { myKeyPair: null, aesKey: null }
+    peerStates.set(peerSessionId, state)
+  }
+  return state
+}
+
+export async function generateECDHKeyPair(peerSessionId: string): Promise<CryptoKeyPair> {
+  const state = stateFor(peerSessionId)
+  state.myKeyPair = await crypto.subtle.generateKey(
     { name: 'ECDH', namedCurve: 'P-256' },
     false,
     ['deriveKey'],
   )
-  return myKeyPair
+  state.aesKey = null
+  return state.myKeyPair
 }
 
-export async function getMyPublicKey(): Promise<string> {
-  if (!myKeyPair) throw new Error('ECDH keypair not generated')
-  const raw = await crypto.subtle.exportKey('raw', myKeyPair.publicKey)
+export async function getMyPublicKey(peerSessionId: string): Promise<string> {
+  const state = stateFor(peerSessionId)
+  if (!state.myKeyPair) throw new Error('ECDH keypair not generated')
+  const raw = await crypto.subtle.exportKey('raw', state.myKeyPair.publicKey)
   return btoa(String.fromCharCode(...new Uint8Array(raw as ArrayBuffer)))
 }
 
-export async function setPeerPublicKey(peerPubBase64: string) {
-  if (!myKeyPair) throw new Error('ECDH keypair not generated')
+export async function setPeerPublicKey(peerSessionId: string, peerPubBase64: string) {
+  const state = stateFor(peerSessionId)
+  if (!state.myKeyPair) throw new Error('ECDH keypair not generated')
   const buf = Uint8Array.from(atob(peerPubBase64), c => c.charCodeAt(0)) as unknown as Uint8Array<ArrayBuffer>
   const peerPub = await crypto.subtle.importKey(
     'raw', buf,
     { name: 'ECDH', namedCurve: 'P-256' },
     false, [],
   )
-  aesKey = await crypto.subtle.deriveKey(
+  state.aesKey = await crypto.subtle.deriveKey(
     { name: 'ECDH', public: peerPub },
-    myKeyPair.privateKey,
+    state.myKeyPair.privateKey,
     { name: 'AES-GCM', length: 256 },
     false,
     ['encrypt', 'decrypt'],
   )
 }
 
-export function hasAESKey(): boolean {
-  return aesKey !== null
+export function hasAESKey(peerSessionId: string): boolean {
+  return peerStates.get(peerSessionId)?.aesKey !== null && peerStates.get(peerSessionId)?.aesKey !== undefined
 }
 
-export async function encryptChunk(data: ArrayBuffer): Promise<{ iv: Uint8Array<ArrayBuffer>; encrypted: ArrayBuffer }> {
+export async function encryptChunk(
+  data: ArrayBuffer,
+  peerSessionId: string,
+): Promise<{ iv: Uint8Array<ArrayBuffer>; encrypted: ArrayBuffer }> {
+  const aesKey = peerStates.get(peerSessionId)?.aesKey
   if (!aesKey) throw new Error('AES key not derived')
   const iv = crypto.getRandomValues(new Uint8Array(12)) as Uint8Array<ArrayBuffer>
   const encrypted = await crypto.subtle.encrypt(
@@ -50,7 +71,12 @@ export async function encryptChunk(data: ArrayBuffer): Promise<{ iv: Uint8Array<
   return { iv, encrypted }
 }
 
-export async function decryptChunk(iv: Uint8Array<ArrayBuffer>, encrypted: ArrayBuffer): Promise<ArrayBuffer> {
+export async function decryptChunk(
+  iv: Uint8Array<ArrayBuffer>,
+  encrypted: ArrayBuffer,
+  peerSessionId: string,
+): Promise<ArrayBuffer> {
+  const aesKey = peerStates.get(peerSessionId)?.aesKey
   if (!aesKey) throw new Error('AES key not derived')
   return crypto.subtle.decrypt(
     { name: 'AES-GCM', iv },
@@ -59,7 +85,10 @@ export async function decryptChunk(iv: Uint8Array<ArrayBuffer>, encrypted: Array
   )
 }
 
-export function resetCrypto() {
-  myKeyPair = null
-  aesKey = null
+export function resetCrypto(peerSessionId?: string) {
+  if (peerSessionId) {
+    peerStates.delete(peerSessionId)
+    return
+  }
+  peerStates.clear()
 }
