@@ -58,7 +58,15 @@ assert.match(networkStore, /hasAESKey\(peerSessionId\)/)
 assert.match(networkStore, /if \(!dc\.label\.startsWith\('misaka-transfer-'\)\)/)
 assert.match(networkStore, /if \(hasAESKey\(peerSessionId\)\) flushOutgoing\(peerSessionId, dc\)/)
 assert.match(networkStore, /flushOutgoing\(peerSessionId, dc\)\s+sendResumeRequests\(peerSessionId, dc\)/)
-assert.match(networkStore, /receiveChunk\(\s*header\.transferId, header, iv, encrypted, peerSessionId,/)
+// receiveChunk now takes (transferId, index, iv, ciphertext) — chunk frame is
+// a single binary message; the transferId comes from the shortId map.
+assert.match(networkStore, /receiveChunk\(\s*transferId, frame\.index, frame\.iv, frame\.ciphertext, peerSessionId,/)
+assert.match(networkStore, /decodeChunkFrame\(e\.data\)/)
+assert.match(networkStore, /shortIdToTransferId/)
+// Per-chunk JSON header and ack are removed — the binary frame carries both
+// shortId and index; DataChannel reliability makes app-level acks redundant.
+assert.doesNotMatch(networkStore, /lastChunkHeader/)
+assert.doesNotMatch(networkStore, /dc\.send\(JSON\.stringify\(ack\)\)/)
 assert.match(networkStore, /engineSendFileParallel\([^)]*peerSessionId/s)
 assert.match(networkStore, /if \(s\.transfers\.some\(t => t\.id === meta\.transferId\)\) return s/)
 assert.match(networkStore, /if \(!pc && sdp\.type !== 'offer'\)/)
@@ -69,8 +77,11 @@ assert.match(crypto, /generateECDHKeyPair\(peerSessionId: string\)/)
 assert.match(crypto, /setPeerPublicKey\(peerSessionId: string, peerPubBase64: string\)/)
 assert.match(crypto, /resetCrypto\(peerSessionId\?: string\)/)
 
-assert.match(transfer, /encryptChunk\(raw, peerSessionId\)/)
+// Per-chunk IV is built from an 8-byte per-transfer prefix + 4-byte index
+// (NIST SP 800-38D §8.2.1) instead of a per-chunk getRandomValues call.
+assert.match(transfer, /encryptChunk\(raw, peerSessionId, makeChunkIv\(ivPrefix, i\)\)/)
 assert.match(transfer, /decryptChunk\(iv, encrypted, peerSessionId\)/)
+assert.match(transfer, /const ivPrefix = randomIvPrefix\(\)/)
 
 assert.match(serviceWorker, /misaka-shell-v3/)
 assert.doesNotMatch(serviceWorker, /const cached = await caches\.match\(req\)\s+if \(cached\) return cached\s+try/s)

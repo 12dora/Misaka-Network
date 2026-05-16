@@ -1,4 +1,10 @@
 // ── ECDH Key Exchange + AES-GCM per-peer chunk encryption ───────────
+// The AES key is derived on the main thread (ECDH happens once per peer)
+// and then mirrored into every worker in the crypto pool. Encrypt/decrypt
+// hot-path calls dispatch to the pool — keeping ~tens of milliseconds per
+// MB of CPU off the main thread and parallelizing across cores.
+
+import { registerPeerKey, unregisterPeerKey, encryptInWorker, decryptInWorker } from './cryptoPool'
 
 type PeerCryptoState = {
   myKeyPair: CryptoKeyPair | null
@@ -47,28 +53,48 @@ export async function setPeerPublicKey(peerSessionId: string, peerPubBase64: str
     { name: 'ECDH', public: peerPub },
     state.myKeyPair.privateKey,
     { name: 'AES-GCM', length: 256 },
+    // CryptoKey must be extractable=false but workers receive a structured
+    // clone, which preserves the same usage flags. extractable=true would
+    // let the key escape via exportKey — we never need that.
     false,
     ['encrypt', 'decrypt'],
   )
+  registerPeerKey(peerSessionId, state.aesKey)
 }
 
 export function hasAESKey(peerSessionId: string): boolean {
   return peerStates.get(peerSessionId)?.aesKey !== null && peerStates.get(peerSessionId)?.aesKey !== undefined
 }
 
+// Build a 12-byte AES-GCM IV from an 8-byte per-transfer random prefix and a
+// 4-byte chunk index. Per NIST SP 800-38D §8.2.1 this construction is safe
+// as long as the (key, prefix) pair is unique across messages — our key is
+// per-peer-session and the prefix is freshly random per transfer (~2^-64
+// collision per pair), so each chunk gets a unique IV without paying the
+// per-chunk getRandomValues syscall (~4000 RNG calls/GB avoided).
+export function makeChunkIv(prefix: Uint8Array, index: number): Uint8Array<ArrayBuffer> {
+  const iv = new Uint8Array(12)
+  iv.set(prefix.subarray(0, 8), 0)
+  new DataView(iv.buffer).setUint32(8, index >>> 0, false)
+  return iv as Uint8Array<ArrayBuffer>
+}
+
+export function randomIvPrefix(): Uint8Array {
+  return crypto.getRandomValues(new Uint8Array(8))
+}
+
 export async function encryptChunk(
   data: ArrayBuffer,
   peerSessionId: string,
+  iv?: Uint8Array<ArrayBuffer>,
 ): Promise<{ iv: Uint8Array<ArrayBuffer>; encrypted: ArrayBuffer }> {
-  const aesKey = peerStates.get(peerSessionId)?.aesKey
-  if (!aesKey) throw new Error('AES key not derived')
-  const iv = crypto.getRandomValues(new Uint8Array(12)) as Uint8Array<ArrayBuffer>
-  const encrypted = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    aesKey,
-    data,
-  )
-  return { iv, encrypted }
+  if (!peerStates.get(peerSessionId)?.aesKey) throw new Error('AES key not derived')
+  const actualIv = iv ?? (crypto.getRandomValues(new Uint8Array(12)) as Uint8Array<ArrayBuffer>)
+  // `data` is transferred into the worker (zero-copy); the caller's reference
+  // becomes detached. sendFileParallel does not reuse `raw` after encrypt, so
+  // this is safe in the current hot path.
+  const encrypted = await encryptInWorker(peerSessionId, actualIv, data)
+  return { iv: actualIv, encrypted }
 }
 
 export async function decryptChunk(
@@ -76,19 +102,16 @@ export async function decryptChunk(
   encrypted: ArrayBuffer,
   peerSessionId: string,
 ): Promise<ArrayBuffer> {
-  const aesKey = peerStates.get(peerSessionId)?.aesKey
-  if (!aesKey) throw new Error('AES key not derived')
-  return crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv },
-    aesKey,
-    encrypted,
-  )
+  if (!peerStates.get(peerSessionId)?.aesKey) throw new Error('AES key not derived')
+  return decryptInWorker(peerSessionId, iv, encrypted)
 }
 
 export function resetCrypto(peerSessionId?: string) {
   if (peerSessionId) {
     peerStates.delete(peerSessionId)
+    unregisterPeerKey(peerSessionId)
     return
   }
   peerStates.clear()
+  unregisterPeerKey()
 }

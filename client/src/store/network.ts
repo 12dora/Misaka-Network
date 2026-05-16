@@ -19,7 +19,8 @@ import {
   supportsFileSystemAccess, streamChunkToDisk,
   finalizeStreamedFile, cancelStreamWrite, getWriteHandle,
   supportsOPFS, createOPFSReceiveFile, writeChunkToOPFS, getOPFSFile, getOPFSHandle, cleanupOPFS,
-  type MetaMessage, type ChunkHeader, type SendCallbacks, type ResumeRequest,
+  decodeChunkFrame,
+  type MetaMessage, type SendCallbacks, type ResumeRequest,
 } from '@/lib/transfer'
 import { getTransfer, getActiveTransfers } from '@/lib/db'
 import { playSound } from '@/lib/sound'
@@ -50,6 +51,11 @@ const iceRestartAttempts = new Map<string, number>()
 // to recover proactively.
 const disconnectedTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const sendingFiles = new Map<string, File>()  // transferId → File
+// Per-peer mapping from the compact shortId embedded in binary chunk frames
+// to the full transferId. Registered when a `meta` message arrives and
+// consulted on every incoming chunk so the receiver can demux multiple
+// concurrent transfers without a JSON header per frame.
+const shortIdToTransferId = new Map<string, Map<number, string>>()
 let initialized = false   // see init() — prevents StrictMode double-registration
 const deliveredTransfers = new Set<string>()  // one file card per transferId
 const transferSpeedSamples = new Map<string, { bytes: number; at: number }>()
@@ -861,8 +867,6 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
   if (configuredDataChannels.has(dc)) return
   configuredDataChannels.add(dc)
 
-  let lastChunkHeader: ChunkHeader | null = null
-
   // Without this, incoming chunk bodies arrive as Blob and the
   // `instanceof ArrayBuffer` check below skips them silently.
   dc.binaryType = 'arraybuffer'
@@ -911,39 +915,36 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
 
   dc.onmessage = async (e) => {
     if (e.data instanceof ArrayBuffer) {
-      if (!lastChunkHeader) return
-      const header = lastChunkHeader
-      lastChunkHeader = null
-
-      const packet = new Uint8Array(e.data as ArrayBuffer)
-      const iv = packet.slice(0, 12)
-      const encrypted = packet.slice(12).buffer as ArrayBuffer
+      const frame = decodeChunkFrame(e.data)
+      if (!frame) return
+      const transferId = shortIdToTransferId.get(peerSessionId)?.get(frame.shortId)
+      if (!transferId) return  // meta hasn't arrived yet, or transfer was cleaned up
 
       const result = await receiveChunk(
-        header.transferId, header, iv, encrypted, peerSessionId,
+        transferId, frame.index, frame.iv, frame.ciphertext, peerSessionId,
         {
           onProgress(received, total) {
             const now = performance.now()
-            const transfer = useNetworkStore.getState().transfers.find(t => t.id === header.transferId)
+            const transfer = useNetworkStore.getState().transfers.find(t => t.id === transferId)
             const fileSize = transfer?.fileSize ?? 0
             const bytes = fileSize > 0 ? Math.min(fileSize, Math.round((received / total) * fileSize)) : 0
-            const prev = transferSpeedSamples.get(header.transferId) ?? { bytes: 0, at: now }
+            const prev = transferSpeedSamples.get(transferId) ?? { bytes: 0, at: now }
             const elapsed = Math.max(1, now - prev.at)
             const speedBps = now === prev.at ? 0 : ((bytes - prev.bytes) * 1000) / elapsed
-            transferSpeedSamples.set(header.transferId, { bytes, at: now })
+            transferSpeedSamples.set(transferId, { bytes, at: now })
             useNetworkStore.setState(s => ({
               transfers: s.transfers.map(t =>
-                t.id === header.transferId
+                t.id === transferId
                   ? { ...t, progress: received / total, speedBps, status: 'transferring' as const }
                   : t,
               ),
             }))
-            if (received === total) deliverCompletedFile(header.transferId, peerSessionId)
+            if (received === total) deliverCompletedFile(transferId, peerSessionId)
           },
           onError(error) {
             useNetworkStore.setState(s => ({
               transfers: s.transfers.map(t =>
-                t.id === header.transferId ? { ...t, status: 'failed' as const, error } : t,
+                t.id === transferId ? { ...t, status: 'failed' as const, error } : t,
               ),
             }))
           },
@@ -951,14 +952,16 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
       )
 
       if (result) {
-        const { ack, decrypted: decryptedData, storageMode } = result
+        const { decrypted: decryptedData, storageMode } = result
         if (storageMode === 'stream') {
           await Promise.all([
-            streamChunkToDisk(header.transferId, header.index, decryptedData),
-            writeChunkToOPFS(header.transferId, header.index, decryptedData),
+            streamChunkToDisk(transferId, frame.index, decryptedData),
+            writeChunkToOPFS(transferId, frame.index, decryptedData),
           ])
         }
-        dc.send(JSON.stringify(ack))
+        // DataChannel is ordered + reliable — no application-level per-chunk
+        // ack is needed. The sender uses the resume bitmap (built from the
+        // session's received set) for recovery, not per-chunk acks.
       }
       return
     }
@@ -979,6 +982,14 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
           const meta = msg as MetaMessage
           const peerNodeId = useNetworkStore.getState().peers.find(p => p.sessionId === peerSessionId)?.nodeId ?? 0
           await handleMetaMessage(meta, peerNodeId)
+          // Register shortId → transferId so binary chunk frames on any lane
+          // for this peer can be demuxed without a per-chunk JSON header.
+          let peerMap = shortIdToTransferId.get(peerSessionId)
+          if (!peerMap) {
+            peerMap = new Map()
+            shortIdToTransferId.set(peerSessionId, peerMap)
+          }
+          peerMap.set(meta.shortId, meta.transferId)
           if (supportsOPFS() && !supportsFileSystemAccess()) {
             createOPFSReceiveFile(meta.transferId, meta.fileName, meta.totalChunks).catch(() => {})
           }
@@ -997,11 +1008,6 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
           const alreadyAnnounced = useNetworkStore.getState().chatMessages[peerSessionId]
             ?.some(m => m.type === 'system' && m.content === `正在接收文件 ${meta.fileName}`)
           if (!alreadyAnnounced) appendSystemChat(peerSessionId, `正在接收文件 ${meta.fileName}`)
-          return
-        }
-
-        if (msg.type === 'chunk') {
-          lastChunkHeader = msg as ChunkHeader
           return
         }
 
@@ -1230,4 +1236,5 @@ function cleanupPeerConnection(sessionId: string, options: { failQueuedMessages?
   }
   resetCrypto(sessionId)
   pendingIceCandidates.delete(sessionId)
+  shortIdToTransferId.delete(sessionId)
 }
