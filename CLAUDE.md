@@ -39,6 +39,12 @@ server/tests/         # spawn-process integration tests
 - `makeChunkIv` merges an 8-byte random prefix (same per transfer) with a 4-byte BE index. See `client/src/lib/crypto.ts`.
 - TURN relay is controlled by `turnSettings.enabled` — when off, neither auto nor manual TURN servers are added to the peer connection. See `client/src/lib/webrtc.ts`.
 
+## Test-script lifecycle (do not regress)
+
+- Server integration scripts (`server/tests/*.test.mjs`) must wrap `main` with `runTest` from `server/tests/_harness.mjs` so the script always calls `process.exit()` explicitly. Any new dangling handle (keep-alive socket, forgotten `setTimeout`, child stderr pipe) silently wedged CI in the past — `runTest` is what prevents that.
+- Use `killChild(proc)` for spawned-server cleanup. It uses an unref'd SIGKILL fallback timer; don't write your own `setTimeout(...kill...)` that itself holds the loop open.
+- Test scripts that import TypeScript directly must be run via `tsx`, not `node`. Node 20 (CI) doesn't auto-strip `.ts`. Mirror the test under Vitest instead whenever possible.
+
 ## CI
 
 PRs trigger `.github/workflows/test.yml`. A guard job ensures `src/` changes are accompanied by `tests/` changes (override with `[skip-test-guard]` in the PR title or latest commit message).

@@ -20,6 +20,9 @@ import { spawn } from 'child_process'
 import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
 import { WebSocket } from 'ws'
+import { runTest, killChild } from './_harness.mjs'
+
+runTest(main)
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const SERVER_DIR = join(__dirname, '..')
@@ -52,14 +55,12 @@ async function main() {
     }
   }
 
-  if (serverProcess) {
-    serverProcess.kill('SIGTERM')
-    setTimeout(() => { if (serverProcess) serverProcess.kill('SIGKILL') }, 3000)
-  }
+  killChild(serverProcess)
 
   if (failed > 0) {
     console.error(`\n❌ ${failed} 用例失败`)
-    process.exit(1)
+    process.exitCode = 1
+    return
   }
   console.log('\n✅ 全部测试通过')
 }
@@ -199,5 +200,3 @@ async function waitForServer() {
   }
   throw new Error('服务器启动超时')
 }
-
-main()
