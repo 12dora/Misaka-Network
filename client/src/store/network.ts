@@ -47,6 +47,7 @@ const disconnectedTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const sendingFiles = new Map<string, File>()  // transferId → File
 let initialized = false   // see init() — prevents StrictMode double-registration
 const deliveredTransfers = new Set<string>()  // one file card per transferId
+const transferSpeedSamples = new Map<string, { bytes: number; at: number }>()
 
 // Messages typed before the DC fully opened, flushed in dc.onopen.
 const outgoingQueue = new Map<string, string[]>()
@@ -377,6 +378,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     cancelStreamWrite(transferId)
     cleanupOPFS(transferId).catch(() => {})
     sendingFiles.delete(transferId)
+    transferSpeedSamples.delete(transferId)
     set(s => ({ transfers: s.transfers.filter(t => t.id !== transferId) }))
   },
 }))
@@ -431,9 +433,15 @@ async function sendFileToPeer(file: File, peerSessionId: string): Promise<boolea
 
   const callbacks: SendCallbacks = {
     onProgress(sent, total) {
+      const now = performance.now()
+      const bytes = Math.min(file.size, Math.round((sent / total) * file.size))
+      const prev = transferSpeedSamples.get(transferId) ?? { bytes: 0, at: now }
+      const elapsed = Math.max(1, now - prev.at)
+      const speedBps = now === prev.at ? 0 : ((bytes - prev.bytes) * 1000) / elapsed
+      transferSpeedSamples.set(transferId, { bytes, at: now })
       useNetworkStore.setState(s => ({
         transfers: s.transfers.map(t =>
-          t.id === transferId ? { ...t, progress: sent / total, status: 'transferring' as const } : t,
+          t.id === transferId ? { ...t, progress: sent / total, speedBps, status: 'transferring' as const } : t,
         ),
       }))
     },
@@ -457,8 +465,10 @@ async function sendFileToPeer(file: File, peerSessionId: string): Promise<boolea
     }))
     appendSystemChat(peerSessionId, `已发送文件 ${file.name}`, 'sent')
     playSound('complete')
+    transferSpeedSamples.delete(transferId)
     return true
   } catch (e) {
+    transferSpeedSamples.delete(transferId)
     useNetworkStore.setState(s => ({
       transfers: s.transfers.map(t =>
         t.id === transferId ? { ...t, status: 'failed' as const, error: String(e) } : t,
@@ -713,10 +723,18 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
         header.transferId, header, iv, encrypted,
         {
           onProgress(received, total) {
+            const now = performance.now()
+            const transfer = useNetworkStore.getState().transfers.find(t => t.id === header.transferId)
+            const fileSize = transfer?.fileSize ?? 0
+            const bytes = fileSize > 0 ? Math.min(fileSize, Math.round((received / total) * fileSize)) : 0
+            const prev = transferSpeedSamples.get(header.transferId) ?? { bytes: 0, at: now }
+            const elapsed = Math.max(1, now - prev.at)
+            const speedBps = now === prev.at ? 0 : ((bytes - prev.bytes) * 1000) / elapsed
+            transferSpeedSamples.set(header.transferId, { bytes, at: now })
             useNetworkStore.setState(s => ({
               transfers: s.transfers.map(t =>
                 t.id === header.transferId
-                  ? { ...t, progress: received / total, status: 'transferring' as const }
+                  ? { ...t, progress: received / total, speedBps, status: 'transferring' as const }
                   : t,
               ),
             }))
@@ -733,9 +751,11 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
       )
 
       if (result) {
-        const { ack, decrypted: decryptedData } = result
-        streamChunkToDisk(header.transferId, header.index, decryptedData).catch(() => {})
-        writeChunkToOPFS(header.transferId, header.index, decryptedData).catch(() => {})
+        const { ack, decrypted: decryptedData, storageMode } = result
+        if (storageMode === 'stream') {
+          streamChunkToDisk(header.transferId, header.index, decryptedData).catch(() => {})
+          writeChunkToOPFS(header.transferId, header.index, decryptedData).catch(() => {})
+        }
         dc.send(JSON.stringify(ack))
       }
       return
@@ -947,6 +967,7 @@ function appendFileChat(peerSessionId: string, fileName: string, fileSize: numbe
 }
 
 function cleanupTransferRecord(transferId: string) {
+  transferSpeedSamples.delete(transferId)
   import('@/lib/db').then(({ deleteChunks }) => deleteChunks(transferId).catch(() => {}))
   useNetworkStore.setState(s => ({
     transfers: s.transfers.map(t =>
@@ -956,6 +977,7 @@ function cleanupTransferRecord(transferId: string) {
 }
 
 function failTransferRecord(transferId: string, error: string) {
+  transferSpeedSamples.delete(transferId)
   useNetworkStore.setState(s => ({
     transfers: s.transfers.map(t =>
       t.id === transferId ? { ...t, status: 'failed' as const, error } : t,

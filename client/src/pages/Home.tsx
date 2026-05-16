@@ -1,66 +1,11 @@
-import { useId, type CSSProperties } from 'react'
 import LoginCard from '@/components/features/LoginCard'
 import StatsDashboard from '@/components/features/StatsDashboard'
 import ActivityStream from '@/components/features/ActivityStream'
 import AppFooter from '@/components/ui/AppFooter'
+import MisakaHeroTitle from '@/components/ui/MisakaHeroTitle'
 import { publicAssetUrl } from '@/lib/appBase'
 
 const HERO_CHARACTER = publicAssetUrl('assets/misaka.webp')
-const HERO_TITLE     = publicAssetUrl('assets/misaka-title.webp')
-
-function HeroTitle({ width }: { width: CSSProperties['width'] }) {
-  const outlineId = useId().replace(/:/g, '')
-
-  return (
-    <svg
-      className="block select-none pointer-events-none"
-      role="img"
-      aria-label="とある科学 御坂网络"
-      viewBox="-40 -40 1616 1104"
-      style={{
-        width,
-        height: 'auto',
-        overflow: 'visible',
-      }}
-    >
-      <defs>
-        <filter
-          id={outlineId}
-          x="-80"
-          y="-80"
-          width="1696"
-          height="1184"
-          filterUnits="userSpaceOnUse"
-          colorInterpolationFilters="sRGB"
-        >
-          <feMorphology in="SourceAlpha" operator="dilate" radius="12" result="expanded" />
-          <feFlood floodColor="#fff" result="white" />
-          <feComposite in="white" in2="expanded" operator="in" result="outline" />
-          <feMerge>
-            <feMergeNode in="outline" />
-          </feMerge>
-        </filter>
-      </defs>
-      <image
-        href={HERO_TITLE}
-        x="0"
-        y="0"
-        width="1536"
-        height="1024"
-        preserveAspectRatio="xMidYMid meet"
-        filter={`url(#${outlineId})`}
-      />
-      <image
-        href={HERO_TITLE}
-        x="0"
-        y="0"
-        width="1536"
-        height="1024"
-        preserveAspectRatio="xMidYMid meet"
-      />
-    </svg>
-  )
-}
 
 export default function Home() {
   return (
@@ -126,7 +71,7 @@ export default function Home() {
 
         {/* Content below character */}
         <div className="relative z-10 flex flex-col items-center -mt-8 pb-10 gap-5">
-          <HeroTitle width="min(230px, 62vw)" />
+          <MisakaHeroTitle width="min(230px, 62vw)" />
           <div className="w-[calc(100%_-_2rem)] max-w-[420px]">
             <LoginCard />
           </div>
@@ -167,7 +112,7 @@ export default function Home() {
           style={{ paddingTop: '2rem', paddingBottom: '3rem' }}
         >
           <div>
-            <HeroTitle width="clamp(280px, 32vw, 460px)" />
+            <MisakaHeroTitle width="clamp(280px, 32vw, 460px)" />
           </div>
           <LoginCard />
         </div>

@@ -108,7 +108,7 @@ export default function TopNav() {
         </div>
 
         {/* Right: QR / scan / status / mobile menu */}
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 h-8">
           {isConnected && (
             <>
               {installPrompt && (
@@ -127,8 +127,8 @@ export default function TopNav() {
 
           {/* Settings */}
           <button
-            className="w-8 h-8 flex items-center justify-center rounded-full cursor-pointer hover:opacity-70 transition-opacity"
-            style={{ border: 'none', background: 'transparent', fontSize: '1.1rem' }}
+            className="w-8 h-8 inline-flex items-center justify-center rounded-full cursor-pointer hover:opacity-70 transition-opacity leading-none"
+            style={{ border: 'none', background: 'transparent', fontSize: '1.1rem', lineHeight: 1 }}
             onClick={() => setShowSettings(true)}
             aria-label="设置"
           >
@@ -136,13 +136,14 @@ export default function TopNav() {
           </button>
 
           {/* Status */}
-          <span className="flex items-center gap-1.5 text-xs font-mono text-[var(--text-on-blue-2)]">
+          <span className="h-8 inline-flex items-center gap-1.5 text-xs font-mono leading-none text-[var(--text-on-blue-2)]">
             <span
               className={isConnected ? 'pulse-dot' : ''}
               style={{
                 display: 'inline-block',
                 width: 8, height: 8, borderRadius: '50%',
                 background: isConnected ? 'var(--state-success)' : 'var(--text-muted)',
+                flexShrink: 0,
               }}
             />
             <span className="hidden xs:inline">{isConnected ? '已接入' : '未接入'}</span>

@@ -7,9 +7,11 @@ export const NODE_ID_MIN = 1
 export const NODE_ID_MAX = 20001
 
 // ── File transfer ─────────────────────────────────────────────────────
-export const CHUNK_SIZE = 64 * 1024              // 64 KB per chunk
-export const HIGH_WATER_MARK = 16 * 1024 * 1024  // 16 MB — pause sending
-export const LOW_WATER_MARK = 4 * 1024 * 1024    // 4 MB — resume sending
+export const CHUNK_SIZE = 256 * 1024             // 256 KB per chunk — fewer frames without stressing DataChannel limits
+export const HIGH_WATER_MARK = 32 * 1024 * 1024  // 32 MB — keep the DataChannel fed on fast local links
+export const LOW_WATER_MARK = 12 * 1024 * 1024   // 12 MB — resume before the sender drains completely
+export const TRANSFER_PROGRESS_INTERVAL_MS = 200
+export const TRANSFER_RECORD_INTERVAL_MS = 1_000
 
 // ── WebRTC / ICE ──────────────────────────────────────────────────────
 // Diversified STUN pool: more servers → more chances to discover srflx
