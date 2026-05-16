@@ -49,7 +49,7 @@ export interface RTCIceServerLike {
 }
 
 interface CfCredentialsResponse {
-  iceServers?: { urls: string | string[]; username?: string; credential?: string }
+  iceServers?: { urls: string | string[]; username?: string; credential?: string } | { urls: string | string[]; username?: string; credential?: string }[]
   username?: string
   credential?: string
   // older shape returned `iceServers` array; newer returns single object
@@ -253,12 +253,12 @@ function normalizeIceServers(resp: CfCredentialsResponse): RTCIceServerLike[] {
   // CF returns either a single iceServers object (new generate-ica) or a flat
   // username/credential pair. Normalize to RTCIceServer[].
   if (resp.iceServers) {
-    const ice = resp.iceServers
-    return [{
+    const list = Array.isArray(resp.iceServers) ? resp.iceServers : [resp.iceServers]
+    return list.map(ice => ({
       urls: ice.urls,
       username: ice.username,
       credential: ice.credential,
-    }]
+    }))
   }
   if (resp.username && resp.credential) {
     return [{
@@ -271,7 +271,7 @@ function normalizeIceServers(resp: CfCredentialsResponse): RTCIceServerLike[] {
 }
 
 async function cfGenerateCredentials(customIdentifier: string, ttlSec: number): Promise<CfCredentialsResponse> {
-  const url = `${CF_API_BASE}/turn/keys/${encodeURIComponent(TURN_CF_KEY_ID)}/credentials/generate-ica`
+  const url = `${CF_API_BASE}/turn/keys/${encodeURIComponent(TURN_CF_KEY_ID)}/credentials/generate`
   const res = await fetch(url, {
     method: 'POST',
     headers: {

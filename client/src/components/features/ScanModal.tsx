@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
+import { useModalExit } from '@/hooks/useModalExit'
 import { appUrl } from '@/lib/appBase'
 import jsQR from 'jsqr'
 
@@ -43,6 +44,7 @@ export default function ScanModal({ onClose }: Props) {
   const [detected, setDetected] = useState<string | null>(null)
   const [manualUrl, setManualUrl] = useState('')
   const [manualError, setManualError] = useState<string | null>(null)
+  const modal = useModalExit(onClose)
   const streamRef = useRef<MediaStream | null>(null)
   const animRef = useRef<number>(0)
 
@@ -156,13 +158,13 @@ export default function ScanModal({ onClose }: Props) {
   function handleBackdrop(e: React.MouseEvent<HTMLDivElement>) {
     if (e.target === e.currentTarget) {
       stopCamera()
-      onClose()
+      modal.requestClose()
     }
   }
 
   function handleClose() {
     stopCamera()
-    onClose()
+    modal.requestClose()
   }
 
   function openDetectedUrl(raw: string) {
@@ -198,12 +200,12 @@ export default function ScanModal({ onClose }: Props) {
 
   return (
     <div
-      className="fixed inset-0 z-[100] flex items-center justify-center p-4"
+      className={`fixed inset-0 z-[100] flex items-center justify-center p-4 ${modal.backdropClass}`}
       style={{ background: 'rgba(14,42,107,0.55)', backdropFilter: 'blur(8px)' }}
       onClick={handleBackdrop}
     >
       <div
-        className="relative flex flex-col items-center gap-4 rounded-2xl p-6"
+        className={`relative flex flex-col items-center gap-4 rounded-2xl p-6 ${modal.panelClass}`}
         style={{
           background: 'var(--surface)',
           boxShadow: 'var(--shadow-float)',
