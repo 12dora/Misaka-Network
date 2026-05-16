@@ -3,9 +3,11 @@ import { cleanupRateLimitWindows } from './ratelimit.js'
 import { CLEANUP_INTERVAL_MS, DISCONNECTED_TTL_MS, LOCK_DURATION_MS, REPORT_TTL_MS } from './config.js'
 
 let zeroActiveSince: number | null = null
+let cleanupTimer: NodeJS.Timeout | null = null
 
 export function startCleanupTask() {
-  setInterval(() => {
+  if (cleanupTimer) return
+  cleanupTimer = setInterval(() => {
     const now = Date.now()
 
     // --- Session cleanup: when all nodes go offline, remove disconnected
@@ -63,4 +65,11 @@ export function startCleanupTask() {
     // Purge stale rate limit windows
     cleanupRateLimitWindows()
   }, CLEANUP_INTERVAL_MS)
+  cleanupTimer.unref?.()
+}
+
+export function stopCleanupTask() {
+  if (!cleanupTimer) return
+  clearInterval(cleanupTimer)
+  cleanupTimer = null
 }

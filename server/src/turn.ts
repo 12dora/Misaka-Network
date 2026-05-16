@@ -53,6 +53,7 @@ interface CfCredentialsResponse {
 }
 
 let pollers: NodeJS.Timeout[] = []
+let initialGlobalPoller: NodeJS.Timeout | null = null
 
 // ── Public API ───────────────────────────────────────────────────────
 
@@ -209,14 +210,20 @@ export function startTurnPollers() {
   pollers.push(globalPoller)
 
   // Run an initial global sync soon after startup to calibrate persisted counter.
-  setTimeout(() => {
+  initialGlobalPoller = setTimeout(() => {
+    initialGlobalPoller = null
     pollGlobalUsage().catch(err => console.error('[turn] initial global poll error:', err.message))
   }, 2000)
+  initialGlobalPoller.unref?.()
 }
 
 export function stopTurnPollers() {
   for (const p of pollers) clearInterval(p)
   pollers = []
+  if (initialGlobalPoller) {
+    clearTimeout(initialGlobalPoller)
+    initialGlobalPoller = null
+  }
 }
 
 // ── Internals ────────────────────────────────────────────────────────

@@ -5,7 +5,7 @@ import { WebSocketServer } from 'ws'
 import { router } from './http.js'
 import { setupWS } from './ws.js'
 import { setWSS } from './activity.js'
-import { startCleanupTask } from './cleanup.js'
+import { startCleanupTask, stopCleanupTask } from './cleanup.js'
 import { loadTurnState, startPersistFlusher, stopPersistFlusher, flushTurnState } from './persist.js'
 import { startTurnPollers, stopTurnPollers } from './turn.js'
 import { PORT, SHUTDOWN_TIMEOUT_MS } from './config.js'
@@ -61,6 +61,7 @@ function gracefulShutdown(signal: string) {
   }
 
   // 3. Stop TURN pollers and flush persisted state synchronously.
+  stopCleanupTask()
   stopTurnPollers()
   stopPersistFlusher()
   flushTurnState(true).catch(err => console.error('[shutdown] flush error:', err.message))
