@@ -4,9 +4,8 @@ import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
 import {
   loadTurnSettings, saveTurnSettings, testTurnServer,
-  loadBlocklist, removeBlockedNode,
-  fetchTurnStatus, getAutoTurnState,
-  type TurnServer, type TurnSettings, type Blocklist,
+  fetchTurnStatus, getAutoTurnState, refreshAutoTurn,
+  type TurnServer, type TurnSettings,
 } from '@/lib/turn'
 import { detectNatType, type NatDetectionResult } from '@/lib/nat'
 import { isSoundEnabled, setSoundEnabled, subscribeSoundPreference, playSound } from '@/lib/sound'
@@ -25,7 +24,7 @@ interface Props {
   onClose: () => void
 }
 
-type SettingsTab = 'turn' | 'sound' | 'blacklist' | 'about'
+type SettingsTab = 'turn' | 'sound' | 'about'
 
 interface TurnStatusView {
   enabled: boolean
@@ -53,7 +52,6 @@ function formatBytes(b: number): string {
 export default function SettingsModal({ onClose }: Props) {
   const [tab, setTab] = useState<SettingsTab>('turn')
   const [turnSettings, setTurnSettings] = useState<TurnSettings>(loadTurnSettings)
-  const [blocklist, setBlocklist] = useState<Blocklist>(loadBlocklist)
   const [editingServer, setEditingServer] = useState<TurnServer | null>(null)
   const [testingId, setTestingId] = useState<string | null>(null)
   const [soundOn, setSoundOn] = useState(isSoundEnabled)
@@ -165,11 +163,6 @@ export default function SettingsModal({ onClose }: Props) {
     setTestingId(null)
   }
 
-  function handleRemoveBlocked(nodeId: number) {
-    removeBlockedNode(nodeId)
-    setBlocklist(loadBlocklist())
-  }
-
   function handleSoundToggle() {
     const next = !soundOn
     setSoundEnabled(next)
@@ -221,7 +214,6 @@ export default function SettingsModal({ onClose }: Props) {
           {([
             { id: 'turn' as const, label: '中继' },
             { id: 'sound' as const, label: '音效' },
-            { id: 'blacklist' as const, label: '黑名单' },
             { id: 'about' as const, label: '关于' },
           ]).map(t => (
             <button
@@ -346,11 +338,11 @@ export default function SettingsModal({ onClose }: Props) {
                       <p className="font-kanji text-[10px] text-[var(--text-muted)] leading-snug">
                         {turnStatus.killSwitchActive
                           ? `已达 ${turnStatus.thresholdPct}% 熔断阈值，停止下发自动 TURN 直至下月`
-                          : `${turnStatus.percentUsed.toFixed(2)}% · 熔断阈值 ${turnStatus.thresholdPct}% · ${turnStatus.monthKey} · ${turnStatus.monthlyUsageSource === 'cloudflare' ? 'CF Analytics' : '本地估算'}`}
+                          : `${turnStatus.percentUsed.toFixed(2)}% · 熔断阈值 ${turnStatus.thresholdPct}% · ${turnStatus.monthKey} · ${turnStatus.monthlyUsageSource === 'cloudflare' ? '服务端统计' : '本地估算'}`}
                       </p>
                       {turnStatus.lastCfSyncError && (
                         <p className="font-mono text-[10px] text-[var(--state-warn)] leading-snug">
-                          CF 同步失败：{turnStatus.lastCfSyncError}
+                          同步失败：{turnStatus.lastCfSyncError}
                         </p>
                       )}
                     </>
@@ -365,8 +357,17 @@ export default function SettingsModal({ onClose }: Props) {
               )}
 
               <p className="font-kanji text-xs text-[var(--text-on-white-2)] leading-relaxed">
-                服务器配置好 Cloudflare TURN 后会自动下发短时效凭证；下方手工添加的 TURN 服务器始终生效。
+                服务器配置好中继服务后会自动下发短时效凭证；下方手工添加的 TURN 服务器在启用状态下生效。
               </p>
+
+              {/* TURN issuance trigger — shown when pending */}
+              {turnStatus && !turnStatus.killSwitchActive && turnStatus.enabled && turnStatus.configured && !autoTurnActive.active && (
+                <div className="flex justify-center">
+                  <MisakaButton variant="primary" size="sm" onClick={() => { void refreshAutoTurn() }}>
+                    下发中继凭证
+                  </MisakaButton>
+                </div>
+              )}
 
               {/* Global toggle */}
               <div className="flex items-center justify-between">
@@ -541,43 +542,6 @@ export default function SettingsModal({ onClose }: Props) {
                   </MisakaButton>
                 </div>
               </div>
-            </div>
-          )}
-
-          {/* ── Blacklist ──────────────────────────────────── */}
-          {tab === 'blacklist' && (
-            <div className="flex flex-col gap-4">
-              <p className="font-kanji text-xs text-[var(--text-on-white-2)] leading-relaxed">
-                屏蔽后的节点将无法向你发起连接请求。
-              </p>
-
-              {blocklist.blocked.length === 0 ? (
-                <div className="text-center py-8">
-                  <MisakaKanjiBlock char="空" size="md" className="mx-auto mb-2" />
-                  <p className="font-kanji text-xs text-[var(--text-muted)]">黑名单为空</p>
-                </div>
-              ) : (
-                blocklist.blocked.map(b => (
-                  <div
-                    key={b.nodeId}
-                    className="flex items-center justify-between rounded-xl p-3"
-                    style={{ background: 'var(--surface-tint)' }}
-                  >
-                    <div>
-                      <div className="font-kanji text-xs font-semibold text-[var(--text-on-white)]">
-                        御坂 {b.nodeId} 号
-                      </div>
-                      <div className="font-kanji text-[10px] text-[var(--text-on-white-2)] mt-0.5">
-                        {b.reason} · {new Date(b.blockedAt).toLocaleString()}
-                      </div>
-                    </div>
-                    <MisakaButton variant="pill" size="sm" className="text-[11px] py-1 px-2"
-                      onClick={() => handleRemoveBlocked(b.nodeId)}>
-                      <span style={{ color: 'var(--state-danger)' }}>解除</span>
-                    </MisakaButton>
-                  </div>
-                ))
-              )}
             </div>
           )}
 

@@ -45,8 +45,8 @@ export const TURN_CF_API_TOKEN = process.env.TURN_CF_API_TOKEN ?? ''
 export const TURN_CF_ACCOUNT_TAG = process.env.TURN_CF_ACCOUNT_TAG ?? ''
 export const TURN_CF_ANALYTICS_API_TOKEN = process.env.TURN_CF_ANALYTICS_API_TOKEN ?? TURN_CF_API_TOKEN
 
-// Per-credential lifetime. Short on purpose: revoke + deny-list take effect
-// at most one TTL later even if a CF revoke call fails.
+// Per-credential lifetime. Revocation takes effect at most one TTL later
+// even if a CF revoke call fails.
 export const TURN_CREDENTIAL_TTL_SEC = parseInt(process.env.TURN_CREDENTIAL_TTL_SEC ?? '300', 10)
 
 // Per-session / per-IP abuse caps.

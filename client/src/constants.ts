@@ -29,8 +29,6 @@ export const DEFAULT_STUN: RTCIceServer[] = [
   { urls: 'stun:stun2.l.google.com:19302' },
   { urls: 'stun:stun3.l.google.com:19302' },
   { urls: 'stun:stun4.l.google.com:19302' },
-  { urls: 'stun:stun.cloudflare.com:3478' },
-  { urls: 'stun:stun.cloudflare.com:53' },        // alt port — bypasses some UDP filters
   { urls: 'stun:stun.nextcloud.com:443' },        // TCP-friendly port
   { urls: 'stun:stun.miwifi.com:3478' },          // Xiaomi — China-friendly
   { urls: 'stun:stun.qq.com:3478' },              // Tencent — China-friendly

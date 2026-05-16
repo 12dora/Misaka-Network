@@ -68,12 +68,11 @@ export async function getSelectedIcePath(pc: RTCPeerConnection): Promise<Selecte
 
 export function createPeerConnection(): RTCPeerConnection {
   const turnSettings = loadTurnSettings()
-  // Order: STUN → server-issued auto TURN (Cloudflare short-lived) → manual user TURN.
-  // Manual user TURN is preserved even when auto TURN is unavailable.
+  // Order: STUN → server-issued auto TURN → manual user TURN.
   const iceServers: RTCIceServer[] = [
     ...DEFAULT_STUN,
-    ...getAutoTurnIceServers(),
-    ...getTurnIceServers(),
+    ...(turnSettings.enabled ? getAutoTurnIceServers() : []),
+    ...(turnSettings.enabled ? getTurnIceServers() : []),
   ]
 
   return new RTCPeerConnection({

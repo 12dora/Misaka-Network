@@ -12,9 +12,9 @@ function getAudioContext(): AudioContext | null {
 
 function readStoredPreference(): boolean {
   try {
-    return localStorage.getItem(STORAGE_KEY) !== 'false'
+    return localStorage.getItem(STORAGE_KEY) === 'true'
   } catch {
-    return true
+    return false
   }
 }
 

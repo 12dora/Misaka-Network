@@ -1,18 +1,12 @@
 // ── TURN-state persistence ───────────────────────────────────────────
 // Minimal JSON snapshot. Atomic write (tmp + rename). No external deps.
-// Holds only data that MUST survive restart: monthly byte tally, deny lists,
+// Holds only data that MUST survive restart: monthly byte tally,
 // in-flight credentials, recent issuance history. Everything else stays in
 // memory by design (节点 / 会话 / 上报 ephemeral per spec).
 
 import fs from 'fs/promises'
 import path from 'path'
 import { TURN_PERSIST_DIR, TURN_PERSIST_INTERVAL_SEC } from './config.js'
-
-export interface DenyEntry {
-  reason: string
-  bannedAt: number
-  expiresAt: number       // 0 = permanent
-}
 
 export interface ActiveCredential {
   sessionId: string
@@ -43,10 +37,6 @@ export interface MonthlyUsage {
 export interface TurnState {
   version: 1
   monthlyUsage: MonthlyUsage
-  denyList: {
-    sessions: Record<string, DenyEntry>
-    ips: Record<string, DenyEntry>
-  }
   activeCredentials: Record<string, ActiveCredential>   // keyed by customIdentifier
   ipIssuanceHistory: IssuanceRecord[]                   // ring buffer, oldest first
 }
@@ -67,7 +57,6 @@ function emptyState(): TurnState {
       killSwitchActive: false,
       killSwitchTriggeredAt: 0,
     },
-    denyList: { sessions: {}, ips: {} },
     activeCredentials: {},
     ipIssuanceHistory: [],
   }
@@ -108,7 +97,7 @@ export async function loadTurnState(): Promise<TurnState> {
         rollMonth(nowKey)
       }
       normalizeMonthlyUsage()
-      console.log(`[persist] loaded turn-state.json (month=${state.monthlyUsage.monthKey}, denyList sessions=${Object.keys(state.denyList.sessions).length} ips=${Object.keys(state.denyList.ips).length})`)
+      console.log(`[persist] loaded turn-state.json (month=${state.monthlyUsage.monthKey})`)
     } else {
       console.warn('[persist] state file has unexpected shape, starting empty')
       state = emptyState()

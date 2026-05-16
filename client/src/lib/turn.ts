@@ -1,7 +1,7 @@
 import { apiUrl } from '@/config'
+import { authedFetch, AuthRequiredError } from '@/lib/api'
 
 const STORAGE_KEY = 'misaka.turnServers'
-const BLACKLIST_KEY = 'misaka.blocklist'
 
 export interface TurnServer {
   id: string
@@ -20,8 +20,7 @@ export interface TurnSettings {
 }
 
 // ── Auto TURN (server-issued via /api/turn-credentials) ──────────────
-// Credentials are kept in memory only — never persisted. The server holds the
-// source of truth (deny list, byte caps, kill switch); the client just consumes.
+// Credentials are kept in memory only — never persisted.
 
 interface AutoTurnState {
   iceServers: RTCIceServer[]
@@ -52,7 +51,6 @@ interface TurnStatusResponse {
   killSwitchTriggeredAt: number
   lastCfSyncAt: number
   activeCredentials: number
-  denyListSize: { sessions: number; ips: number }
 }
 
 let autoTurn: AutoTurnState | null = null
@@ -60,16 +58,6 @@ let inFlight: Promise<AutoTurnState | null> | null = null
 let refreshTimer: ReturnType<typeof setTimeout> | null = null
 let lastFailReason: string | null = null
 const REFRESH_LEAD_MS = 60_000   // refetch 60s before expiry
-
-export interface BlockedNode {
-  nodeId: number
-  reason: string
-  blockedAt: number
-}
-
-export interface Blocklist {
-  blocked: BlockedNode[]
-}
 
 // ── TURN settings ────────────────────────────────────────────────────
 
@@ -115,14 +103,16 @@ export function getAutoTurnState(): { active: boolean; expiresAt: number | null;
   return { active: false, expiresAt: null, lastFailReason }
 }
 
-async function fetchAutoTurnOnce(token: string): Promise<AutoTurnState | null> {
+async function fetchAutoTurnOnce(): Promise<AutoTurnState | null> {
   let resp: Response
   try {
-    resp = await fetch(apiUrl('/api/turn-credentials'), {
-      headers: { 'Authorization': `Bearer ${token}` },
-    })
-  } catch {
-    lastFailReason = 'NETWORK'
+    resp = await authedFetch('/api/turn-credentials')
+  } catch (err) {
+    if (err instanceof AuthRequiredError) {
+      lastFailReason = 'AUTH_REQUIRED'
+    } else {
+      lastFailReason = 'NETWORK'
+    }
     return null
   }
   if (!resp.ok) {
@@ -144,28 +134,27 @@ async function fetchAutoTurnOnce(token: string): Promise<AutoTurnState | null> {
   return { iceServers: data.iceServers, expiresAt: data.expiresAt }
 }
 
-export async function refreshAutoTurn(token: string): Promise<RTCIceServer[]> {
-  if (!token) return []
+export async function refreshAutoTurn(): Promise<RTCIceServer[]> {
   if (inFlight) return (await inFlight)?.iceServers ?? []
 
-  inFlight = fetchAutoTurnOnce(token)
+  inFlight = fetchAutoTurnOnce()
   try {
     const result = await inFlight
     autoTurn = result
-    scheduleNextRefresh(token)
+    scheduleNextRefresh()
     return result?.iceServers ?? []
   } finally {
     inFlight = null
   }
 }
 
-function scheduleNextRefresh(token: string) {
+function scheduleNextRefresh() {
   if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null }
   if (!autoTurn) return
   const lead = Math.max(autoTurn.expiresAt - Date.now() - REFRESH_LEAD_MS, 5_000)
   refreshTimer = setTimeout(() => {
     refreshTimer = null
-    void refreshAutoTurn(token)
+    void refreshAutoTurn()
   }, lead)
 }
 
@@ -204,37 +193,4 @@ export async function testTurnServer(server: TurnServer): Promise<boolean> {
       }
     }
   })
-}
-
-// ── Blacklist ─────────────────────────────────────────────────────────
-
-export function loadBlocklist(): Blocklist {
-  try {
-    const raw = localStorage.getItem(BLACKLIST_KEY)
-    if (raw) return JSON.parse(raw) as Blocklist
-  } catch { /* ignore */ }
-  return { blocked: [] }
-}
-
-export function saveBlocklist(list: Blocklist) {
-  localStorage.setItem(BLACKLIST_KEY, JSON.stringify(list))
-}
-
-export function addBlockedNode(nodeId: number, reason: string) {
-  const list = loadBlocklist()
-  // Don't duplicate
-  if (list.blocked.some(b => b.nodeId === nodeId)) return
-  list.blocked.push({ nodeId, reason, blockedAt: Date.now() })
-  saveBlocklist(list)
-}
-
-export function removeBlockedNode(nodeId: number) {
-  const list = loadBlocklist()
-  list.blocked = list.blocked.filter(b => b.nodeId !== nodeId)
-  saveBlocklist(list)
-}
-
-export function isNodeBlocked(nodeId: number): boolean {
-  const list = loadBlocklist()
-  return list.blocked.some(b => b.nodeId === nodeId)
 }
