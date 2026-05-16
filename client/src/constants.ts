@@ -12,6 +12,7 @@ export const HIGH_WATER_MARK = 32 * 1024 * 1024  // 32 MB — keep the DataChann
 export const LOW_WATER_MARK = 12 * 1024 * 1024   // 12 MB — resume before the sender drains completely
 export const TRANSFER_PROGRESS_INTERVAL_MS = 200
 export const TRANSFER_RECORD_INTERVAL_MS = 1_000
+export const TRANSFER_LANE_COUNT = 4
 
 // ── WebRTC / ICE ──────────────────────────────────────────────────────
 // Diversified STUN pool: more servers → more chances to discover srflx

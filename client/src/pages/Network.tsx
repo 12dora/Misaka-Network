@@ -12,7 +12,7 @@ import { apiUrl } from '@/config'
 import { appUrl } from '@/lib/appBase'
 import { humanizeError } from '@/lib/transfer'
 import { ensureNotificationPermission } from '@/lib/notify'
-import type { Peer, Transfer } from '@/types'
+import type { Peer, Transfer, PendingFileItem } from '@/types'
 
 function channelLabel(t: Peer['channelType']) {
   return { direct: '直接信道（局域网）', stun: '标准信道（STUN）', relay: '中继信道（TURN）', ws: '备用信道（WS）' }[t]
@@ -32,6 +32,10 @@ function formatBytes(b: number) {
 
 function formatSpeed(bps: number) {
   return `${(bps / 1e6).toFixed(1)} MB/s`
+}
+
+function totalFileSize(items: PendingFileItem[]) {
+  return items.reduce((sum, item) => sum + item.file.size, 0)
 }
 
 function formatIceMeasuredAt(ts?: number) {
@@ -139,17 +143,18 @@ function DeliveryStatus({ status, onRetry }: { status?: string; onRetry: () => v
 // ── Channel Chat ───────────────────────────────────────────────────
 function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
   const messages = useNetworkStore(s => s.chatMessages[peerSessionId] ?? [])
-  const pendingFile = useNetworkStore(s => s.pendingFiles[peerSessionId] ?? null)
+  const pendingFiles = useNetworkStore(s => s.pendingFiles[peerSessionId] ?? [])
   const recvTransfers = useNetworkStore(s => s.transfers.filter(t => t.peerSessionId === peerSessionId))
   const sendPendingFile = useNetworkStore(s => s.sendPendingFile)
-  const clearPendingFile = useNetworkStore(s => s.setPendingFile)
+  const removePendingFile = useNetworkStore(s => s.removePendingFile)
+  const clearPendingFiles = useNetworkStore(s => s.clearPendingFiles)
   const retryChatMessage = useNetworkStore(s => s.retryChatMessage)
   const bottomRef = useRef<HTMLDivElement>(null)
   const [downloadedIds, setDownloadedIds] = useState<Set<string>>(new Set())
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages.length, recvTransfers.length, pendingFile])
+  }, [messages.length, recvTransfers.length, pendingFiles.length])
 
   function handleDownload(m: { id: string; fileName?: string; downloadUrl?: string }) {
     if (!m.downloadUrl) return
@@ -167,7 +172,7 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
       style={{ borderColor: 'var(--border-card)', maxHeight: 200, overflowY: 'auto' }}
     >
       <div className="font-kanji text-xs font-semibold text-[var(--text-on-white-2)] mb-1">会话信道</div>
-      {messages.length === 0 && recvTransfers.length === 0 && !pendingFile && (
+      {messages.length === 0 && recvTransfers.length === 0 && pendingFiles.length === 0 && (
         <div className="font-kanji text-xs text-[var(--text-on-white-2)]">
           <span className="font-mono mr-2 text-[var(--accent-cyan)]">▸</span>
           [已连接] 人格连接已建立
@@ -252,25 +257,46 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
           <span className="text-[10px] text-[var(--text-muted)]">{Math.round(t.progress * 100)}%</span>
         </div>
       ))}
-      {pendingFile && (
+      {pendingFiles.length > 0 && (
         <div
-          className="font-kanji text-xs rounded-md p-2 flex items-center gap-2"
+          className="font-kanji text-xs rounded-md p-2"
           style={{ background: 'var(--surface-tint)', border: '1px dashed var(--border-card)' }}
         >
-          <span className="font-mono text-[var(--accent-cyan)]">📎</span>
-          <div className="flex-1 min-w-0">
-            <div className="truncate text-[var(--text-on-white)]">{pendingFile.name}</div>
-            <div className="text-[10px] text-[var(--text-muted)]">{formatBytes(pendingFile.size)}</div>
+          <div className="flex items-center gap-2 mb-2">
+            <span className="font-mono text-[var(--accent-cyan)]">📎</span>
+            <div className="flex-1 min-w-0">
+              <div className="text-[var(--text-on-white)] font-semibold">待发送 {pendingFiles.length} 个项目</div>
+              <div className="text-[10px] text-[var(--text-muted)]">{formatBytes(totalFileSize(pendingFiles))}</div>
+            </div>
+            <MisakaButton variant="primary" size="sm" className="text-xs py-1 px-3 shrink-0"
+              data-testid="send-pending-file"
+              onClick={() => sendPendingFile(peerSessionId)}>
+              发送
+            </MisakaButton>
+            <MisakaButton variant="pill" size="sm" className="text-xs py-1 px-2 shrink-0"
+              onClick={() => clearPendingFiles(peerSessionId)}>
+              清空
+            </MisakaButton>
           </div>
-          <MisakaButton variant="primary" size="sm" className="text-xs py-1 px-3"
-            data-testid="send-pending-file"
-            onClick={() => sendPendingFile(peerSessionId)}>
-            发送
-          </MisakaButton>
-          <MisakaButton variant="pill" size="sm" className="text-xs py-1 px-2"
-            onClick={() => clearPendingFile(peerSessionId, null)}>
-            ✕
-          </MisakaButton>
+          <div className="max-h-28 overflow-y-auto space-y-1 pr-1">
+            {pendingFiles.map(item => (
+              <div key={item.id} className="flex items-center gap-2 rounded px-2 py-1" style={{ background: 'rgba(255,255,255,0.45)' }}>
+                <div className="flex-1 min-w-0">
+                  <div className="truncate text-[var(--text-on-white)]">{item.displayName}</div>
+                  <div className="text-[10px] text-[var(--text-muted)]">{formatBytes(item.file.size)}</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => removePendingFile(peerSessionId, item.id)}
+                  className="w-6 h-6 inline-flex items-center justify-center rounded-full text-xs cursor-pointer"
+                  style={{ border: 'none', background: 'rgba(14,42,107,0.1)', color: 'var(--text-on-white)' }}
+                  aria-label={`移除 ${item.displayName}`}
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+          </div>
         </div>
       )}
       <div ref={bottomRef} />
@@ -308,25 +334,32 @@ function ChatInput({ peerSessionId }: { peerSessionId: string }) {
 }
 
 // ── TransferChannel ───────────────────────────────────────────────
-function TransferChannel({ selectedPeer, onStageFile, onSendFileToAll }: {
+function TransferChannel({ selectedPeer, onStageFiles, onSendFilesToAll }: {
   selectedPeer: Peer | null
-  onStageFile: (file: File) => void
-  onSendFileToAll: (file: File) => void
+  onStageFiles: (files: File[]) => void
+  onSendFilesToAll: (files: File[]) => void
 }) {
   const [isDragOver, setDragOver] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const folderInputRef = useRef<HTMLInputElement>(null)
 
   function handleDrop(e: React.DragEvent) {
     e.preventDefault()
     setDragOver(false)
-    const file = e.dataTransfer.files[0]
-    if (file) onStageFile(file)
+    const files = Array.from(e.dataTransfer.files)
+    if (files.length > 0) onStageFiles(files)
   }
 
   function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0]
-    if (file) onStageFile(file)
-    if (fileInputRef.current) fileInputRef.current.value = ''
+    const files = Array.from(e.target.files ?? [])
+    if (files.length > 0) onStageFiles(files)
+    e.target.value = ''
+  }
+
+  function handleFolderChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(e.target.files ?? [])
+    if (files.length > 0) onStageFiles(files)
+    e.target.value = ''
   }
 
   async function handleCopyIceDiagnostics() {
@@ -417,17 +450,30 @@ function TransferChannel({ selectedPeer, onStageFile, onSendFileToAll }: {
       >
         <MisakaButton variant="pill" size="md" className="w-56"
           onClick={() => fileInputRef.current?.click()}>
-          📁 拖拽 / 点击选择文件
+          📁 选择文件
+        </MisakaButton>
+        <MisakaButton variant="pill" size="md" className="w-56"
+          onClick={() => folderInputRef.current?.click()}>
+          🗂 选择文件夹
         </MisakaButton>
         <MisakaButton variant="pill" size="md" className="w-56"
           onClick={() => document.getElementById('fanout-file-input')?.click()}>
           📡 群发文件到全部节点
         </MisakaButton>
-        <input ref={fileInputRef} type="file" className="hidden" onChange={handleFileChange} />
-        <input id="fanout-file-input" type="file" className="hidden"
+        <p className="font-kanji text-xs text-[var(--text-on-white-2)] text-center">支持多选、拖拽多个文件和文件夹队列</p>
+        <input ref={fileInputRef} type="file" multiple className="hidden" onChange={handleFileChange} />
+        <input
+          ref={folderInputRef}
+          type="file"
+          multiple
+          className="hidden"
+          onChange={handleFolderChange}
+          {...({ webkitdirectory: '', directory: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
+        />
+        <input id="fanout-file-input" type="file" multiple className="hidden"
           onChange={(e) => {
-            const file = e.target.files?.[0]
-            if (file) onSendFileToAll(file)
+            const files = Array.from(e.target.files ?? [])
+            if (files.length > 0) onSendFilesToAll(files)
             e.target.value = ''
           }} />
       </div>
@@ -628,14 +674,14 @@ export default function Network() {
     setChannelOpenedAt(Date.now())
   }
 
-  function handleStageFile(file: File) {
+  function handleStageFiles(files: File[]) {
     if (!store.selectedSessionId) return
-    store.setPendingFile(store.selectedSessionId, file)
+    store.addPendingFiles(store.selectedSessionId, files)
     setActiveTab('channel')
   }
 
-  async function handleSendFileToAll(file: File) {
-    try { await store.sendFileToAll(file) }
+  async function handleSendFilesToAll(files: File[]) {
+    try { await store.sendFilesToAll(files) }
     catch (e) { console.error('Fanout send failed:', e) }
   }
 
@@ -661,8 +707,8 @@ export default function Network() {
         >
           <TransferChannel
             selectedPeer={peerEntity}
-            onStageFile={handleStageFile}
-            onSendFileToAll={handleSendFileToAll}
+            onStageFiles={handleStageFiles}
+            onSendFilesToAll={handleSendFilesToAll}
           />
         </div>
         <div className="overflow-y-auto">
@@ -719,8 +765,8 @@ export default function Network() {
             >
               <TransferChannel
                 selectedPeer={peerEntity}
-                onStageFile={handleStageFile}
-                onSendFileToAll={handleSendFileToAll}
+                onStageFiles={handleStageFiles}
+                onSendFilesToAll={handleSendFilesToAll}
               />
             </div>
           )}

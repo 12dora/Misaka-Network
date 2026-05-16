@@ -37,6 +37,24 @@ export function connect(t: string) {
   doConnect()
 }
 
+export function reconnectNow() {
+  if (!token) return
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
+  reconnectAttempts = 0
+  serverShutdown = false
+  if (ws && (ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED)) {
+    ws = null
+  }
+  if (ws?.readyState === WebSocket.OPEN) {
+    try { ws.send(JSON.stringify({ t: 'PING' })) } catch { /* reconnect below */ }
+    return
+  }
+  doConnect()
+}
+
 function doConnect() {
   // Don't replace a socket that's already open *or* still connecting —
   // overwriting it leaves the old socket's `onopen` referencing the new ws
@@ -105,11 +123,7 @@ function scheduleReconnect() {
 // Network change auto-reconnect
 if (typeof window !== 'undefined') {
   window.addEventListener('online', () => {
-    if (token && !isConnected()) {
-      reconnectAttempts = 0
-      serverShutdown = false
-      doConnect()
-    }
+    reconnectNow()
   })
 }
 

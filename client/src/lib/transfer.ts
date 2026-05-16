@@ -9,6 +9,7 @@ import { encryptChunk, decryptChunk } from './crypto'
 import {
   CHUNK_SIZE, HIGH_WATER_MARK, LOW_WATER_MARK,
   TRANSFER_PROGRESS_INTERVAL_MS, TRANSFER_RECORD_INTERVAL_MS,
+  TRANSFER_LANE_COUNT,
 } from '@/constants'
 
 export { CHUNK_SIZE }
@@ -219,6 +220,138 @@ export async function sendFile(
   await updateTransfer(transferId, { status: 'completed' })
 }
 
+export async function sendFileParallel(
+  dcs: RTCDataChannel[],
+  file: File,
+  transferId: string,
+  peerNodeId: number,
+  existingRecord?: TransferRecord,
+  callbacks?: SendCallbacks,
+  peerReceivedChunks?: number[],
+): Promise<void> {
+  const lanes = dcs.filter(dc => dc.readyState === 'open').slice(0, TRANSFER_LANE_COUNT)
+  if (lanes.length <= 1) {
+    await sendFile(lanes[0] ?? dcs[0], file, transferId, peerNodeId, existingRecord, callbacks, peerReceivedChunks)
+    return
+  }
+
+  const fileHash = existingRecord?.fileHash ?? await computeFileHash(file)
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
+  const record: TransferRecord = existingRecord ?? {
+    transferId,
+    direction: 'send',
+    peerNodeId,
+    fileName: file.name,
+    fileSize: file.size,
+    fileHash,
+    totalChunks,
+    receivedChunks: [],
+    status: 'active',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  }
+  await saveTransfer(record)
+
+  const skipSet = new Set(peerReceivedChunks ?? (existingRecord ? await getSavedChunkIndexes(transferId) : []))
+  const sentChunkIndexes = new Set(record.receivedChunks)
+  let sent = skipSet.size
+  let nextChunk = 0
+  let cancelled = false
+  let lastProgressAt = performance.now()
+  let lastRecordAt = performance.now()
+  let recordDirty = false
+
+  const meta = JSON.stringify({
+    type: 'meta',
+    transferId,
+    fileName: file.name,
+    fileSize: file.size,
+    fileHash,
+    totalChunks,
+    mime: file.type || 'application/octet-stream',
+  } satisfies MetaMessage)
+
+  if (!peerReceivedChunks && !existingRecord) {
+    for (const lane of lanes) lane.send(meta)
+  }
+
+  callbacks?.onProgress?.(sent, totalChunks)
+
+  function nextIndex(): number | null {
+    while (nextChunk < totalChunks) {
+      const idx = nextChunk++
+      if (!skipSet.has(idx)) return idx
+    }
+    return null
+  }
+
+  async function flushRecord(force = false) {
+    if (!recordDirty && !force) return
+    if (!force && performance.now() - lastRecordAt < TRANSFER_RECORD_INTERVAL_MS) return
+    record.receivedChunks = Array.from(sentChunkIndexes).sort((a, b) => a - b)
+    await updateTransfer(transferId, { receivedChunks: record.receivedChunks })
+    recordDirty = false
+    lastRecordAt = performance.now()
+  }
+
+  async function laneLoop(dc: RTCDataChannel) {
+    while (!cancelled) {
+      const signal = transferSignals.get(transferId)
+      if (signal?.cancelled) {
+        cancelled = true
+        await updateTransfer(transferId, { status: 'failed' })
+        return
+      }
+      if (signal?.paused) {
+        await updateTransfer(transferId, { status: 'paused' })
+        await waitWhilePaused(transferId)
+        const s2 = transferSignals.get(transferId)
+        if (s2?.cancelled) {
+          cancelled = true
+          await updateTransfer(transferId, { status: 'failed' })
+          return
+        }
+        await updateTransfer(transferId, { status: 'active' })
+      }
+
+      const i = nextIndex()
+      if (i === null) return
+
+      const start = i * CHUNK_SIZE
+      const end = Math.min(start + CHUNK_SIZE, file.size)
+      const raw = await file.slice(start, end).arrayBuffer()
+      const { iv, encrypted } = await encryptChunk(raw)
+
+      await waitForBuffer(dc)
+      dc.send(JSON.stringify({
+        type: 'chunk',
+        transferId,
+        index: i,
+        total: totalChunks,
+        checksum: '',
+      } satisfies ChunkHeader))
+
+      const packet = new Uint8Array(12 + encrypted.byteLength)
+      packet.set(iv, 0)
+      packet.set(new Uint8Array(encrypted), 12)
+      dc.send(packet.buffer)
+
+      sent++
+      sentChunkIndexes.add(i)
+      recordDirty = true
+      if (shouldFlushProgress(lastProgressAt, sent, totalChunks)) {
+        callbacks?.onProgress?.(sent, totalChunks)
+        lastProgressAt = performance.now()
+      }
+      await flushRecord(sent === totalChunks)
+    }
+  }
+
+  await Promise.all(lanes.map(lane => laneLoop(lane)))
+  await flushRecord(true)
+  if (!cancelled) await updateTransfer(transferId, { status: 'completed' })
+}
+
 // ── Receive file ─────────────────────────────────────────────────────
 
 export interface ReceiveCallbacks {
@@ -247,6 +380,9 @@ export function getReceiveSession(transferId: string): ReceiveSession | undefine
 }
 
 export async function handleMetaMessage(msg: MetaMessage, peerNodeId: number): Promise<ReceiveSession> {
+  const existing = receiveSessions.get(msg.transferId)
+  if (existing) return existing
+
   const session: ReceiveSession = {
     transferId: msg.transferId,
     fileName: msg.fileName,
