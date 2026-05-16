@@ -11,7 +11,9 @@ globalThis.fetch = async (url) => {
   }
   if (href.includes('/graphql')) {
     return new Response(JSON.stringify({
-      data: { viewer: { accounts: [{ rtcRelayedTrafficAdaptiveGroups: [] }] } },
+      data: { viewer: { accounts: [{ callsTurnUsageAdaptiveGroups: [
+        { sum: { egressBytes: 1234, ingressBytes: 4321 }, dimensions: { customIdentifier: 'stub-cf-month' } },
+      ] }] } },
     }), { status: 200, headers: { 'Content-Type': 'application/json' } })
   }
   if (href.includes('/revoke')) {

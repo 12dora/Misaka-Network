@@ -42,6 +42,9 @@ interface TurnStatusResponse {
   credentialTtlSec: number
   monthKey: string
   monthlyBytesUsed: number
+  monthlyBytesEffective: number
+  monthlyUsageSource: 'cloudflare' | 'pessimistic'
+  lastCfSyncError?: string
   monthlyBytesLimit: number
   percentUsed: number
   thresholdPct: number

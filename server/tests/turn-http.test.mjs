@@ -47,11 +47,15 @@ async function waitForHealth() {
 try {
   await waitForHealth()
 
+  await wait(2300)
   const statusRes = await fetch(`http://127.0.0.1:${port}/api/turn-status`)
   assert.equal(statusRes.status, 200)
   const status = await statusRes.json()
   assert.equal(status.enabled, true)
   assert.equal(status.configured, true)
+  assert.equal(status.monthlyUsageSource, 'cloudflare')
+  assert.equal(status.monthlyBytesUsed, 5555)
+  assert.ok(status.lastCfSyncAt > 0)
 
   const regRes = await fetch(`http://127.0.0.1:${port}/api/register`, {
     method: 'POST',
