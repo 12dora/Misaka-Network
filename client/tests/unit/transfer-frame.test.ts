@@ -154,24 +154,31 @@ describe('AES-GCM round-trip with makeChunkIv', () => {
     const key = await deriveKey()
     const prefix = randomIvPrefix()
 
-    const plaintexts = [
-      new TextEncoder().encode('first chunk').buffer,
-      new TextEncoder().encode('second chunk has different content').buffer,
-      new Uint8Array(1024).fill(0xa5).buffer,
+    // Pass Uint8Array views (BufferSource) rather than raw .buffer
+    // ArrayBuffers — Node 20's jsdom SubtleCrypto shim rejects bare
+    // ArrayBuffer in some paths even though the spec allows it, while
+    // TypedArrays work identically across Node 20/22/24+ and the browser.
+    const plaintexts: Uint8Array[] = [
+      new TextEncoder().encode('first chunk'),
+      new TextEncoder().encode('second chunk has different content'),
+      new Uint8Array(1024).fill(0xa5),
     ]
 
     for (let i = 0; i < plaintexts.length; i++) {
       const iv = makeChunkIv(prefix, i)
       const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plaintexts[i])
       const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct)
-      expect(new Uint8Array(pt)).toEqual(new Uint8Array(plaintexts[i]))
+      // Compare via plain arrays — vitest's toEqual treats Uint8Arrays from
+      // different ArrayBuffer realms (jsdom global vs Node global) as
+      // non-equal even when the bytes match exactly.
+      expect(Array.from(new Uint8Array(pt))).toEqual(Array.from(plaintexts[i]))
     }
   })
 
   it('refuses to decrypt with a wrong-index IV (auth tag fails)', async () => {
     const key = await deriveKey()
     const prefix = randomIvPrefix()
-    const pt = new TextEncoder().encode('chunk #5').buffer
+    const pt = new TextEncoder().encode('chunk #5')
     const ivCorrect = makeChunkIv(prefix, 5)
     const ivWrong = makeChunkIv(prefix, 6)
 
@@ -188,7 +195,7 @@ describe('AES-GCM round-trip with makeChunkIv', () => {
     const prefix = randomIvPrefix()
     const shortId = 0xcafebabe
     const index = 42
-    const plaintext = new TextEncoder().encode('roundtrip payload').buffer
+    const plaintext = new TextEncoder().encode('roundtrip payload')
 
     const iv = makeChunkIv(prefix, index)
     const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plaintext)
@@ -199,11 +206,14 @@ describe('AES-GCM round-trip with makeChunkIv', () => {
     expect(decoded!.shortId).toBe(shortId)
     expect(decoded!.index).toBe(index)
 
+    // Same Uint8Array-view dance for the decrypt side: wrap the decoded
+    // ciphertext slice so jsdom's SubtleCrypto doesn't reject the raw
+    // ArrayBuffer.
     const pt = await crypto.subtle.decrypt(
       { name: 'AES-GCM', iv: decoded!.iv },
       key,
-      decoded!.ciphertext,
+      new Uint8Array(decoded!.ciphertext),
     )
-    expect(new Uint8Array(pt)).toEqual(new Uint8Array(plaintext))
+    expect(Array.from(new Uint8Array(pt))).toEqual(Array.from(plaintext))
   })
 })
