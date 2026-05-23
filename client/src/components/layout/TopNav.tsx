@@ -46,10 +46,15 @@ export default function TopNav() {
     if (!installPrompt) return
     await installPrompt.prompt()
     try {
-      const result = await installPrompt.userChoice
-      if (result.outcome === 'accepted') setInstallPrompt(null)
+      // beforeinstallprompt events are single-use per spec — once `prompt()`
+      // resolves the event is consumed regardless of accepted/dismissed, so
+      // clear it either way. Leaving it around would leave a dead "安装应用"
+      // button that no longer does anything.
+      await installPrompt.userChoice
     } catch {
-      // ignore
+      // ignore — user choice may reject in some browsers
+    } finally {
+      setInstallPrompt(null)
     }
   }
 
@@ -129,7 +134,7 @@ export default function TopNav() {
           <button
             className="w-8 h-8 inline-grid place-items-center rounded-full cursor-pointer hover:opacity-70 transition-opacity leading-none"
             style={{ border: 'none', background: 'transparent', lineHeight: 0, padding: 0 }}
-            onClick={() => setShowSettings(true)}
+            onClick={() => { setMenuOpen(false); setShowSettings(true) }}
             aria-label="设置"
           >
             <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" focusable="false">

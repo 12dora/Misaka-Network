@@ -26,7 +26,7 @@ function SectionHeader({ kanji, title, furigana }: { kanji: string; title: strin
 // ── Characters Section ────────────────────────────────────────────
 function CharacterSection() {
   return (
-    <section id="characters" className="px-5 md:px-8 py-14">
+    <section id="characters" className="px-5 md:px-8 py-14 scroll-mt-20">
       <SectionHeader kanji="体" title="实验体档案" furigana="実験体ファイル" />
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 max-w-3xl">
         {CHARACTERS.map(c => (
@@ -93,7 +93,7 @@ function EasterEggSection() {
   }
 
   return (
-    <section id="easter-eggs" className="px-5 md:px-8 py-14">
+    <section id="easter-eggs" className="px-5 md:px-8 py-14 scroll-mt-20">
       <SectionHeader kanji="戯" title="彩蛋功能" furigana="おまけ機能" />
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6 max-w-5xl">
 
@@ -170,7 +170,7 @@ function EasterEggSection() {
 // ── Timeline Section ──────────────────────────────────────────────
 function TimelineSection() {
   return (
-    <section id="timeline" className="px-5 md:px-8 py-14">
+    <section id="timeline" className="px-5 md:px-8 py-14 scroll-mt-20">
       <SectionHeader kanji="史" title="世界观时间线" furigana="タイムライン" />
       <div className="max-w-4xl grid grid-cols-1 md:grid-cols-2 gap-5">
         {LORE_TIMELINE.map(item => (
@@ -319,7 +319,7 @@ export default function ACGN() {
       </section>
 
       {/* ── About ────────────────────────────────────────────────── */}
-      <section id="about" className="px-5 md:px-8 py-14">
+      <section id="about" className="px-5 md:px-8 py-14 scroll-mt-20">
         <SectionHeader kanji="設" title="关于御坂网络" furigana="みさかネットワークについて" />
         <MisakaCard padding="lg" className="max-w-3xl">
           <div className="font-kanji text-base text-[var(--text-on-white)] leading-[1.85] space-y-4">

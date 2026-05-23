@@ -65,9 +65,14 @@ export default function Privacy() {
           <p className="text-[var(--text-on-white-2)] mt-6">最后更新：2026-05-13</p>
         </div>
 
-        <Link to="/" className="inline-block mt-6">
-          <button className="nav-pill">← 返回首页</button>
-        </Link>
+        <div className="mt-6 flex flex-wrap items-center gap-2">
+          <Link to="/" className="inline-block">
+            <button className="nav-pill">← 返回首页</button>
+          </Link>
+          <Link to="/tos" className="inline-block">
+            <button className="nav-pill">查看服务条款</button>
+          </Link>
+        </div>
       </div>
     </div>
   )

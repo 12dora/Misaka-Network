@@ -1,5 +1,18 @@
-import { getTurnIceServers, getAutoTurnIceServers, loadTurnSettings } from './turn'
+import { getTurnIceServers, getAutoTurnIceServers, loadTurnSettings, refreshAutoTurn } from './turn'
 import { DEFAULT_STUN, ICE_CANDIDATE_POOL_SIZE } from '@/constants'
+
+// One-shot pre-warm so connections kicked off immediately after WS open
+// can still get TURN ICE servers from the first RTCPeerConnection.
+// refreshAutoTurn is idempotent / coalesces in-flight calls.
+export async function ensureAutoTurnReady(timeoutMs = 1500): Promise<void> {
+  if (getAutoTurnIceServers().length > 0) return
+  try {
+    await Promise.race([
+      refreshAutoTurn(),
+      new Promise(resolve => setTimeout(resolve, timeoutMs)),
+    ])
+  } catch { /* ignore — fall through with whatever we have */ }
+}
 
 // ICE candidate pair → channel type
 export type ChannelType = 'direct' | 'stun' | 'relay'
@@ -68,10 +81,18 @@ export async function getSelectedIcePath(pc: RTCPeerConnection): Promise<Selecte
 
 export function createPeerConnection(): RTCPeerConnection {
   const turnSettings = loadTurnSettings()
-  // Order: STUN → server-issued auto TURN → manual user TURN.
+  // Order: STUN → server-issued auto TURN (always injected — server is the
+  // canonical gate via budget/killswitch) → manual user TURN (only when
+  // user opts in via the Settings toggle).
+  //
+  // The previous gate (both lists behind `turnSettings.enabled`) meant that
+  // symmetric-NAT users behind a default-off install simply could not
+  // connect — the README's headline feature was off by default.
+  // Manual servers stay opt-in so users with broken creds can't break their
+  // own ICE selection.
   const iceServers: RTCIceServer[] = [
     ...DEFAULT_STUN,
-    ...(turnSettings.enabled ? getAutoTurnIceServers() : []),
+    ...getAutoTurnIceServers(),
     ...(turnSettings.enabled ? getTurnIceServers() : []),
   ]
 

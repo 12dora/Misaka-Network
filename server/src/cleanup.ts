@@ -1,4 +1,4 @@
-import { nodes, channels, qrTokens, reports, getOnlineCount } from './store.js'
+import { nodes, channels, qrTokens, reports, attemptLocks, getOnlineCount } from './store.js'
 import { cleanupRateLimitWindows } from './ratelimit.js'
 import { CLEANUP_INTERVAL_MS, DISCONNECTED_TTL_MS, LOCK_DURATION_MS, REPORT_TTL_MS } from './config.js'
 
@@ -40,6 +40,18 @@ export function startCleanupTask() {
       if (session.lockedUntil > 0 && now >= session.lockedUntil) {
         session.lockedUntil = 0
         session.failedAttempts = 0
+      }
+    }
+
+    // Purge stale per-attempter brute-force locks (Bug F7). Entries are
+    // dropped once their lock has expired AND no attempt has happened in
+    // the last LOCK_DURATION_MS — otherwise we'd reset the count for an
+    // active brute-force session and let the attacker keep guessing.
+    for (const [key, lock] of attemptLocks) {
+      const lockExpired = lock.lockedUntil === 0 || now >= lock.lockedUntil
+      const idle = now - lock.lastAttemptAt >= LOCK_DURATION_MS
+      if (lockExpired && idle) {
+        attemptLocks.delete(key)
       }
     }
 

@@ -2,7 +2,7 @@ import { Router, type Request, type Response, type NextFunction } from 'express'
 import { createHash, randomBytes } from 'crypto'
 import { nanoid } from 'nanoid'
 import { z } from 'zod'
-import { nodes, channels, qrTokens, reports, stats, getOnlineCount, getLongestUptimeMs, countNodesByIp, getCpuUsagePercent, findSessionByToken } from './store.js'
+import { nodes, channels, qrTokens, reports, stats, getOnlineCount, getLongestUptimeMs, countNodesByIp, getCpuUsagePercent, findSessionByToken, attemptLocks, attemptKey } from './store.js'
 import { broadcast } from './activity.js'
 import { checkRateLimit } from './ratelimit.js'
 import { issueCredentials, getTurnStatus } from './turn.js'
@@ -52,6 +52,24 @@ router.post('/register', (req, res) => {
   const now = Date.now()
   const passCodeHash = hashPassCode(passCode)
 
+  // Brute-force lock (Bug F7): the lock follows the *attempter*, not the
+  // owner. Key = (ip, nodeId). If the attempter is currently locked we
+  // refuse before even looking at the passcode, so brute-force probes can't
+  // distinguish "you got it right but you're still locked" from a guess.
+  // The owner on a DIFFERENT IP is unaffected — that is the whole point
+  // of the fix.
+  const lockKey = attemptKey(ip, nodeId)
+  let lock = attemptLocks.get(lockKey)
+  if (lock && now < lock.lockedUntil) {
+    res.status(423).json({ error: 'NODE_LOCKED', reason: 'WRONG_PASSCODE', unlockAt: lock.lockedUntil })
+    return
+  }
+  // Expired lock — clear it so a fresh attempt cycle can begin.
+  if (lock && lock.lockedUntil > 0 && now >= lock.lockedUntil) {
+    attemptLocks.delete(lockKey)
+    lock = undefined
+  }
+
   // Identity = (nodeId, passCodeHash). Reject if any session already exists
   // with the same nodeId but a different passcode — that nodeId is "owned" by
   // someone else. Otherwise we permit a brand-new session for this identity:
@@ -61,19 +79,24 @@ router.post('/register', (req, res) => {
   for (const s of nodes.values()) {
     if (s.nodeId === nodeId) sameNodeSessions.push(s)
   }
-  const lockedSession = sameNodeSessions.find(s => now < s.lockedUntil)
-  if (lockedSession) {
-    res.status(423).json({ error: 'NODE_LOCKED', reason: 'WRONG_PASSCODE', unlockAt: lockedSession.lockedUntil })
-    return
-  }
   const conflict = sameNodeSessions.find(s => s.passCodeHash !== passCodeHash)
   if (conflict) {
-    conflict.failedAttempts++
-    if (conflict.failedAttempts >= MAX_ATTEMPTS) {
-      conflict.lockedUntil = now + LOCK_DURATION_MS
-      res.status(423).json({ error: 'NODE_LOCKED', reason: 'WRONG_PASSCODE', unlockAt: conflict.lockedUntil })
+    // Failure attributed to (ip, nodeId), NOT to the owner session. The
+    // owner's NodeSession.failedAttempts / lockedUntil are now legacy and
+    // remain zero in normal operation — they are kept on the type only so
+    // that persisted state from older builds can be loaded without
+    // crashing. Brute-force semantics live entirely in `attemptLocks`.
+    if (!lock) {
+      lock = { attempts: 0, lockedUntil: 0, lastAttemptAt: now }
+      attemptLocks.set(lockKey, lock)
+    }
+    lock.attempts++
+    lock.lastAttemptAt = now
+    if (lock.attempts >= MAX_ATTEMPTS) {
+      lock.lockedUntil = now + LOCK_DURATION_MS
+      res.status(423).json({ error: 'NODE_LOCKED', reason: 'WRONG_PASSCODE', unlockAt: lock.lockedUntil })
     } else {
-      const remaining = MAX_ATTEMPTS - conflict.failedAttempts
+      const remaining = MAX_ATTEMPTS - lock.attempts
       res.status(409).json({ error: 'NODE_OCCUPIED', message: '该节点编号的通行码错误，请重新输入', remaining })
     }
     return
@@ -106,20 +129,55 @@ router.post('/register', (req, res) => {
   }
   nodes.set(sessionId, session)
 
+  // A successful register from this (ip, nodeId) means the caller knows the
+  // right passcode, so clear any prior lockout we'd been tracking against
+  // this attempter. Without this, a user who typed wrong once and right the
+  // second time would still see a lingering counter on their next try.
+  attemptLocks.delete(lockKey)
+
   broadcast({ type: 'join', nodeId, message: `御坂 ${nodeId} 号已接入网络` })
 
   res.json({ sessionId, token, expiresAt: now + SESSION_TTL_MS, resumed: false })
 })
 
 // POST /api/release-by-ip
-// Releases every node currently registered from the caller's IP. Used by the
+// Releases the caller's stale sessions from the caller's IP. Used by the
 // client when the IP node limit is hit so the user can wipe stale sessions
 // (typical for local dev with multiple browsers) and try again.
+//
+// Security (F6): this endpoint MUST require a valid Bearer token. Without
+// auth, any anonymous attacker on a shared egress IP (CGNAT, corporate NAT,
+// dorm WiFi) could wipe every other Misaka user behind that same IP. We
+// authenticate the caller, then only release sessions that belong to the
+// SAME identity (same token == same registration). Other users on the same
+// IP are untouched.
 router.post('/release-by-ip', (req, res) => {
+  const authHeader = req.headers.authorization
   const ip = getClientIP(req)
+
+  // Test escape hatch: when the server is launched with
+  // E2E_ALLOW_UNAUTH_RELEASE_BY_IP=1, allow anonymous calls to wipe every
+  // session on the caller's IP. The e2e suite uses this in beforeEach to
+  // prevent cross-test pollution (zombie sessions from a previous test
+  // accumulating in the same identity cluster). Production never sets this.
+  const testBypass = process.env.E2E_ALLOW_UNAUTH_RELEASE_BY_IP === '1'
+
+  let caller: ReturnType<typeof findSessionByToken> | undefined
+  if (authHeader?.startsWith('Bearer ')) {
+    const token = authHeader.slice(7)
+    caller = findSessionByToken(token)
+    if (!caller && !testBypass) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
+  } else if (!testBypass) {
+    res.status(401).json({ error: 'UNAUTHORIZED' }); return
+  }
+
   let released = 0
   for (const [sessionId, session] of nodes) {
     if (session.ip !== ip) continue
+    // In test-bypass mode (no caller) we wipe everything on the IP.
+    // In authenticated mode, only release sessions belonging to the same
+    // identity (same nodeId + passCodeHash as the caller).
+    if (caller && (session.nodeId !== caller.nodeId || session.passCodeHash !== caller.passCodeHash)) continue
     if (session.socket) {
       try { session.socket.close() } catch { /* ignore */ }
       session.socket = null

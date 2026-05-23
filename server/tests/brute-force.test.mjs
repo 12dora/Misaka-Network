@@ -7,6 +7,9 @@
  * 2. 锁定期间正确通行码也拒绝
  * 3. 注册 API 速率限制
  * 4. 单 IP 最多 10 个节点
+ * 5. Bug F7: 锁定追踪 attempter（IP+nodeId），不再连累 owner
+ *    — 攻击者从 IP A 暴力穷举不会把 IP B 的合法 owner 锁出
+ *    — 合法 owner 注册成功后清除自己的 attempter 计数
  *
  * Usage: cd server && node tests/brute-force.test.mjs
  */
@@ -26,12 +29,14 @@ let serverProcess = null
 
 async function main() {
   // ── Start server ─────────────────────────────────────────────────
-  console.log('[1/6] 启动测试服务器...')
+  console.log('[1/8] 启动测试服务器...')
   serverProcess = startServer()
   await waitForServer()
 
   try {
     await testBruteForceLock()
+    await testAttackerCannotLockOwnerOnDifferentIp()
+    await testSuccessfulRegisterClearsAttemptCounter()
     await testIpNodeLimit()  // must run before testRateLimit (which floods IP)
     await testRateLimit()
     console.log('\n✅ 全部测试通过')
@@ -47,7 +52,7 @@ async function main() {
 // ── Test 1: Brute force lock ─────────────────────────────────────
 
 async function testBruteForceLock() {
-  console.log('[2/6] 通行码暴力穷举锁定测试...')
+  console.log('[2/8] 通行码暴力穷举锁定测试（同 IP 下）...')
 
   const nodeId = 10032
   const correctCode = '485291'
@@ -77,16 +82,106 @@ async function testBruteForceLock() {
   assert(lockDuration > 4.5 * 60 * 1000, `锁定时间应 ≈ 5 分钟，实际 ${(lockDuration / 1000).toFixed(0)}s`)
   console.log('   ✓ 第 3 次错误 → NODE_LOCKED (锁定 5 分钟)')
 
-  // Locked: correct passcode should also be rejected
+  // Locked: correct passcode from the SAME attempter (same IP, same nodeId)
+  // should also be rejected. The lock is keyed to the attempter so the
+  // server can't tell whether the lock duration is a defensive 5-minute
+  // window against the same source IP or just a guess that happened to be
+  // right; the safe choice is "reject for the whole window".
   const locked = await post('/register', { nodeId, passCode: correctCode })
-  assertEq(locked.error, 'NODE_LOCKED', '锁定期间正确通行码也拒绝')
-  console.log('   ✓ 锁定期间正确通行码 → NODE_LOCKED')
+  assertEq(locked.error, 'NODE_LOCKED', '锁定期间正确通行码也拒绝（同 IP）')
+  console.log('   ✓ 锁定期间正确通行码 → NODE_LOCKED (同 IP)')
 }
 
-// ── Test 2: API rate limit ───────────────────────────────────────
+// ── Test 2 (F7): attacker can't lock the owner on a different IP ────
+//
+// This is the core invariant the F7 fix protects. Before the fix the failed
+// attempts were counted against the owner's session, so any anonymous IP
+// could lock the legitimate owner out of their own nodeId in under a
+// minute. After the fix the counter follows the attacker's (IP, nodeId)
+// pair only.
+
+async function testAttackerCannotLockOwnerOnDifferentIp() {
+  console.log('[3/8] F7: 攻击者 IP 不应锁住合法 owner 的不同 IP ...')
+
+  const nodeId = 10100
+  const correctCode = '777777'
+  const ATTACKER_IP = '198.51.100.7'
+  const OWNER_IP    = '203.0.113.42'
+
+  // Pre-register the owner on OWNER_IP so the nodeId is occupied. (If the
+  // bug were present, the attack below would lock this very session.)
+  const ownerPre = await postFrom('/register', { nodeId, passCode: correctCode }, OWNER_IP)
+  assert(ownerPre.token, 'owner 预先注册成功')
+
+  // Bombard from ATTACKER_IP with wrong passcodes — far more than 3 to
+  // make sure cumulative count would have wrecked the owner under the
+  // old semantics.
+  let attackerLocked = false
+  for (let i = 0; i < 25; i++) {
+    const guess = String(i).padStart(6, '0')
+    if (guess === correctCode) continue
+    const r = await postFrom('/register', { nodeId, passCode: guess }, ATTACKER_IP)
+    if (r.error === 'NODE_LOCKED') {
+      attackerLocked = true
+      // Once we see lock from this attempter we've proven the lock applied
+      // to the attacker — no need to keep hammering.
+      break
+    }
+  }
+  assert(attackerLocked, '攻击者 IP 自己应被锁定')
+  console.log('   ✓ 攻击者 IP 自身被锁定')
+
+  // Owner on a DIFFERENT IP, with the CORRECT passcode, must still get a
+  // working multi-device session — this is the legitimate "phone joins the
+  // cluster after PC" path.
+  const ownerAfter = await postFrom('/register', { nodeId, passCode: correctCode }, OWNER_IP)
+  assert(ownerAfter.token, `合法 owner 应能正常注册，实际响应 ${JSON.stringify(ownerAfter)}`)
+  assert(ownerAfter.sessionId !== ownerPre.sessionId, 'owner 应分到新的 sessionId')
+  console.log('   ✓ 合法 owner 在 IP B 上仍能注册成功')
+}
+
+// ── Test 3 (F7): success clears the per-attempter counter ──────────
+
+async function testSuccessfulRegisterClearsAttemptCounter() {
+  console.log('[4/8] F7: 注册成功后应清除 (IP,nodeId) 失败计数 ...')
+
+  const nodeId = 10200
+  const correctCode = '654321'
+  const SHARED_IP = '198.51.100.50'
+
+  // First register an OWNER from a *different* IP so the nodeId is taken.
+  const ownerIp = '203.0.113.99'
+  const owner = await postFrom('/register', { nodeId, passCode: correctCode }, ownerIp)
+  assert(owner.token, 'owner registered on its own IP')
+
+  // From SHARED_IP, type the wrong code twice — should be under the
+  // 3-strike threshold so the attempter is not yet locked.
+  for (let i = 0; i < 2; i++) {
+    const r = await postFrom('/register', { nodeId, passCode: '000000' }, SHARED_IP)
+    assertEq(r.error, 'NODE_OCCUPIED', `第 ${i + 1} 次错误未越线`)
+  }
+
+  // Now register correctly from SHARED_IP — this IS the owner's identity
+  // (matching nodeId+passcode), so it should succeed AND wipe the prior
+  // failure count for (SHARED_IP, nodeId).
+  const ok = await postFrom('/register', { nodeId, passCode: correctCode }, SHARED_IP)
+  assert(ok.token, '正确通行码注册成功')
+
+  // A SUBSEQUENT wrong attempt from SHARED_IP should reset to "1 failure",
+  // not "3 failures → locked". We test this by issuing one wrong attempt
+  // and asserting the response is still NODE_OCCUPIED with remaining >=
+  // MAX_ATTEMPTS - 1.
+  const after = await postFrom('/register', { nodeId, passCode: '999999' }, SHARED_IP)
+  assertEq(after.error, 'NODE_OCCUPIED', '失败计数应已被清零，新一次错误不应直接锁定')
+  assert(after.remaining === undefined || after.remaining >= 1,
+    `remaining 应至少为 1，实际 ${after.remaining}`)
+  console.log('   ✓ 注册成功后失败计数被重置')
+}
+
+// ── Test 4: API rate limit ───────────────────────────────────────
 
 async function testRateLimit() {
-  console.log('[4/6] API 速率限制测试...')
+  console.log('[6/8] API 速率限制测试...')
 
   // Register many nodes rapidly to trigger rate limit
   let rateLimited = false
@@ -101,10 +196,10 @@ async function testRateLimit() {
   console.log('   ✓ 高频请求 → RATE_LIMITED')
 }
 
-// ── Test 3: IP node limit ────────────────────────────────────────
+// ── Test 5: IP node limit ────────────────────────────────────────
 
 async function testIpNodeLimit() {
-  console.log('[3/6] 单 IP 节点数限制测试...')
+  console.log('[5/8] 单 IP 节点数限制测试...')
 
   // Register nodes from same IP until limit (test 1 already registered 1 node, so 9 more = 10 total)
   const baseId = 12000
@@ -125,6 +220,20 @@ async function post(path, body) {
   const res = await fetch(`${BASE}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  return res.json()
+}
+
+// Issue a request that the server sees as coming from a specific IP.
+// Requires `app.set('trust proxy', 1)` on the server (set in index.ts).
+async function postFrom(path, body, ip) {
+  const res = await fetch(`${BASE}${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Forwarded-For': ip,
+    },
     body: JSON.stringify(body),
   })
   return res.json()

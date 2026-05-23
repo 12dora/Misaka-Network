@@ -37,9 +37,26 @@ export function onAuthInvalid(handler: ConnectionHandler) {
 }
 
 export function connect(t: string) {
+  // Auth recovery (4001/4002 close → fresh token) re-enters this function.
+  // The old socket is still attached to its onclose; if we leave it alone the
+  // new doConnect() bails on the OPEN/CONNECTING guard and the new token is
+  // never sent. Force-detach + close the old socket first.
+  const tokenChanged = token !== t
+  if (tokenChanged && ws) {
+    ws.onclose = null
+    ws.onerror = null
+    ws.onmessage = null
+    ws.onopen = null
+    try { ws.close() } catch { /* ignore */ }
+    ws = null
+  }
   token = t
   reconnectAttempts = 0
   serverShutdown = false
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
   doConnect()
 }
 
@@ -126,8 +143,11 @@ function stopHeartbeat() {
 
 function scheduleReconnect() {
   if (reconnectTimer || serverShutdown) return
-  const delay = RECONNECT_DELAYS_MS[Math.min(reconnectAttempts, RECONNECT_DELAYS_MS.length - 1)]
-  reconnectAttempts++
+  const idx = Math.min(reconnectAttempts, RECONNECT_DELAYS_MS.length - 1)
+  const delay = RECONNECT_DELAYS_MS[idx]
+  // Bound the counter so it doesn't increment forever on a flaky network.
+  // Stops being meaningful past the table length anyway.
+  if (reconnectAttempts < RECONNECT_DELAYS_MS.length) reconnectAttempts++
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null
     doConnect()

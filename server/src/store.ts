@@ -8,6 +8,32 @@ export const channels = new Map<string, Set<string>>()    // channelId -> sessio
 export const qrTokens = new Map<string, QrTokenRecord>()
 export const reports: ReportRecord[] = []
 
+// Per-attempter brute-force lockout (Bug F7).
+//
+// Why this is separate from NodeSession.failedAttempts:
+// The old design incremented the OWNER's session counter when a 3rd party
+// guessed wrong, which let an attacker lock out the legitimate owner just
+// by spamming /api/register with the right nodeId and any passcode. The
+// fix is to track failures on the ATTEMPTER's side — keyed by
+// (ip, nodeId) — so the lock follows the attacker, not the victim. An
+// owner on a different IP can still register on attempt 1 even while an
+// attacker on another IP is in lockout.
+//
+// Key shape: `${ip}::${nodeId}`. The lock is cleared on a successful
+// register from the same (ip, nodeId), so a legitimate user who mistyped
+// once or twice and then gets it right is not punished, and so the
+// per-session cleanup task can purge stale entries.
+export interface AttemptLock {
+  attempts: number
+  lockedUntil: number   // 0 = not currently locked
+  lastAttemptAt: number // for cleanup / TTL purposes
+}
+export const attemptLocks = new Map<string, AttemptLock>()
+
+export function attemptKey(ip: string, nodeId: number): string {
+  return `${ip}::${nodeId}`
+}
+
 export function findSessionByToken(token: string): NodeSession | null {
   for (const s of nodes.values()) {
     if (s.token === token) return s

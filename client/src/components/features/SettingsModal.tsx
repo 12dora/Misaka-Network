@@ -140,6 +140,13 @@ export default function SettingsModal({ onClose }: Props) {
   }
 
   function handleDelete(id: string) {
+    // If the user is mid-edit on this row, clear the editing state and reset
+    // the form fields first — otherwise the edit form would silently target a
+    // server that no longer exists and "保存" would no-op.
+    if (editingServer?.id === id) {
+      setEditingServer(null)
+      setForm({ url: '', username: '', credential: '' })
+    }
     setTurnSettings(s => ({ ...s, servers: s.servers.filter(srv => srv.id !== id) }))
   }
 
@@ -442,8 +449,9 @@ export default function SettingsModal({ onClose }: Props) {
                       {s.enabled ? '禁用' : '启用'}
                     </MisakaButton>
                     <MisakaButton variant="pill" size="sm" className="text-[11px] py-1 px-2"
-                      onClick={() => handleTest(s)}>
-                      测试
+                      onClick={() => handleTest(s)}
+                      disabled={testingId === s.id}>
+                      {testingId === s.id ? '测试中…' : '测试'}
                     </MisakaButton>
                     <MisakaButton variant="pill" size="sm" className="text-[11px] py-1 px-2"
                       onClick={() => handleEdit(s)}>
