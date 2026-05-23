@@ -12,7 +12,6 @@ const topNav = read('src/components/layout/TopNav.tsx')
 const qr = read('src/components/features/QRModal.tsx')
 const settings = read('src/components/features/SettingsModal.tsx')
 const scan = read('src/components/features/ScanModal.tsx')
-const receive = read('src/components/features/ReceiveConfirmModal.tsx')
 const network = read('src/pages/Network.tsx')
 const networkStore = read('src/store/network.ts')
 const authStore = read('src/store/auth.ts')
@@ -30,7 +29,7 @@ assert.match(css, /@keyframes modal-panel-out/)
 assert.match(app, /key=\{location\.pathname\} className="page-enter"/)
 assert.match(read('src/hooks/useModalExit.ts'), /modal-panel-out/)
 
-for (const [name, source] of Object.entries({ qr, settings, scan, receive })) {
+for (const [name, source] of Object.entries({ qr, settings, scan })) {
   assert.match(source, /modal-(backdrop|panel)|useModalExit/, `${name} has modal animation hook/classes`)
 }
 

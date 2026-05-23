@@ -44,6 +44,7 @@ export default function ScanModal({ onClose }: Props) {
   const [detected, setDetected] = useState<string | null>(null)
   const [manualUrl, setManualUrl] = useState('')
   const [manualError, setManualError] = useState<string | null>(null)
+  const [cameraCount, setCameraCount] = useState(0)
   const modal = useModalExit(onClose)
   const streamRef = useRef<MediaStream | null>(null)
   const animRef = useRef<number>(0)
@@ -86,6 +87,15 @@ export default function ScanModal({ onClose }: Props) {
       }
       setHasCamera(true)
       setCameraError(null)
+      // Probe device list after permission is granted — pre-permission the
+      // browser returns blank labels and may hide some devices. We only show
+      // the "切换摄像头" button when there is actually something to switch to.
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices()
+        setCameraCount(devices.filter(d => d.kind === 'videoinput').length)
+      } catch {
+        setCameraCount(1)
+      }
       startScanning()
     } catch (err) {
       setHasCamera(false)
@@ -287,7 +297,7 @@ export default function ScanModal({ onClose }: Props) {
 
         {/* Actions */}
         <div className="flex gap-2 w-full">
-          {hasCamera && (
+          {hasCamera && cameraCount > 1 && (
             <MisakaButton variant="pill" size="sm" fullWidth onClick={switchCamera}>
               切换摄像头
             </MisakaButton>

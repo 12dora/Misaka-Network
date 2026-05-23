@@ -40,12 +40,16 @@ export default function ActivityStream() {
   }, [session, addActivity])
 
   useEffect(() => {
+    // Lore quotes are flavour text mixed into the live activity stream — only
+    // inject them once the user is connected so the section stays empty (and
+    // collapses, see early-return below) for visitors who haven't joined yet.
+    if (!session) return
     const timer = window.setInterval(() => {
       quoteIndex.current += 1
       addActivity(quoteEvent(quoteIndex.current))
     }, 45_000)
     return () => window.clearInterval(timer)
-  }, [addActivity])
+  }, [session, addActivity])
 
   // Auto scroll to left on new activity
   useEffect(() => {

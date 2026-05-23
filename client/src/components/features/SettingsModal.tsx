@@ -59,6 +59,7 @@ export default function SettingsModal({ onClose }: Props) {
   const [natDetecting, setNatDetecting] = useState(false)
   const [turnStatus, setTurnStatus] = useState<TurnStatusView | null>(null)
   const [autoTurnActive, setAutoTurnActive] = useState(getAutoTurnState())
+  const [issuing, setIssuing] = useState(false)
   const navigate = useNavigate()
   const modal = useModalExit(onClose)
 
@@ -363,8 +364,18 @@ export default function SettingsModal({ onClose }: Props) {
               {/* TURN issuance trigger — shown when pending */}
               {turnStatus && !turnStatus.killSwitchActive && turnStatus.enabled && turnStatus.configured && !autoTurnActive.active && (
                 <div className="flex justify-center">
-                  <MisakaButton variant="primary" size="sm" onClick={() => { void refreshAutoTurn() }}>
-                    下发中继凭证
+                  <MisakaButton
+                    variant="primary"
+                    size="sm"
+                    disabled={issuing}
+                    onClick={async () => {
+                      if (issuing) return
+                      setIssuing(true)
+                      try { await refreshAutoTurn() }
+                      finally { setIssuing(false) }
+                    }}
+                  >
+                    {issuing ? '下发中…' : '下发中继凭证'}
                   </MisakaButton>
                 </div>
               )}

@@ -7,6 +7,13 @@ import MisakaButton from '@/components/ui/MisakaButton'
 import QRModal from '@/components/features/QRModal'
 import ScanModal from '@/components/features/ScanModal'
 import { SPECIAL_NODE_HINTS } from '@/data/lore'
+import {
+  getPassChars as computePassChars,
+  sanitisePastedPassCode,
+  sanitiseDigit,
+  applyDigit,
+  applyBackspace,
+} from '@/lib/passcode'
 
 export default function LoginCard() {
   const navigate = useNavigate()
@@ -31,38 +38,24 @@ export default function LoginCard() {
     if (!isNaN(n) && n >= 1 && n <= 20001) setNodeId(n)
   }
 
-  // Pad passcode to 6 chars with empty strings for display
   function getPassChars(): string[] {
-    const chars: string[] = []
-    for (let i = 0; i < 6; i++) {
-      chars.push(identity.passCode[i] ?? '')
-    }
-    return chars
+    return computePassChars(identity.passCode)
   }
 
   function handlePassDigit(idx: number, val: string) {
-    const digit = val.replace(/\D/g, '').slice(-1)
+    const digit = sanitiseDigit(val)
     if (!digit) return
-    const chars = getPassChars()
-    chars[idx] = digit
-    setPassCode(chars.join(''))
-    passInputs.current[idx + 1]?.focus()
+    const result = applyDigit(identity.passCode, idx, digit)
+    setPassCode(result.next)
+    if (result.focusIdx !== idx) passInputs.current[result.focusIdx]?.focus()
   }
 
   function handlePassKey(idx: number, e: KeyboardEvent<HTMLInputElement>) {
     if (e.key === 'Backspace') {
-      const chars = getPassChars()
-      if (chars[idx]) {
-        // Clear current digit and stay
-        chars[idx] = ''
-        setPassCode(chars.join(''))
-      } else if (idx > 0) {
-        // Already empty — move to previous and clear it
-        chars[idx - 1] = ''
-        setPassCode(chars.join(''))
-        passInputs.current[idx - 1]?.focus()
-      }
-      e.preventDefault()
+      const result = applyBackspace(identity.passCode, idx)
+      if (result.next !== identity.passCode) setPassCode(result.next)
+      if (result.focusIdx !== idx) passInputs.current[result.focusIdx]?.focus()
+      if (result.preventDefault) e.preventDefault()
     } else if (e.key === 'ArrowLeft' && idx > 0) {
       passInputs.current[idx - 1]?.focus()
     } else if (e.key === 'ArrowRight' && idx < 5) {
@@ -71,10 +64,8 @@ export default function LoginCard() {
   }
 
   function handlePassPaste(e: React.ClipboardEvent) {
-    const text = e.clipboardData.getData('text').replace(/\D/g, '').slice(0, 6)
-    if (text.length > 0) {
-      setPassCode(text.padEnd(6, ''))
-    }
+    const text = sanitisePastedPassCode(e.clipboardData.getData('text'))
+    if (text.length > 0) setPassCode(text)
   }
 
   // Whether passcode is complete (6 digits)

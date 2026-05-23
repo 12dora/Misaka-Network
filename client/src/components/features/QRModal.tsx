@@ -41,6 +41,7 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
   const [loading, setLoading] = useState(true)
   const [qrError, setQrError] = useState<string | null>(null)
   const [qrImageUrl, setQrImageUrl] = useState<string | null>(null)
+  const [copyToast, setCopyToast] = useState<string | null>(null)
   const session = useAuthStore(s => s.session)
   const modal = useModalExit(onClose)
 
@@ -105,7 +106,13 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
   function handleCopy() {
     if (!qrToken) return
     const url = buildURL(qrType, nodeId, qrToken, includePass ? passCode : undefined, fileSessionId, channelId)
-    navigator.clipboard.writeText(url).catch(() => {})
+    // Clipboard API rejects in non-secure contexts and when permission is
+    // denied — surface that to the user instead of silently failing so they
+    // don't think they have a link they can paste.
+    navigator.clipboard.writeText(url)
+      .then(() => setCopyToast('链接已复制'))
+      .catch(() => setCopyToast('复制失败，请手动选取下方链接'))
+    window.setTimeout(() => setCopyToast(null), 2200)
   }
 
   function handleBackdrop(e: React.MouseEvent<HTMLDivElement>) {
@@ -245,6 +252,16 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
         <MisakaButton variant="pill" size="sm" fullWidth onClick={modal.requestClose}>
           关闭
         </MisakaButton>
+
+        {copyToast && (
+          <div
+            className="absolute -bottom-10 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-md text-xs font-kanji whitespace-nowrap shadow-md"
+            style={{ background: 'var(--bg-deep)', color: '#fff' }}
+            role="status"
+          >
+            {copyToast}
+          </div>
+        )}
       </div>
     </div>
   )
