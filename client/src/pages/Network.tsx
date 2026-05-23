@@ -6,6 +6,7 @@ import MisakaStatusBadge from '@/components/ui/MisakaStatusBadge'
 import MisakaProgressBar from '@/components/ui/MisakaProgressBar'
 import AppFooter from '@/components/ui/AppFooter'
 import QRModal from '@/components/features/QRModal'
+import SettingsModal from '@/components/features/SettingsModal'
 import { useNetworkStore } from '@/store/network'
 import { useAuthStore } from '@/store/auth'
 import { appUrl } from '@/lib/appBase'
@@ -162,7 +163,9 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
     a.href = m.downloadUrl
     a.download = m.fileName ?? 'download'
     a.click()
-    setTimeout(() => { if (m.downloadUrl) URL.revokeObjectURL(m.downloadUrl) }, 500)
+    // Keep the object URL alive: revoking after a fixed delay used to break the
+    // re-download path when the user dismissed the "已下载" state (e.g. tab
+    // re-mount). The blob is garbage-collected with the page anyway.
     setDownloadedIds(prev => new Set([...prev, m.id]))
   }
 
@@ -334,10 +337,11 @@ function ChatInput({ peerSessionId }: { peerSessionId: string }) {
 }
 
 // ── TransferChannel ───────────────────────────────────────────────
-function TransferChannel({ selectedPeer, onStageFiles, onSendFilesToAll }: {
+function TransferChannel({ selectedPeer, onStageFiles, onSendFilesToAll, onOpenSettings }: {
   selectedPeer: Peer | null
   onStageFiles: (files: File[]) => void
   onSendFilesToAll: (files: File[]) => void
+  onOpenSettings: () => void
 }) {
   const [isDragOver, setDragOver] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -435,7 +439,15 @@ function TransferChannel({ selectedPeer, onStageFiles, onSendFilesToAll }: {
         )}
         {selectedPeer.status === 'offline' && (
           <div className="flex items-center gap-1.5 mt-2 px-2 py-1 rounded text-[10px]" style={{ background: 'rgba(239,68,68,0.1)', color: 'var(--state-danger)' }}>
-            <span className="font-kanji">连接已断开 — 请在设置中开启 TURN 中继或检查网络</span>
+            <span className="font-kanji">连接已断开 — 请检查网络或开启 TURN 中继</span>
+            <button
+              type="button"
+              onClick={onOpenSettings}
+              className="ml-auto font-kanji underline decoration-dotted cursor-pointer"
+              style={{ background: 'transparent', border: 'none', color: 'var(--state-danger)', padding: 0 }}
+            >
+              打开设置
+            </button>
           </div>
         )}
       </div>
@@ -577,7 +589,20 @@ function TaskPanel({ transfers, onPause, onResume, onCancel }: {
 }
 
 // ── Mobile bottom action bar ──────────────────────────────────────
-function MobileBottomBar({ onShowQR }: { onShowQR: () => void }) {
+function MobileBottomBar({
+  onShowFiles,
+  onShowChannel,
+  onShowQR,
+}: {
+  onShowFiles: () => void
+  onShowChannel: () => void
+  onShowQR: () => void
+}) {
+  const items = [
+    { kanji: '件', label: '文件', onClick: onShowFiles },
+    { kanji: '言', label: '消息', onClick: onShowChannel },
+    { kanji: '码', label: 'QR',   onClick: onShowQR },
+  ]
   return (
     <div
       className="flex items-center justify-around"
@@ -588,16 +613,13 @@ function MobileBottomBar({ onShowQR }: { onShowQR: () => void }) {
         borderTop: '1px solid rgba(255,255,255,0.1)',
       }}
     >
-      {[
-        { kanji: '件', label: '文件', onClick: () => {} },
-        { kanji: '言', label: '消息', onClick: () => {} },
-        { kanji: '码', label: 'QR',   onClick: onShowQR },
-      ].map(({ kanji, label, onClick }) => (
+      {items.map(({ kanji, label, onClick }) => (
         <button
           key={kanji}
           onClick={onClick}
           className="flex flex-col items-center gap-1 px-6 py-2 cursor-pointer"
           style={{ border: 'none', background: 'transparent' }}
+          aria-label={label}
         >
           <MisakaKanjiBlock char={kanji} size="sm" />
           <span className="font-kanji text-[11px] text-[var(--text-on-blue-2)]">{label}</span>
@@ -619,6 +641,7 @@ const TABS: { id: TabId; kanji: string; label: string }[] = [
 export default function Network() {
   const [activeTab, setActiveTab] = useState<TabId>('radar')
   const [showQR, setShowQR]   = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
   const [toast, setToast] = useState<string | null>(null)
   const [channelOpenedAt, setChannelOpenedAt] = useState(0)
 
@@ -684,8 +707,13 @@ export default function Network() {
   }
 
   async function handleSendFilesToAll(files: File[]) {
-    try { await store.sendFilesToAll(files) }
-    catch (e) { console.error('Fanout send failed:', e) }
+    try {
+      await store.sendFilesToAll(files)
+    } catch (e) {
+      console.error('Fanout send failed:', e)
+      setToast(e instanceof Error ? e.message : '群发失败，请稍后再试')
+      setTimeout(() => setToast(null), 2400)
+    }
   }
 
   const peerEntity = store.peers.find(p => p.sessionId === store.selectedSessionId) ?? null
@@ -712,6 +740,7 @@ export default function Network() {
             selectedPeer={peerEntity}
             onStageFiles={handleStageFiles}
             onSendFilesToAll={handleSendFilesToAll}
+            onOpenSettings={() => setShowSettings(true)}
           />
         </div>
         <div className="overflow-y-auto">
@@ -770,6 +799,7 @@ export default function Network() {
                 selectedPeer={peerEntity}
                 onStageFiles={handleStageFiles}
                 onSendFilesToAll={handleSendFilesToAll}
+                onOpenSettings={() => setShowSettings(true)}
               />
             </div>
           )}
@@ -783,7 +813,11 @@ export default function Network() {
           )}
         </div>
 
-        <MobileBottomBar onShowQR={() => setShowQR(true)} />
+        <MobileBottomBar
+          onShowFiles={() => setActiveTab('tasks')}
+          onShowChannel={() => setActiveTab('channel')}
+          onShowQR={() => setShowQR(true)}
+        />
       </div>
 
       {toast && (
@@ -799,6 +833,9 @@ export default function Network() {
           passCode={auth.identity.passCode}
           onClose={() => setShowQR(false)}
         />
+      )}
+      {showSettings && (
+        <SettingsModal onClose={() => setShowSettings(false)} />
       )}
       <AppFooter />
     </div>

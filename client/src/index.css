@@ -115,6 +115,16 @@ body {
     background: var(--bg-deep);
     color: var(--surface);
   }
+  .nav-pill:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: var(--shadow-card);
+  }
+  .nav-pill:disabled:hover {
+    transform: none;
+    box-shadow: var(--shadow-card);
+  }
 
   /* Primary Button ─── */
   .btn-primary {
@@ -174,9 +184,13 @@ body {
     transition: background 0.2s, border-color 0.2s;
     text-decoration: none;
   }
-  .btn-ghost:hover {
+  .btn-ghost:hover:not(:disabled) {
     background: rgba(255,255,255,0.12);
     border-color: rgba(255,255,255,0.85);
+  }
+  .btn-ghost:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   /* Section Header ─── */
