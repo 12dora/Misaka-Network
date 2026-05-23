@@ -150,6 +150,7 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
   const removePendingFile = useNetworkStore(s => s.removePendingFile)
   const clearPendingFiles = useNetworkStore(s => s.clearPendingFiles)
   const retryChatMessage = useNetworkStore(s => s.retryChatMessage)
+  const isSending = useNetworkStore(s => s.sendingPeers.has(peerSessionId))
   const bottomRef = useRef<HTMLDivElement>(null)
   const [downloadedIds, setDownloadedIds] = useState<Set<string>>(new Set())
 
@@ -273,8 +274,9 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
             </div>
             <MisakaButton variant="primary" size="sm" className="text-xs py-1 px-3 shrink-0"
               data-testid="send-pending-file"
+              disabled={isSending}
               onClick={() => sendPendingFile(peerSessionId)}>
-              发送
+              {isSending ? '发送中…' : '发送'}
             </MisakaButton>
             <MisakaButton variant="pill" size="sm" className="text-xs py-1 px-2 shrink-0"
               onClick={() => clearPendingFiles(peerSessionId)}>
@@ -337,11 +339,13 @@ function ChatInput({ peerSessionId }: { peerSessionId: string }) {
 }
 
 // ── TransferChannel ───────────────────────────────────────────────
-function TransferChannel({ selectedPeer, onStageFiles, onSendFilesToAll, onOpenSettings }: {
+function TransferChannel({ selectedPeer, onStageFiles, onSendFilesToAll, onOpenSettings, onEmptyDropAttempt, onForceReconnect }: {
   selectedPeer: Peer | null
   onStageFiles: (files: File[]) => void
   onSendFilesToAll: (files: File[]) => void
   onOpenSettings: () => void
+  onEmptyDropAttempt: () => void
+  onForceReconnect: () => void
 }) {
   const [isDragOver, setDragOver] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -393,7 +397,15 @@ function TransferChannel({ selectedPeer, onStageFiles, onSendFilesToAll, onOpenS
           : { borderStyle: 'dashed' }}
         onDragOver={e => { e.preventDefault(); setDragOver(true) }}
         onDragLeave={() => setDragOver(false)}
-        onDrop={e => { e.preventDefault(); setDragOver(false) }}
+        onDrop={e => {
+          e.preventDefault()
+          setDragOver(false)
+          // Don't silently swallow the files — tell the user they need to
+          // pick a peer first. Previously the styled dashed border invited
+          // a drop that was then thrown away.
+          const files = Array.from(e.dataTransfer.files)
+          if (files.length > 0) onEmptyDropAttempt()
+        }}
       >
         <MisakaKanjiBlock char="同" size="xl" className="mb-4" />
         <p className="font-kanji font-bold text-lg text-[var(--text-on-white)] mb-1">从左侧选择目标节点</p>
@@ -435,6 +447,14 @@ function TransferChannel({ selectedPeer, onStageFiles, onSendFilesToAll, onOpenS
           <div className="flex items-center gap-1.5 mt-2 px-2 py-1 rounded text-[10px]" style={{ background: 'rgba(255,193,7,0.12)', color: 'var(--state-warn)' }}>
             <MisakaStatusBadge status="reconnecting" />
             <span className="font-kanji">正在尝试重新协商连接…</span>
+            <button
+              type="button"
+              onClick={onForceReconnect}
+              className="ml-auto font-kanji underline decoration-dotted cursor-pointer"
+              style={{ background: 'transparent', border: 'none', color: 'var(--state-warn)', padding: 0 }}
+            >
+              立即重连
+            </button>
           </div>
         )}
         {selectedPeer.status === 'offline' && (
@@ -534,7 +554,9 @@ function TaskPanel({ transfers, onPause, onResume, onCancel }: {
                 <span>{formatSpeed(t.speedBps)}</span>
               </div>
               <div className="flex gap-1.5 mt-2">
-                <MisakaButton variant="pill" size="sm" className="flex-1 text-xs py-1" onClick={() => onPause(t.id)}>⏸ 暂停</MisakaButton>
+                {t.direction === 'send' && (
+                  <MisakaButton variant="pill" size="sm" className="flex-1 text-xs py-1" onClick={() => onPause(t.id)}>⏸ 暂停</MisakaButton>
+                )}
                 <MisakaButton variant="pill" size="sm" className="flex-1 text-xs py-1" onClick={() => onCancel(t.id)}>✕ 取消</MisakaButton>
               </div>
             </>
@@ -706,6 +728,11 @@ export default function Network() {
     setActiveTab('channel')
   }
 
+  function handleEmptyDropAttempt() {
+    setToast('请先在左侧选择一个目标节点，再拖入文件')
+    setTimeout(() => setToast(null), 2400)
+  }
+
   async function handleSendFilesToAll(files: File[]) {
     try {
       await store.sendFilesToAll(files)
@@ -741,6 +768,8 @@ export default function Network() {
             onStageFiles={handleStageFiles}
             onSendFilesToAll={handleSendFilesToAll}
             onOpenSettings={() => setShowSettings(true)}
+            onEmptyDropAttempt={handleEmptyDropAttempt}
+            onForceReconnect={() => store.recoverConnections()}
           />
         </div>
         <div className="overflow-y-auto">
@@ -800,6 +829,8 @@ export default function Network() {
                 onStageFiles={handleStageFiles}
                 onSendFilesToAll={handleSendFilesToAll}
                 onOpenSettings={() => setShowSettings(true)}
+                onEmptyDropAttempt={handleEmptyDropAttempt}
+                onForceReconnect={() => store.recoverConnections()}
               />
             </div>
           )}

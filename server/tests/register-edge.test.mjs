@@ -126,11 +126,16 @@ async function testReleaseUnknownToken() {
 
 async function testReleaseByIpFreesSlots() {
   // Register a unique nodeId then verify release-by-ip drops it.
+  // F6: endpoint now requires a Bearer token — we pass the caller's own
+  // token, which lets them wipe their own (same-identity) stale sessions.
   const nodeId = 13200
   const reg = await post('/register', { nodeId, passCode: '111111' })
   assert(reg.token, '注册成功')
 
-  const r = await fetch(`${BASE}/release-by-ip`, { method: 'POST' })
+  const r = await fetch(`${BASE}/release-by-ip`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${reg.token}` },
+  })
   assertEq(r.status, 200, 'release-by-ip 200')
   const body = await r.json()
   assert(typeof body.released === 'number' && body.released >= 1,

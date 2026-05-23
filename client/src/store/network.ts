@@ -7,6 +7,7 @@ import {
 import {
   createPeerConnection, createDataChannel, createOffer, createAnswer,
   applyAnswer, addIceCandidate, getSelectedChannelType, getSelectedIcePath,
+  ensureAutoTurnReady,
 } from '@/lib/webrtc'
 import {
   generateECDHKeyPair, getMyPublicKey, setPeerPublicKey,
@@ -203,6 +204,7 @@ interface NetworkState {
   pendingFiles: Record<string, PendingFileItem[]>  // peer sessionId -> files awaiting send
   connectedPeers: Set<string>                      // sessionIds with open DC
   unreadByPeer: Record<string, { message: number; file: number }>
+  sendingPeers: Set<string>                        // sessionIds currently flushing pendingFiles
 
   init: (token: string) => void
   destroy: () => void
@@ -233,13 +235,24 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
   pendingFiles: {},
   connectedPeers: new Set(),
   unreadByPeer: {},
+  sendingPeers: new Set(),
 
   init(token: string) {
     // React 18 StrictMode double-mounts effects in dev, which would register
     // a second onMessage handler (every signal would be processed twice,
     // tripping `setLocalDescription: wrong state: stable` on the second
     // application) and spawn a second WebSocket. Guard with a module flag.
-    if (initialized) return
+    if (initialized) {
+      // Auth recovery (server restart → 4002 close → re-register) ends up
+      // here with a fresh token. The flag is still set from the first init,
+      // so we don't re-register handlers, but we MUST reconnect the WS with
+      // the new token — otherwise signaling stays dead on the stale token.
+      if (currentToken !== token) {
+        currentToken = token
+        wsConnect(token)
+      }
+      return
+    }
     initialized = true
     currentToken = token
     onMessage(async (msg) => {
@@ -265,12 +278,31 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
             initiateWebRTC(sessionId).catch(err => console.warn('[net] auto-initiate failed', err))
           } else {
             remoteInitiatingPeers.add(sessionId)
+            // #23: if the remote never actually sends its offer (their browser
+            // crashed silently between PEER_JOINED and their initiate path),
+            // we'd be stuck in remoteInitiatingPeers forever and every
+            // ensureConnected() against this peer would block for the full
+            // 15s DC_OPEN_TIMEOUT_MS. Try our own initiate as a fallback.
+            setTimeout(() => {
+              if (remoteInitiatingPeers.has(sessionId) && !peerConnections.has(sessionId)) {
+                console.warn('[net] remote never initiated, fallback to local initiate', sessionId)
+                remoteInitiatingPeers.delete(sessionId)
+                initiateWebRTC(sessionId).catch(err => console.warn('[net] fallback initiate failed', err))
+              }
+            }, 7_000)
           }
           break
         }
 
         case 'PEER_LEFT': {
           const sid = msg.sessionId
+          // Revoke blob URLs before dropping chatMessages — otherwise the
+          // File/Blob each one references stays alive in memory until page
+          // close (a 10-file × 100MB chat → ~1GB leak per peer that leaves).
+          const droppedMsgs = useNetworkStore.getState().chatMessages[sid] ?? []
+          for (const m of droppedMsgs) {
+            if (m.downloadUrl) { try { URL.revokeObjectURL(m.downloadUrl) } catch { /* ignore */ } }
+          }
           set(s => {
             const { [sid]: _omit, ...restChat } = s.chatMessages
             const { [sid]: _f, ...restFiles } = s.pendingFiles
@@ -335,10 +367,20 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     clearAutoTurn()
     initialized = false
     currentToken = ''
+    // Revoke every cached download URL — these point at File/Blob objects
+    // held in chatMessages, which otherwise stay alive (and keep the file
+    // bytes resident in memory / OPFS) forever.
+    const state = get()
+    for (const msgs of Object.values(state.chatMessages)) {
+      for (const m of msgs) {
+        if (m.downloadUrl) { try { URL.revokeObjectURL(m.downloadUrl) } catch { /* ignore */ } }
+      }
+    }
     set({
       wsConnected: false, mySessionId: null, channelId: null,
       peers: [], selectedSessionId: null, transfers: [],
       chatMessages: {}, pendingFiles: {}, connectedPeers: new Set(), unreadByPeer: {},
+      sendingPeers: new Set(),
     })
   },
 
@@ -386,10 +428,28 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
   async sendPendingFile(sessionId) {
     const items = get().pendingFiles[sessionId] ?? []
     if (items.length === 0) return
+    // Guard against double-click / spam: if a send is already in flight for
+    // this peer, drop the second call. Previously the second click re-queued
+    // the same items (they're only removed after `allOk`), producing
+    // duplicate transfers.
+    if (get().sendingPeers.has(sessionId)) return
+    set(s => {
+      const next = new Set(s.sendingPeers)
+      next.add(sessionId)
+      return { sendingPeers: next }
+    })
     let allOk = true
-    for (const item of items) {
-      const ok = await sendFileToPeer(item.file, sessionId, item.displayName)
-      if (!ok) allOk = false
+    try {
+      for (const item of items) {
+        const ok = await sendFileToPeer(item.file, sessionId, item.displayName)
+        if (!ok) allOk = false
+      }
+    } finally {
+      set(s => {
+        const next = new Set(s.sendingPeers)
+        next.delete(sessionId)
+        return { sendingPeers: next }
+      })
     }
     if (allOk) {
       set(s => {
@@ -673,6 +733,11 @@ function appendSystemChat(peerSessionId: string, content: string, direction: 'se
 
 async function initiateWebRTC(peerSessionId: string) {
   if (peerConnections.has(peerSessionId)) return
+  // Without this, the first PC after WELCOME is built before the auto-TURN
+  // credential fetch resolves — symmetric-NAT peers get a non-relay PC,
+  // first ICE round fails, only the second restart attempt (~5s later) has
+  // TURN. Wait briefly for credentials so the very first handshake has them.
+  await ensureAutoTurnReady()
   const pc = createPeerConnection()
   peerConnections.set(peerSessionId, pc)
 
@@ -712,6 +777,16 @@ async function initiateWebRTC(peerSessionId: string) {
   }
 }
 
+// Perfect-negotiation tie-break: when both sides send offers at the same
+// time (e.g. simultaneous ICE restart on LAN UDP flap), the side with the
+// lexicographically smaller sessionId is "polite" and yields — rolls back
+// its local offer and accepts the remote one. The impolite side ignores
+// the incoming offer and keeps its own.
+function isPolite(peerSessionId: string): boolean {
+  const my = useNetworkStore.getState().mySessionId ?? ''
+  return my < peerSessionId
+}
+
 async function handleRemoteSDP(fromSessionId: string, fromNodeId: number, sdp: RTCSessionDescriptionInit) {
   let pc = peerConnections.get(fromSessionId)
   if (sdp.type === 'offer') remoteInitiatingPeers.delete(fromSessionId)
@@ -723,6 +798,9 @@ async function handleRemoteSDP(fromSessionId: string, fromNodeId: number, sdp: R
 
   if (!pc) {
     // Inbound offer from a peer who joined before us — accept it.
+    // Same pre-warm rationale as initiateWebRTC: ensures the answerer
+    // also has TURN servers in its first PC.
+    await ensureAutoTurnReady()
     pc = createPeerConnection()
     peerConnections.set(fromSessionId, pc)
 
@@ -763,6 +841,25 @@ async function handleRemoteSDP(fromSessionId: string, fromNodeId: number, sdp: R
   }
 
   if (sdp.type === 'offer') {
+    // Glare: an offer arrives while we already have a local offer outstanding
+    // (typically simultaneous ICE restart on both sides after a UDP flap).
+    // Without this branch, createAnswer → setRemoteDescription throws
+    // InvalidStateError and both sides wedge until the long ICE failure timeout.
+    if (pc.signalingState === 'have-local-offer') {
+      if (isPolite(fromSessionId)) {
+        // Polite: roll back our outstanding offer, then accept theirs.
+        try {
+          await pc.setLocalDescription({ type: 'rollback' } as RTCSessionDescriptionInit)
+        } catch (err) {
+          console.warn('[net] glare rollback failed', err)
+          return
+        }
+      } else {
+        // Impolite: drop the colliding offer; our outstanding offer wins.
+        console.warn('[net] ignoring colliding offer (impolite side)', fromSessionId)
+        return
+      }
+    }
     const answer = await createAnswer(pc, sdp)
     wsSend({ t: 'SIGNAL_SDP', targetSessionId: fromSessionId, sdp: answer })
   } else {
@@ -783,7 +880,15 @@ async function handleRemoteSDP(fromSessionId: string, fromNodeId: number, sdp: R
 async function handleRemoteICE(fromSessionId: string, candidate: RTCIceCandidateInit) {
   const pc = peerConnections.get(fromSessionId)
   if (pc?.remoteDescription) {
-    await addIceCandidate(pc, candidate)
+    // Wrap: addIceCandidate throws on closed pc / malformed candidate / unknown
+    // sdpMid. Without try/catch the dispatch loop's forEach swallows the
+    // rejection (unhandledrejection), and we'd never know one peer's bad IPv6
+    // candidate was poisoning the whole session.
+    try {
+      await addIceCandidate(pc, candidate)
+    } catch (err) {
+      console.warn('[net] addIceCandidate failed', err)
+    }
   } else {
     const pending = pendingIceCandidates.get(fromSessionId) ?? []
     pending.push(candidate)
@@ -796,6 +901,7 @@ async function handleRemoteICEEnd(fromSessionId: string) {
   if (!pc) return
   // Empty-candidate marker per RFC 8445 §8.1.2 — signals the peer has
   // finished gathering. Browsers accept this to short-circuit waits.
+  if (!pc.remoteDescription) return // marker before SDP is meaningless
   try { await pc.addIceCandidate({ candidate: '', sdpMid: '', sdpMLineIndex: 0 }) }
   catch { /* some browsers reject the marker; harmless */ }
 }
@@ -925,48 +1031,69 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
       const transferId = shortIdToTransferId.get(peerSessionId)?.get(frame.shortId)
       if (!transferId) return  // meta hasn't arrived yet, or transfer was cleaned up
 
-      const result = await receiveChunk(
-        transferId, frame.index, frame.iv, frame.ciphertext, peerSessionId,
-        {
-          onProgress(received, total) {
-            const now = performance.now()
-            const transfer = useNetworkStore.getState().transfers.find(t => t.id === transferId)
-            const fileSize = transfer?.fileSize ?? 0
-            const bytes = fileSize > 0 ? Math.min(fileSize, Math.round((received / total) * fileSize)) : 0
-            const prev = transferSpeedSamples.get(transferId) ?? { bytes: 0, at: now }
-            const elapsed = Math.max(1, now - prev.at)
-            const speedBps = now === prev.at ? 0 : ((bytes - prev.bytes) * 1000) / elapsed
-            transferSpeedSamples.set(transferId, { bytes, at: now })
-            useNetworkStore.setState(s => ({
-              transfers: s.transfers.map(t =>
-                t.id === transferId
-                  ? { ...t, progress: received / total, speedBps, status: 'transferring' as const }
-                  : t,
-              ),
-            }))
-            if (received === total) deliverCompletedFile(transferId, peerSessionId)
+      // Wrap the whole receive path. decryptChunk can reject (wrong key, bad
+      // auth tag, tampered ciphertext) — without a try/catch the rejection
+      // becomes an unhandledrejection and the UI hangs at whatever % the last
+      // good chunk left it at. Surface it as a failed transfer + error tone.
+      try {
+        const result = await receiveChunk(
+          transferId, frame.index, frame.iv, frame.ciphertext, peerSessionId,
+          {
+            onProgress(received, total) {
+              const now = performance.now()
+              const transfer = useNetworkStore.getState().transfers.find(t => t.id === transferId)
+              const fileSize = transfer?.fileSize ?? 0
+              const bytes = fileSize > 0 ? Math.min(fileSize, Math.round((received / total) * fileSize)) : 0
+              const prev = transferSpeedSamples.get(transferId) ?? { bytes: 0, at: now }
+              const elapsed = Math.max(1, now - prev.at)
+              const speedBps = now === prev.at ? 0 : ((bytes - prev.bytes) * 1000) / elapsed
+              transferSpeedSamples.set(transferId, { bytes, at: now })
+              useNetworkStore.setState(s => ({
+                transfers: s.transfers.map(t =>
+                  // #25: preserve 'paused' status if user paused mid-receive.
+                  t.id === transferId
+                    ? {
+                        ...t,
+                        progress: received / total,
+                        speedBps,
+                        status: t.status === 'paused' ? 'paused' as const : 'transferring' as const,
+                      }
+                    : t,
+                ),
+              }))
+              if (received === total) deliverCompletedFile(transferId, peerSessionId)
+            },
+            onError(error) {
+              useNetworkStore.setState(s => ({
+                transfers: s.transfers.map(t =>
+                  t.id === transferId ? { ...t, status: 'failed' as const, error } : t,
+                ),
+              }))
+            },
           },
-          onError(error) {
-            useNetworkStore.setState(s => ({
-              transfers: s.transfers.map(t =>
-                t.id === transferId ? { ...t, status: 'failed' as const, error } : t,
-              ),
-            }))
-          },
-        },
-      )
+        )
 
-      if (result) {
-        const { decrypted: decryptedData, storageMode } = result
-        if (storageMode === 'stream') {
-          await Promise.all([
-            streamChunkToDisk(transferId, frame.index, decryptedData),
-            writeChunkToOPFS(transferId, frame.index, decryptedData),
-          ])
+        if (result) {
+          const { decrypted: decryptedData, storageMode } = result
+          if (storageMode === 'stream') {
+            await Promise.all([
+              streamChunkToDisk(transferId, frame.index, decryptedData),
+              writeChunkToOPFS(transferId, frame.index, decryptedData),
+            ])
+          }
+          // DataChannel is ordered + reliable — no application-level per-chunk
+          // ack is needed. The sender uses the resume bitmap (built from the
+          // session's received set) for recovery, not per-chunk acks.
         }
-        // DataChannel is ordered + reliable — no application-level per-chunk
-        // ack is needed. The sender uses the resume bitmap (built from the
-        // session's received set) for recovery, not per-chunk acks.
+      } catch (err) {
+        const errStr = err instanceof Error ? err.message : String(err)
+        console.warn('[net] receiveChunk failed', errStr)
+        failTransferRecord(transferId, errStr)
+        playSound('error')
+        appendSystemChat(peerSessionId, `接收失败：${errStr}`)
+        // Drop the demux entry so subsequent stray chunks for this transfer
+        // don't keep firing the catch.
+        shortIdToTransferId.get(peerSessionId)?.delete(frame.shortId)
       }
       return
     }
@@ -986,15 +1113,19 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
         if (msg.type === 'meta') {
           const meta = msg as MetaMessage
           const peerNodeId = useNetworkStore.getState().peers.find(p => p.sessionId === peerSessionId)?.nodeId ?? 0
-          await handleMetaMessage(meta, peerNodeId)
-          // Register shortId → transferId so binary chunk frames on any lane
-          // for this peer can be demuxed without a per-chunk JSON header.
+          // Register shortId → transferId BEFORE any await. If a chunk for
+          // this transfer arrives while handleMetaMessage is still in flight
+          // (very common — meta + chunk are queued back-to-back on the lane),
+          // the binary-frame handler MUST already see the demux entry,
+          // otherwise the chunk is silently dropped at the `if (!transferId)`
+          // early-return. Hit during the folder e2e test.
           let peerMap = shortIdToTransferId.get(peerSessionId)
           if (!peerMap) {
             peerMap = new Map()
             shortIdToTransferId.set(peerSessionId, peerMap)
           }
           peerMap.set(meta.shortId, meta.transferId)
+          await handleMetaMessage(meta, peerNodeId)
           if (supportsOPFS() && !supportsFileSystemAccess()) {
             createOPFSReceiveFile(meta.transferId, meta.fileName, meta.totalChunks).catch(() => {})
           }
@@ -1013,6 +1144,26 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
           const alreadyAnnounced = useNetworkStore.getState().chatMessages[peerSessionId]
             ?.some(m => m.type === 'system' && m.content === `正在接收文件 ${meta.fileName}`)
           if (!alreadyAnnounced) appendSystemChat(peerSessionId, `正在接收文件 ${meta.fileName}`)
+          // #16: surface an OS notification at start-of-transfer so a tab-
+          // backgrounded recipient can decline a big incoming file early
+          // rather than discovering it only after the entire payload lands.
+          notifyIncomingFile({ peerNodeId, fileName: meta.fileName, fileSize: meta.fileSize })
+          // #5: zero-byte files send no chunks at all (totalChunks=0). The
+          // chunk-driven completion gate never fires; deliver synthetically
+          // from the empty Blob and clean up. (#14 cleanup of demux map below.)
+          if (meta.totalChunks === 0 && meta.fileSize === 0) {
+            const emptyBlob = new Blob([], { type: meta.mime || 'application/octet-stream' })
+            const emptyFile = new File([emptyBlob], meta.fileName, { type: meta.mime || 'application/octet-stream' })
+            const url = URL.createObjectURL(emptyFile)
+            appendFileChat(peerSessionId, meta.fileName, 0, url)
+            playSound('complete')
+            useNetworkStore.setState(s => ({
+              transfers: s.transfers.map(t =>
+                t.id === meta.transferId ? { ...t, progress: 1, status: 'completed' as const } : t,
+              ),
+            }))
+            shortIdToTransferId.get(peerSessionId)?.delete(meta.shortId)
+          }
           return
         }
 
@@ -1099,6 +1250,14 @@ async function attemptIceRestart(peerSessionId: string) {
       return
     }
 
+    // If we're not in 'stable', a restart offer would either collide with our
+    // own outstanding offer or step on an inbound one. Skip — the
+    // perfect-negotiation rollback in handleRemoteSDP will recover us.
+    if (pc.signalingState !== 'stable') {
+      console.warn('[net] skipping iceRestart, signalingState=', pc.signalingState)
+      return
+    }
+
     const offer = await pc.createOffer({ iceRestart: true })
     await pc.setLocalDescription(offer)
     // Trickle — candidates will stream via onicecandidate. (Same fix as
@@ -1160,6 +1319,16 @@ async function deliverCompletedFile(transferId: string, peerSessionId: string) {
       failTransferRecord(transferId, String(err))
       deliveredTransfers.delete(transferId)
       playSound('error')
+      // #15: assemble can throw with a partial IndexedDB chunk set ("Missing
+      // chunk N"). Without this, the orphan chunk rows leak to disk forever.
+      import('@/lib/db').then(({ deleteChunks }) => deleteChunks(transferId).catch(() => {}))
+    }
+  }
+  // Common cleanup: drop the demux entry for any peer's map that pointed at
+  // this transferId. Otherwise long sessions accumulate stale entries forever.
+  for (const peerMap of shortIdToTransferId.values()) {
+    for (const [shortId, tid] of peerMap) {
+      if (tid === transferId) peerMap.delete(shortId)
     }
   }
 }
@@ -1255,4 +1424,14 @@ function cleanupPeerConnection(sessionId: string, options: { failQueuedMessages?
   resetCrypto(sessionId)
   pendingIceCandidates.delete(sessionId)
   shortIdToTransferId.delete(sessionId)
+  // Without this, when an ICE-failed peer is cleaned up but PEER_LEFT is
+  // never received (unilateral local teardown), `connectedPeers` keeps the
+  // stale sessionId. Downstream code that consults it for "is this peer
+  // reachable?" then takes the wrong branch.
+  useNetworkStore.setState(s => {
+    if (!s.connectedPeers.has(sessionId)) return s
+    const next = new Set(s.connectedPeers)
+    next.delete(sessionId)
+    return { connectedPeers: next }
+  })
 }

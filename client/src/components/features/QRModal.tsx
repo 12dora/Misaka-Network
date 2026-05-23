@@ -241,10 +241,12 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
 
         {/* Actions */}
         <div className="flex gap-2 w-full">
-          <MisakaButton variant="pill" size="sm" fullWidth onClick={fetchToken}>
-            刷新 QR
+          {/* `loading` is set during BOTH first-fetch and refresh in fetchToken,
+              so disabling here also prevents spam-clicking during refresh. */}
+          <MisakaButton variant="pill" size="sm" fullWidth onClick={fetchToken} disabled={loading}>
+            {loading && qrToken ? '刷新中…' : '刷新 QR'}
           </MisakaButton>
-          <MisakaButton variant="pill" size="sm" fullWidth onClick={handleCopy}>
+          <MisakaButton variant="pill" size="sm" fullWidth onClick={handleCopy} disabled={!qrToken || loading}>
             复制链接
           </MisakaButton>
         </div>

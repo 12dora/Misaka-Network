@@ -39,7 +39,7 @@ export default defineConfig({
     {
       // Build the server once (turn tests reuse dist/) then run it.
       command: 'npm --prefix ../server run build && PORT=' + SIGNAL_PORT +
-               ' MAX_NODES=200 TURN_AUTO_ENABLED=false node ../server/dist/index.js',
+               ' MAX_NODES=200 TURN_AUTO_ENABLED=false E2E_ALLOW_UNAUTH_RELEASE_BY_IP=1 node ../server/dist/index.js',
       port: SIGNAL_PORT,
       timeout: 60_000,
       reuseExistingServer: !process.env.CI,

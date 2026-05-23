@@ -134,6 +134,10 @@ vi.mock('@/lib/webrtc', () => ({
   addIceCandidate: vi.fn(async () => {}),
   getSelectedChannelType: vi.fn(async () => 'direct'),
   getSelectedIcePath: vi.fn(async () => null),
+  // Added when ensureAutoTurnReady() was wired into initiateWebRTC /
+  // handleRemoteSDP to pre-warm Cloudflare credentials. In tests we
+  // resolve immediately — no real fetch.
+  ensureAutoTurnReady: vi.fn(async () => {}),
 }))
 
 vi.mock('@/lib/crypto', () => ({

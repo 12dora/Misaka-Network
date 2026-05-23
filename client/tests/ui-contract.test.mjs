@@ -12,6 +12,10 @@ const topNav = read('src/components/layout/TopNav.tsx')
 const qr = read('src/components/features/QRModal.tsx')
 const settings = read('src/components/features/SettingsModal.tsx')
 const scan = read('src/components/features/ScanModal.tsx')
+const footer = read('src/components/ui/AppFooter.tsx')
+const privacy = read('src/pages/Privacy.tsx')
+const terms = read('src/pages/Terms.tsx')
+const useModalExitHook = read('src/hooks/useModalExit.ts')
 const network = read('src/pages/Network.tsx')
 const networkStore = read('src/store/network.ts')
 const authStore = read('src/store/auth.ts')
@@ -37,6 +41,41 @@ assert.match(topNav, /<svg width="18" height="18" viewBox="0 0 24 24"/)
 assert.match(topNav, /inline-grid place-items-center/)
 assert.match(topNav, /lineHeight: 0/)
 assert.match(topNav, /h-8 inline-flex items-center/)
+
+// #20 — beforeinstallprompt is single-use; the consumed event MUST be cleared
+// on BOTH accepted and dismissed (a `finally { setInstallPrompt(null) }` does
+// it). Previously only the accepted branch cleared it, leaving a dead button.
+assert.match(topNav, /finally\s*\{\s*setInstallPrompt\(null\)/)
+
+// #29 — clicking the settings gear must close the mobile hamburger menu so
+// the dropdown doesn't sit on top of the opening SettingsModal.
+assert.match(topNav, /onClick=\{\(\)\s*=>\s*\{\s*setMenuOpen\(false\);\s*setShowSettings\(true\)/)
+
+// #14 — global Escape-to-close lives inside useModalExit so every consumer
+// (QR / Scan / Settings) gets it for free without bespoke listeners.
+assert.match(useModalExitHook, /addEventListener\(['"]keydown['"]/)
+assert.match(useModalExitHook, /e\.key !== ['"]Escape['"]/)
+
+// #31 — "刷新 QR" button must be disabled while a fetch is in-flight so the
+// user can't spam-click it. fetchToken sets `loading` on entry; we reuse that.
+assert.match(qr, /onClick=\{fetchToken\}\s+disabled=\{loading\}/)
+
+// #32 — TURN "测试" button must disable itself while a test is in-flight,
+// signalled by testingId === s.id (same condition the row label uses).
+assert.match(settings, /disabled=\{testingId === s\.id\}/)
+
+// #34 — deleting a server that's currently being edited must clear the
+// editing form so "保存" doesn't silently no-op against a vanished id.
+assert.match(settings, /editingServer\?\.id === id/)
+assert.match(settings, /setEditingServer\(null\)/)
+
+// #30 — footer must surface Privacy + Terms links; pages must cross-link.
+assert.match(footer, /to="\/privacy"/)
+assert.match(footer, /to="\/tos"/)
+assert.match(privacy, /to="\/tos"/)
+assert.match(privacy, /查看服务条款/)
+assert.match(terms, /to="\/privacy"/)
+assert.match(terms, /查看隐私政策/)
 
 assert.match(qr, /QRCode\.toCanvas/)
 assert.match(qr, /QRCode\.toDataURL/)

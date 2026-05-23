@@ -121,7 +121,12 @@ export async function sendFileParallel(
   if (activeLanes.length === 0) throw new Error('No open DataChannel lane available')
 
   const fileHash = existingRecord?.fileHash ?? ''
-  const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
+  // Zero-byte files: math.ceil(0/CHUNK_SIZE) = 0 → no chunks ever sent, so the
+  // receiver's `received === total` completion gate (which only fires from
+  // receiveChunk) never trips. Use 1 as the synthetic chunk count for empty
+  // files; the meta message is enough on its own and the receiver detects the
+  // empty case to deliver immediately.
+  const totalChunks = file.size === 0 ? 0 : Math.ceil(file.size / CHUNK_SIZE)
   const shortId = nextShortId()
   // 8-byte random prefix; combined with the 4-byte chunk index it yields a
   // unique 12-byte IV per chunk without an RNG syscall in the hot loop.
@@ -163,6 +168,14 @@ export async function sendFileParallel(
     mime: file.type || 'application/octet-stream',
   } satisfies MetaMessage)
   for (const lane of activeLanes) lane.send(meta)
+
+  // Zero-byte files complete the moment meta has been sent — no chunks
+  // follow. Synthesize the (1,1) tick so the UI doesn't render NaN%.
+  if (file.size === 0) {
+    callbacks?.onProgress?.(1, 1)
+    await updateTransfer(transferId, { status: 'completed' })
+    return
+  }
 
   callbacks?.onProgress?.(sent, totalChunks)
 
@@ -227,6 +240,14 @@ export async function sendFileParallel(
     // chunk's prepare before awaiting the current chunk's send.
     let prepared = await prepareNext()
     while (prepared && !cancelled) {
+      // If this lane has closed under us (NAT/firewall reset a single SCTP
+      // stream), don't take the chunk off the queue with a doomed send.
+      // Put it back so a healthy lane can pick it up.
+      if (dc.readyState !== 'open') {
+        skipSet.delete(prepared.i)
+        nextChunk = Math.min(nextChunk, prepared.i)
+        return
+      }
       const current = prepared
       // Start preparing the next chunk in the background; we'll await it at
       // the top of the next iteration. dc.send / waitForBuffer below now
@@ -234,9 +255,26 @@ export async function sendFileParallel(
       const upcoming = prepareNext()
 
       const packet = encodeChunkFrame(shortId, current.i, current.iv, current.encrypted)
-      await waitForBuffer(dc)
-      if (cancelled) return
-      dc.send(packet)
+      try {
+        await waitForBuffer(dc)
+        if (cancelled) return
+        if (dc.readyState !== 'open') throw new Error('lane closed')
+        dc.send(packet)
+      } catch (laneErr) {
+        // Don't abort the whole transfer for a single bad lane — re-queue
+        // this index and exit this lane. Healthy lanes pick up the slack.
+        console.warn('[transfer] lane send failed, re-queueing chunk', current.i, laneErr)
+        skipSet.delete(current.i)
+        nextChunk = Math.min(nextChunk, current.i)
+        // Drain the upcoming so the encrypted bytes aren't lost — also
+        // re-queue it.
+        const orphan = await upcoming.catch(() => null)
+        if (orphan) {
+          skipSet.delete(orphan.i)
+          nextChunk = Math.min(nextChunk, orphan.i)
+        }
+        return
+      }
 
       sent++
       sentChunkIndexes.add(current.i)
@@ -251,7 +289,14 @@ export async function sendFileParallel(
     }
   }
 
-  await Promise.all(activeLanes.map(lane => laneLoop(lane)))
+  // Use allSettled: one lane's hard failure now triggers a re-queue + lane
+  // exit (see laneLoop above), but the OTHER lanes must keep draining.
+  await Promise.allSettled(activeLanes.map(lane => laneLoop(lane)))
+  // If we exited with anything still un-sent (because all lanes died),
+  // fail loudly. The success path already updates status='completed' below.
+  if (!cancelled && sent < totalChunks) {
+    throw new Error(`传输中断：${totalChunks - sent} 个分片未送达`)
+  }
   await flushRecord(true)
   if (!cancelled) await updateTransfer(transferId, { status: 'completed' })
 }
@@ -288,6 +333,15 @@ export async function handleMetaMessage(msg: MetaMessage, peerNodeId: number): P
   const existing = receiveSessions.get(msg.transferId)
   if (existing) return existing
 
+  // CRITICAL: register the session SYNCHRONOUSLY before any await. The
+  // DataChannel's onmessage queues meta + chunks back-to-back; if we await
+  // any I/O before set()ing receiveSessions, the very next message (a
+  // chunk for the same transfer on the same lane) reaches receiveChunk
+  // BEFORE the session exists and gets silently dropped. Symptom: the
+  // transfer card appears on the recipient but progress stays at 0%
+  // forever even though the sender finished. (Hit during the folder e2e
+  // test — race introduced when this function gained an `await getTransfer`
+  // for resume restoration.)
   const session: ReceiveSession = {
     transferId: msg.transferId,
     fileName: msg.fileName,
@@ -303,7 +357,23 @@ export async function handleMetaMessage(msg: MetaMessage, peerNodeId: number): P
   }
   receiveSessions.set(msg.transferId, session)
 
-  // Persist
+  // Resume-aware: if a TransferRecord already exists from a prior session
+  // (page reload mid-transfer), restore the bitmap so subsequent chunk
+  // arrivals can still hit the `received === total` completion gate.
+  // Chunks that race ahead of this restoration just add their indexes to
+  // session.received normally — duplicate adds on a Set are a no-op.
+  try {
+    const prior = await getTransfer(msg.transferId)
+    if (prior && prior.direction === 'recv') {
+      const saved = await getSavedChunkIndexes(msg.transferId)
+      for (const idx of prior.receivedChunks) session.received.add(idx)
+      for (const idx of saved) session.received.add(idx)
+    }
+  } catch { /* fresh transfer */ }
+
+  // Persist (with whatever we just restored — keeps the record in sync if
+  // the prior shutdown happened between a chunk save and the next interval
+  // flush).
   await saveTransfer({
     transferId: msg.transferId,
     direction: 'recv',
@@ -312,7 +382,7 @@ export async function handleMetaMessage(msg: MetaMessage, peerNodeId: number): P
     fileSize: msg.fileSize,
     fileHash: msg.fileHash,
     totalChunks: msg.totalChunks,
-    receivedChunks: [],
+    receivedChunks: Array.from(session.received).sort((a, b) => a - b),
     status: 'active',
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -398,6 +468,10 @@ export async function completeReceive(transferId: string): Promise<File> {
 
 export function cancelReceive(transferId: string) {
   receiveSessions.delete(transferId)
+  // Without this, cancelled IndexedDB-fallback transfers leak their partial
+  // chunks forever — multi-GB orphans accumulate across many cancellations
+  // and silently consume the user's storage quota.
+  deleteChunks(transferId).catch(() => {})
   updateTransfer(transferId, { status: 'failed' })
 }
 
@@ -568,7 +642,11 @@ export async function createOPFSReceiveFile(
   const root = await navigator.storage.getDirectory()
   const dir = await root.getDirectoryHandle('misaka-transfers', { create: true })
   const fileHandle = await dir.getFileHandle(`${transferId}-${fileName}`, { create: true })
-  const writable = await fileHandle.createWritable({ keepExistingData: false })
+  // Keep existing data so a page-refresh mid-transfer doesn't truncate the
+  // already-written bytes. The resume bitmap (built from IndexedDB) tells the
+  // sender which chunk indexes are still missing; sparse writes here fill
+  // exactly those.
+  const writable = await fileHandle.createWritable({ keepExistingData: true })
   const handle: OPFSReceiveHandle = { writable, fileHandle, written: new Set(), totalChunks, fileName, queue: new WriteQueue() }
   opfsHandles.set(transferId, handle)
   return handle
