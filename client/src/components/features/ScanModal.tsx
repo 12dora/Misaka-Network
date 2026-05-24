@@ -32,6 +32,24 @@ function describeCameraError(err: unknown): string {
   return String(err)
 }
 
+// P1: surface the "where do I open the camera permission" question with a
+// concrete platform hint. Without this the only fallback the modal offered
+// was a generic "请在浏览器设置中允许" — leaving mobile users hunting through
+// system settings with no idea which menu hides the toggle.
+function permissionHelpHint(): string {
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : ''
+  if (/iPhone|iPad|iPod/.test(ua)) {
+    return 'iOS：设置 → Safari → 摄像头 → 改为「询问」或「允许」，然后回到本页点击重试。'
+  }
+  if (/Android/.test(ua)) {
+    return 'Android：长按地址栏左侧的锁形图标 → 网站设置 → 摄像头 → 允许，然后刷新页面。'
+  }
+  if (/Mac OS X/.test(ua)) {
+    return 'macOS：Safari/Chrome → 偏好设置/设置 → 网站 → 摄像头 → 允许本站。'
+  }
+  return '在浏览器地址栏点击锁形图标 → 网站设置 → 摄像头 → 允许，然后刷新页面。'
+}
+
 // Default to user-facing camera (most desktops only have one); user can toggle to rear.
 type FacingMode = 'user' | 'environment'
 
@@ -215,12 +233,13 @@ export default function ScanModal({ onClose }: Props) {
       onClick={handleBackdrop}
     >
       <div
-        className={`relative flex flex-col items-center gap-4 rounded-2xl p-6 ${modal.panelClass}`}
+        className={`relative flex flex-col items-center gap-4 rounded-2xl p-5 xs:p-6 ${modal.panelClass}`}
         style={{
           background: 'var(--surface)',
           boxShadow: 'var(--shadow-float)',
-          maxWidth: 340,
-          width: '100%',
+          // P0-2: gracefully shrink on 320px-class devices instead of relying
+          // on width: 100% inside a fixed-padding backdrop.
+          width: 'min(340px, 100% - 8px)',
           // P1-13: landscape phone / split-view iPad — without a maxHeight the
           // aspect-square camera + URL input + buttons overflow and the
           // "接入" / "取消" actions are off-screen.
@@ -266,6 +285,14 @@ export default function ScanModal({ onClose }: Props) {
               <p className="font-kanji text-xs text-[var(--text-muted)] break-words">
                 {cameraError ?? '请检查权限设置'}
               </p>
+              {/* P1: platform-specific guidance when the user previously
+                  denied the prompt — otherwise they're stuck (the browser
+                  won't re-prompt) with no path forward. */}
+              {cameraError?.includes('权限') && (
+                <p className="font-kanji text-[10px] text-[var(--text-on-blue-2)] break-words leading-snug px-2 mt-1">
+                  {permissionHelpHint()}
+                </p>
+              )}
               <MisakaButton variant="pill" size="sm" onClick={startCamera} className="mt-2">
                 重试
               </MisakaButton>

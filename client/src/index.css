@@ -21,7 +21,10 @@
   /* State */
   --state-success: #00C28A;
   --state-warn:    #FFB23D;
-  --state-danger:  #FF5670;
+  /* P2: bumped from #FF5670 → #E83A5A for WCAG AA contrast against the
+     primary blue (#1A4FC4) — previous ratio was ~3.5:1, below the 4.5:1
+     required for normal-size error text. */
+  --state-danger:  #E83A5A;
 
   /* Text */
   --text-on-blue:    #FFFFFF;
@@ -248,7 +251,34 @@ body {
   @media (min-width: 640px) {
     .misaka-input { font-size: 0.9rem; }
   }
-  .misaka-input:focus { border-color: var(--bg-deep); }
+  /* P0-3: visible focus ring for keyboard / screen-reader users. Tailwind's
+     `focus:outline-none` is used on inline inputs to hide the platform-default
+     ring; reinstate a stylized one here so the focused field is unambiguous. */
+  .misaka-input:focus { border-color: var(--bg-deep); box-shadow: 0 0 0 3px rgba(91, 179, 255, 0.45); }
+
+  /* P0-3: passcode + nodeId inputs in LoginCard use inline styles and an
+     explicit `focus:outline-none` to get the platform default out of the way.
+     This rule reinstates a visible ring + makes Tab navigation perceivable. */
+  .misaka-focus-ring:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 3px rgba(91, 179, 255, 0.55);
+    border-color: var(--bg-deep) !important;
+  }
+
+  /* P2: thin themed scrollbar utility — used by the chat region in Network.tsx
+     where `scrollbarWidth: 'none'` previously left users guessing whether more
+     messages existed off-screen. */
+  .misaka-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(14, 42, 107, 0.35) transparent;
+  }
+  .misaka-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
+  .misaka-scroll::-webkit-scrollbar-track { background: transparent; }
+  .misaka-scroll::-webkit-scrollbar-thumb {
+    background: rgba(14, 42, 107, 0.28);
+    border-radius: 3px;
+  }
+  .misaka-scroll::-webkit-scrollbar-thumb:hover { background: rgba(14, 42, 107, 0.5); }
 
   /* Corner Frame ─── used on QR/scan */
   .corner-frame { position: relative; }

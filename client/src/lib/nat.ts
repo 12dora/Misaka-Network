@@ -5,10 +5,37 @@
 // that drives an RTCPeerConnection.
 
 import { DEFAULT_STUN, NAT_DETECTION_TIMEOUT_MS } from '@/constants'
-import { classifyNat, parseCandidate, type NatDetectionResult, type ParsedCandidate } from './nat-classify'
+import { classifyNat, parseCandidate, type NatDetectionResult, type NatType, type ParsedCandidate } from './nat-classify'
 
 export type { NatType, NatDetectionResult, ParsedCandidate } from './nat-classify'
 export { classifyNat, parseCandidate, isPrivateAddress } from './nat-classify'
+
+// ── Shared NAT state ──────────────────────────────────────────────────
+// `detectNatType()` is called from the Settings modal. We stash the latest
+// result so other layers (webrtc.ts → buildIceConfig) can adjust ICE policy
+// without needing every call site to re-probe. Listeners let the live PC
+// graph re-apply config when the local NAT type changes.
+
+let lastNatType: NatType = 'unknown'
+type NatTypeListener = (t: NatType) => void
+const natListeners = new Set<NatTypeListener>()
+
+export function getDetectedNatType(): NatType {
+  return lastNatType
+}
+
+export function setDetectedNatType(t: NatType) {
+  if (lastNatType === t) return
+  lastNatType = t
+  for (const fn of natListeners) {
+    try { fn(t) } catch (err) { console.warn('[nat] listener failed', err) }
+  }
+}
+
+export function onNatTypeChange(fn: NatTypeListener): () => void {
+  natListeners.add(fn)
+  return () => natListeners.delete(fn)
+}
 
 export async function detectNatType(
   stunServers: RTCIceServer[] = DEFAULT_STUN,
@@ -48,7 +75,12 @@ export async function detectNatType(
     const offer = await pc.createOffer()
     await pc.setLocalDescription(offer)
     await done
-    return classifyNat(candidates)
+    const result = classifyNat(candidates)
+    // P1: stash the latest type so buildIceConfig can switch to relay
+    // automatically when we're behind a symmetric NAT — without this the
+    // user had to manually toggle "强制使用 TURN" in Settings.
+    setDetectedNatType(result.type)
+    return result
   } finally {
     pc.close()
   }

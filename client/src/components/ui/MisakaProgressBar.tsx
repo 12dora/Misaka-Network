@@ -14,11 +14,17 @@ export default function MisakaProgressBar({ value, className = '' }: Props) {
       aria-valuemin={0}
       aria-valuemax={100}
     >
+      {/* P1: was `transition-all duration-300` which makes the fill chase
+          high-frequency `onProgress` updates ~3× slower than they arrive on
+          large files — the bar looks like it lags 30% behind the percentage
+          counter. Transition only `width` at 150ms so the fill keeps up while
+          still feeling animated rather than jumpy. */}
       <div
-        className="h-full rounded-full transition-all duration-300"
+        className="h-full rounded-full"
         style={{
           width: `${pct}%`,
           background: 'linear-gradient(90deg, var(--bg-deep), var(--accent-cyan))',
+          transition: 'width 150ms linear',
         }}
       />
       {pct > 0 && pct < 100 && (

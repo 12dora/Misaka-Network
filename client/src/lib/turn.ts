@@ -115,9 +115,22 @@ export function getAutoTurnIceServers(): RTCIceServer[] {
   if (!autoTurn) return []
   if (Date.now() >= autoTurn.expiresAt) {
     autoTurn = null
+    // Kick a background refresh so the *next* PC build has fresh creds even
+    // if this caller has to fall back to STUN-only. Without this, an expiry
+    // that happens between PC construction events leaves us with no auto
+    // TURN until the scheduled refresh timer fires (could be minutes).
+    void refreshAutoTurn().catch(() => {})
     return []
   }
   return autoTurn.iceServers
+}
+
+// Returns true when auto-TURN credentials are still within `withinMs` of
+// expiry (or already gone). Used by webrtc.ts to decide whether to await a
+// fresh fetch before building a new RTCPeerConnection.
+export function isAutoTurnStaleWithin(withinMs: number): boolean {
+  if (!autoTurn) return true
+  return Date.now() + withinMs >= autoTurn.expiresAt
 }
 
 export function getAutoTurnState(): { active: boolean; expiresAt: number | null; lastFailReason: string | null } {

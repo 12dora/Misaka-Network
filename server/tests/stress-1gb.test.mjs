@@ -10,6 +10,7 @@
 
 import crypto from 'crypto'
 import { createRequire } from 'module'
+import { runTest } from './_harness.mjs'
 
 const require = createRequire(import.meta.url)
 
@@ -161,7 +162,8 @@ async function main() {
   console.log('✅ 1GB 内存压测完成')
 }
 
-main().catch(e => {
-  console.error('压测失败:', e)
-  process.exit(1)
-})
+// CLAUDE.md "test-script lifecycle": runTest enforces an explicit
+// process.exit(). The stress test runs for several minutes; without the
+// watchdog a hung allocator or GC loop would silently wedge CI. Bump the
+// timeout to 10min to fit the worst-case run on a slow runner.
+runTest(main, { timeoutMs: 10 * 60 * 1000 })

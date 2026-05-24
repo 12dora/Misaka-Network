@@ -72,6 +72,18 @@ export function hasAESKey(peerSessionId: string): boolean {
 // per-peer-session and the prefix is freshly random per transfer (~2^-64
 // collision per pair), so each chunk gets a unique IV without paying the
 // per-chunk getRandomValues syscall (~4000 RNG calls/GB avoided).
+//
+// CONTRACT (do not break without updating callers):
+//   The `prefix` MUST be unique per (AES key, transfer) tuple.
+//   Concretely: in our send path the AES key is derived per peerSessionId
+//   via ECDH, and `randomIvPrefix()` is called once per call to
+//   `sendFileParallel()`. So every call site that invokes the engine for a
+//   NEW peer-and-transfer pair gets a fresh prefix, and reuse only occurs
+//   *within* a single send loop (where the 4-byte index then disambiguates).
+//   In particular, `sendFilesToAll` calls `sendFileToPeer` per (file, peer)
+//   independently — each call gets its own prefix, so the same chunk index
+//   across two peers produces different IVs even when the plaintext is the
+//   same file. See `transfer-iv-multi-peer.test.ts` for the regression.
 export function makeChunkIv(prefix: Uint8Array, index: number): Uint8Array<ArrayBuffer> {
   const iv = new Uint8Array(12)
   iv.set(prefix.subarray(0, 8), 0)

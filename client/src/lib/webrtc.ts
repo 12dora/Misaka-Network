@@ -1,11 +1,22 @@
-import { getTurnIceServers, getAutoTurnIceServers, loadTurnSettings, refreshAutoTurn } from './turn'
+import { getTurnIceServers, getAutoTurnIceServers, loadTurnSettings, refreshAutoTurn, isAutoTurnStaleWithin } from './turn'
+import { getDetectedNatType } from './nat'
 import { DEFAULT_STUN, ICE_CANDIDATE_POOL_SIZE } from '@/constants'
+
+// How close to expiry we consider the auto-TURN credential "stale enough"
+// that the next PC should wait for a refresh rather than starting with creds
+// that will die in seconds. 10s gives the new fetch room to complete before
+// ICE actually needs the relay candidate.
+const AUTO_TURN_STALE_WINDOW_MS = 10_000
 
 // One-shot pre-warm so connections kicked off immediately after WS open
 // can still get TURN ICE servers from the first RTCPeerConnection.
 // refreshAutoTurn is idempotent / coalesces in-flight calls.
 export async function ensureAutoTurnReady(timeoutMs = 1500): Promise<void> {
-  if (getAutoTurnIceServers().length > 0) return
+  // P1: previously this only re-fetched when there were *zero* servers. A
+  // credential that was about to expire (or had just expired) would still
+  // satisfy the early-return, so the next PC built with it failed ICE the
+  // moment the relay candidate timed out. Check staleness, not emptiness.
+  if (!isAutoTurnStaleWithin(AUTO_TURN_STALE_WINDOW_MS) && getAutoTurnIceServers().length > 0) return
   try {
     await Promise.race([
       refreshAutoTurn(),
@@ -92,9 +103,22 @@ export function buildIceConfig(): RTCConfiguration {
     ...getAutoTurnIceServers(),
     ...(turnSettings.enabled ? getTurnIceServers() : []),
   ]
+  // P1: when local NAT is symmetric, host candidates can't be reached and
+  // srflx candidates won't match the peer's expectations either — only relay
+  // works reliably. Previously this required the user to manually flip
+  // "强制使用 TURN" in Settings; now we do it automatically once
+  // `detectNatType()` has marked us symmetric. The Settings toggle still
+  // wins if it's already set.
+  const natIsSymmetric = getDetectedNatType() === 'symmetric'
+  const forceRelay = turnSettings.forceRelay || (natIsSymmetric && iceServers.some(s => {
+    // Only force relay if we actually have a TURN entry — otherwise we'd
+    // produce an unsatisfiable config (relay policy + STUN-only servers).
+    const urls = Array.isArray(s.urls) ? s.urls : [s.urls]
+    return urls.some(u => typeof u === 'string' && (u.startsWith('turn:') || u.startsWith('turns:')))
+  }))
   return {
     iceServers,
-    iceTransportPolicy: turnSettings.forceRelay ? 'relay' : 'all',
+    iceTransportPolicy: forceRelay ? 'relay' : 'all',
     bundlePolicy: 'max-bundle',
     rtcpMuxPolicy: 'require',
     iceCandidatePoolSize: ICE_CANDIDATE_POOL_SIZE,

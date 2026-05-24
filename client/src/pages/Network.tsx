@@ -172,7 +172,10 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
 
   return (
     <div
-      className="border-t p-4 flex flex-col gap-2"
+      // P2: `misaka-scroll` makes the scrollbar visible and themed so users
+      // can tell at a glance whether history is scrollable. Previously the
+      // chat container had `scrollbarWidth: 'none'`, hiding any indicator.
+      className="misaka-scroll border-t p-4 flex flex-col gap-2"
       // P1-12: previously a hard 200px cap on every viewport. On a 1080p
       // desktop that wastes ~70% of the channel card and forces a tiny
       // scroll for tall conversations; mobile is fine because the screen is
@@ -208,7 +211,9 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
                 <div className="flex items-center gap-2">
                   <span className="text-sm">📎</span>
                   <div className="flex-1 min-w-0">
-                    <div className="truncate text-xs font-semibold">{m.fileName}</div>
+                    {/* P1: long filenames get truncated to one line; without a
+                        title the user can't recover the full name. */}
+                    <div className="truncate text-xs font-semibold" title={m.fileName}>{m.fileName}</div>
                     {m.fileSize !== undefined && (
                       <div className="text-[10px]" style={{ color: 'var(--text-muted)' }}>{formatBytes(m.fileSize)}</div>
                     )}
@@ -230,18 +235,24 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
         return (
           <div
             key={m.id}
-            className={`font-kanji text-xs flex ${mine ? 'justify-end' : 'justify-start'}`}
+            // P2: center system notices so they read as out-of-band info
+            // rather than a normal chat bubble. Italic alone wasn't enough
+            // visual separation against the user/peer bubbles.
+            className={`font-kanji text-xs flex ${isSystem ? 'justify-center' : (mine ? 'justify-end' : 'justify-start')}`}
           >
             <div
-              className="max-w-[80%] rounded-lg px-2.5 py-1.5"
+              className={`rounded-lg px-2.5 py-1.5 ${isSystem ? 'max-w-[90%]' : 'max-w-[80%]'}`}
               style={{
                 background: isSystem
-                  ? 'transparent'
+                  ? 'rgba(14,42,107,0.05)'
                   : (mine ? 'var(--bg-deep)' : 'var(--surface-tint)'),
                 color: isSystem
                   ? 'var(--text-on-white-2)'
                   : (mine ? '#fff' : 'var(--text-on-white)'),
                 fontStyle: isSystem ? 'italic' : 'normal',
+                // P2: subtle accent on the left edge so system messages are
+                // visually distinct without shouting.
+                borderLeft: isSystem ? '2px solid var(--accent-cyan)' : undefined,
               }}
             >
               <span className="text-[10px] opacity-70 mr-1">
@@ -262,7 +273,8 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
           <span className="text-[var(--text-on-white-2)] text-[10px]">
             {new Date(t.startedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
           </span>
-          <span className="truncate flex-1">{t.fileName}</span>
+          {/* P1: same truncate-without-title bug as the file card above. */}
+          <span className="truncate flex-1" title={t.fileName}>{t.fileName}</span>
           <span className="text-[10px] text-[var(--text-muted)]">{Math.round(t.progress * 100)}%</span>
         </div>
       ))}
@@ -292,7 +304,8 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
             {pendingFiles.map(item => (
               <div key={item.id} className="flex items-center gap-2 rounded px-2 py-1" style={{ background: 'rgba(255,255,255,0.45)' }}>
                 <div className="flex-1 min-w-0">
-                  <div className="truncate text-[var(--text-on-white)]">{item.displayName}</div>
+                  {/* P1: long path/name needs a hover tooltip when truncated. */}
+                  <div className="truncate text-[var(--text-on-white)]" title={item.displayName}>{item.displayName}</div>
                   <div className="text-[10px] text-[var(--text-muted)]">{formatBytes(item.file.size)}</div>
                 </div>
                 <button
@@ -317,11 +330,22 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
 function ChatInput({ peerSessionId }: { peerSessionId: string }) {
   const [text, setText] = useState('')
   const sendChatMessage = useNetworkStore(s => s.sendChatMessage)
+  const inputRef = useRef<HTMLInputElement>(null)
 
   function handleSend() {
     if (!text.trim()) return
     sendChatMessage(peerSessionId, text.trim())
     setText('')
+  }
+
+  // P2: on mobile, the soft keyboard slides up and covers the MobileBottomBar
+  // which sits directly under this input — leaving the input visible but the
+  // text area invisible. Defer one tick so the keyboard has time to push the
+  // viewport, then scroll the input back into view.
+  function handleFocus() {
+    setTimeout(() => {
+      inputRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    }, 250)
   }
 
   return (
@@ -330,13 +354,17 @@ function ChatInput({ peerSessionId }: { peerSessionId: string }) {
       style={{ borderColor: 'var(--border-card)', borderRadius: '0 0 1rem 1rem' }}
     >
       <input
+        ref={inputRef}
         type="text"
         placeholder="输入消息…"
         value={text}
         onChange={e => setText(e.target.value)}
         onKeyDown={e => { if (e.key === 'Enter') handleSend() }}
-        className="flex-1 px-3 py-2 rounded-lg text-sm font-kanji focus:outline-none"
-        style={{ border: '1px solid var(--border-card)', background: 'var(--surface)', color: 'var(--text-on-white)' }}
+        onFocus={handleFocus}
+        className="misaka-focus-ring flex-1 px-3 py-2 rounded-lg text-sm font-kanji focus:outline-none"
+        // Use 16px so iOS Safari doesn't auto-zoom on focus.
+        style={{ border: '1px solid var(--border-card)', background: 'var(--surface)', color: 'var(--text-on-white)', fontSize: '16px' }}
+        aria-label="聊天输入框"
       />
       <MisakaButton variant="primary" size="sm" onClick={handleSend}>发送</MisakaButton>
     </div>
@@ -344,13 +372,14 @@ function ChatInput({ peerSessionId }: { peerSessionId: string }) {
 }
 
 // ── TransferChannel ───────────────────────────────────────────────
-function TransferChannel({ selectedPeer, onStageFiles, onSendFilesToAll, onOpenSettings, onEmptyDropAttempt, onForceReconnect }: {
+function TransferChannel({ selectedPeer, onStageFiles, onSendFilesToAll, onOpenSettings, onEmptyDropAttempt, onForceReconnect, onToast }: {
   selectedPeer: Peer | null
   onStageFiles: (files: File[]) => void
   onSendFilesToAll: (files: File[]) => void
   onOpenSettings: () => void
   onEmptyDropAttempt: () => void
   onForceReconnect: () => void
+  onToast: (text: string) => void
 }) {
   const [isDragOver, setDragOver] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -384,10 +413,14 @@ function TransferChannel({ selectedPeer, onStageFiles, onSendFilesToAll, onOpenS
       `采集时间: ${formatIceMeasuredAt(selectedPeer.icePathMeasuredAt)}`,
       `状态: ${selectedPeer.status}`,
     ]
+    // P1: previously a silent try/catch — users had no idea whether the copy
+    // worked, so they clicked again and again. Surface success/failure via
+    // the shared page-level toast.
     try {
       await navigator.clipboard.writeText(lines.join('\n'))
+      onToast('诊断信息已复制到剪贴板')
     } catch {
-      // ignore
+      onToast('复制失败，请手动选取诊断文本')
     }
   }
 
@@ -548,7 +581,7 @@ function TaskPanel({ transfers, onPause, onResume, onCancel }: {
               {t.direction === 'send' ? '→' : '←'} 御坂 {t.peerNodeId} 号
             </span>
           </div>
-          <div className="font-kanji text-xs text-[var(--text-on-white-2)] mb-2 truncate">
+          <div className="font-kanji text-xs text-[var(--text-on-white-2)] mb-2 truncate" title={`${t.fileName} · ${formatBytes(t.fileSize)}`}>
             {t.fileName} · {formatBytes(t.fileSize)}
           </div>
           {(t.status === 'transferring' || t.status === 'reconnecting') && (
@@ -697,6 +730,14 @@ export default function Network() {
     }
   }, [store.peers, store.selectedSessionId])
 
+  // Shared toast helper — every transient surface (copy results, force-relay
+  // hints, error reports) routes through this so the misaka-toast slot is the
+  // single source of truth and we don't stack overlapping setTimeouts.
+  function showToast(text: string, durationMs = 2400) {
+    setToast(text)
+    setTimeout(() => setToast(prev => (prev === text ? null : prev)), durationMs)
+  }
+
   async function handleCopyLink() {
     if (!auth.session?.token) return
     try {
@@ -713,15 +754,14 @@ export default function Network() {
       })
       const link = appUrl(`/join?${params.toString()}`)
       await navigator.clipboard.writeText(link)
-      setToast('链接已复制到剪贴板')
+      showToast('链接已复制到剪贴板')
     } catch (e) {
       if (e instanceof AuthRequiredError) {
-        setToast('会话已失效，请重新接入后再试')
+        showToast('会话已失效，请重新接入后再试')
       } else {
-        setToast(`复制失败：${String(e)}`)
+        showToast(`复制失败：${String(e)}`)
       }
     }
-    setTimeout(() => setToast(null), 2400)
   }
 
   function handleSelectPeer(sessionId: string) {
@@ -737,8 +777,7 @@ export default function Network() {
   }
 
   function handleEmptyDropAttempt() {
-    setToast('请先在左侧选择一个目标节点，再拖入文件')
-    setTimeout(() => setToast(null), 2400)
+    showToast('请先在左侧选择一个目标节点，再拖入文件')
   }
 
   async function handleSendFilesToAll(files: File[]) {
@@ -746,8 +785,7 @@ export default function Network() {
       await store.sendFilesToAll(files)
     } catch (e) {
       console.error('Fanout send failed:', e)
-      setToast(e instanceof Error ? e.message : '群发失败，请稍后再试')
-      setTimeout(() => setToast(null), 2400)
+      showToast(e instanceof Error ? e.message : '群发失败，请稍后再试')
     }
   }
 
@@ -778,6 +816,7 @@ export default function Network() {
             onOpenSettings={() => setShowSettings(true)}
             onEmptyDropAttempt={handleEmptyDropAttempt}
             onForceReconnect={() => store.recoverConnections()}
+            onToast={showToast}
           />
         </div>
         <div className="overflow-y-auto">
@@ -848,6 +887,7 @@ export default function Network() {
                 onOpenSettings={() => setShowSettings(true)}
                 onEmptyDropAttempt={handleEmptyDropAttempt}
                 onForceReconnect={() => store.recoverConnections()}
+                onToast={showToast}
               />
             </div>
           )}
