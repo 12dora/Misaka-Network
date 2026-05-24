@@ -20,14 +20,14 @@ import {
   supportsFileSystemAccess, streamChunkToDisk,
   finalizeStreamedFile, cancelStreamWrite, getWriteHandle,
   supportsOPFS, createOPFSReceiveFile, writeChunkToOPFS, getOPFSFile, getOPFSHandle, cleanupOPFS,
-  decodeChunkFrame,
+  decodeChunkFrame, decodeResumeRequest, checkMetaOOMGuard,
   type MetaMessage, type SendCallbacks, type ResumeRequest,
 } from '@/lib/transfer'
 import { getTransfer, getActiveTransfers } from '@/lib/db'
 import { playSound } from '@/lib/sound'
 import { notifyIncomingFile } from '@/lib/notify'
-import { refreshAutoTurn, clearAutoTurn, onTurnConfigChange } from '@/lib/turn'
-import { onNatTypeChange } from '@/lib/nat'
+import { refreshAutoTurn, clearAutoTurn, onTurnConfigChange, fetchTurnStatus, getAutoTurnState, loadTurnSettings } from '@/lib/turn'
+import { detectNatType, onNatTypeChange, getDetectedNatType, type NatType } from '@/lib/nat'
 import {
   MAX_ICE_RESTART_ATTEMPTS, ICE_RESTART_BACKOFF_MS, ICE_DISCONNECTED_RESTART_DELAY_MS,
   DC_OPEN_TIMEOUT_MS, ENCRYPTION_TIMEOUT_MS,
@@ -148,6 +148,11 @@ let recoveryInstalled = false
 let lastRecoverAt = 0
 let turnConfigUnsubscribe: (() => void) | null = null
 let natConfigUnsubscribe: (() => void) | null = null
+// P1-1: NAT probe + TURN status fetch are fire-and-forget at most once
+// per page lifetime (the result rarely changes within a session — the
+// user can force a re-probe from Settings if they actually move network).
+let natProbeStarted = false
+let natStoreUnsubscribe: (() => void) | null = null
 
 function installTurnConfigPropagation() {
   if (turnConfigUnsubscribe) return
@@ -163,10 +168,91 @@ function installTurnConfigPropagation() {
   // detect button in Settings and we discover symmetric NAT). Same rationale
   // as TURN config — existing PCs would otherwise stay on the old policy.
   if (!natConfigUnsubscribe) {
-    natConfigUnsubscribe = onNatTypeChange(() => {
+    natConfigUnsubscribe = onNatTypeChange((t) => {
+      // Mirror the published NAT type into the store so the UI banner can
+      // react without imperatively polling `getDetectedNatType()`.
+      useNetworkStore.setState({ myNatType: t })
       applyIceConfigToAll(peerConnections.values())
     })
   }
+  if (!natStoreUnsubscribe) {
+    // Convenience: a separate slot so destroy() can rip out both
+    // subscriptions cleanly without juggling references.
+    natStoreUnsubscribe = natConfigUnsubscribe
+  }
+}
+
+/**
+ * P1-1: fire-and-forget NAT type probe + auto-TURN reachability check
+ * once per page lifetime. The probe is gated to a single call because
+ * - the cost is several STUN packets to public servers (small but real)
+ * - the result rarely changes within a session
+ * The Settings modal still has a manual re-probe button for users who
+ * actually changed networks.
+ *
+ * Both calls are wrapped in try/catch — a failure (firewall blocks STUN,
+ * /api/turn-credentials 503'd) just leaves the corresponding store field
+ * at its conservative default and the UI suppresses the warning.
+ */
+function startNatAndTurnProbes() {
+  if (natProbeStarted) return
+  natProbeStarted = true
+
+  // NAT probe — fire-and-forget. The shared module state in nat.ts will
+  // re-emit through onNatTypeChange listeners, which is what writes the
+  // store; we still set it here as a fallback in case the listener was
+  // subscribed after the probe resolves (shouldn't happen with current
+  // ordering but cheap insurance).
+  void (async () => {
+    try {
+      const result = await detectNatType()
+      useNetworkStore.setState({ myNatType: result.type })
+    } catch (err) {
+      console.warn('[nat] probe failed', err)
+      useNetworkStore.setState({ myNatType: 'unknown' })
+    }
+  })()
+
+  // Auto-TURN status: server may report disabled / quota-exceeded / not
+  // configured. We treat any "not enabled" reply as `autoTurnAvailable=false`.
+  void (async () => {
+    try {
+      const status = await fetchTurnStatus()
+      if (!status) {
+        useNetworkStore.setState({ autoTurnAvailable: false })
+        return
+      }
+      const available = status.enabled && status.configured && !status.killSwitchActive
+      useNetworkStore.setState({ autoTurnAvailable: available })
+    } catch {
+      useNetworkStore.setState({ autoTurnAvailable: false })
+    }
+  })()
+}
+
+/**
+ * Derived selector: are we likely to fail to connect to peers given our
+ * local conditions? Symmetric NAT + no usable TURN = no hole punch
+ * possible. The UI uses this to show a single banner instead of letting
+ * users wait ~30 s for the ICE-restart loop to bail out.
+ *
+ * Stays narrow: NAT type must be the strong "symmetric" verdict (NOT
+ * 'unknown', which would over-warn in firewalled corporate networks
+ * where the probe just timed out). Requires both auto and manual TURN
+ * to be unavailable — having either is enough to potentially relay.
+ */
+export function isLikelyUnreachable(s: Pick<NetworkState, 'myNatType' | 'autoTurnAvailable'>): boolean {
+  if (s.myNatType !== 'symmetric') return false
+  if (s.autoTurnAvailable) return false
+  const settings = loadTurnSettings()
+  const hasManualTurn = settings.enabled && settings.servers.some(srv => srv.enabled)
+  return !hasManualTurn
+}
+
+// Re-export the auto-TURN state inspector so the page can decide whether
+// to call out "TURN unavailable" explicitly. Cheap wrapper, no state copy.
+export function getAutoTurnSnapshot() {
+  return getAutoTurnState()
 }
 
 function installForegroundRecovery() {
@@ -240,6 +326,13 @@ interface NetworkState {
   connectedPeers: Set<string>                      // sessionIds with open DC
   unreadByPeer: Record<string, { message: number; file: number }>
   sendingPeers: Set<string>                        // sessionIds currently flushing pendingFiles
+  // P1-1: surfaced so the UI can warn ahead of a 30s ICE failure cycle.
+  // `myNatType` starts null and resolves once the post-WELCOME probe
+  // returns (or times out → 'unknown'). `autoTurnAvailable` flips false
+  // when /api/turn-credentials replied 503 (disabled / quota) on the
+  // most recent attempt.
+  myNatType: NatType | null
+  autoTurnAvailable: boolean
 
   init: (token: string) => void
   destroy: () => void
@@ -271,6 +364,11 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
   connectedPeers: new Set(),
   unreadByPeer: {},
   sendingPeers: new Set(),
+  // Default to whatever was last detected (may still be 'unknown' across
+  // a session) and to "auto TURN reachable" until proven otherwise — that
+  // way the warning banner only shows after we have firm evidence.
+  myNatType: getDetectedNatType(),
+  autoTurnAvailable: true,
 
   init(token: string) {
     // React 18 StrictMode double-mounts effects in dev, which would register
@@ -405,7 +503,16 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
       // Prefetch auto TURN once authed. Server may reply 503 if disabled —
       // that's fine, we just fall back to STUN + manual TURN. Re-fetch on
       // every reconnect because credentials are short-lived.
-      void refreshAutoTurn()
+      void refreshAutoTurn().then(servers => {
+        // P1-1: if the cred fetch yielded ICE servers, auto-TURN is
+        // reachable for this session — we'd otherwise need the user to
+        // toggle Settings → 立即获取凭证 to learn the truth.
+        useNetworkStore.setState({ autoTurnAvailable: servers.length > 0 })
+      }).catch(() => {})
+      // Kick off the NAT probe + TURN status check exactly once. These are
+      // cheap and informational — the UI uses the result to warn ahead of
+      // a 30s ICE-failure cycle when both sides are symmetric NAT.
+      startNatAndTurnProbes()
     })
     onDisconnect(() => set({ wsConnected: false }))
 
@@ -421,6 +528,11 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     clearAutoTurn()
     if (turnConfigUnsubscribe) { turnConfigUnsubscribe(); turnConfigUnsubscribe = null }
     if (natConfigUnsubscribe) { natConfigUnsubscribe(); natConfigUnsubscribe = null }
+    natStoreUnsubscribe = null
+    // P1-1: allow the next init() to re-probe (e.g. user logged out and
+    // back in on a different network). The cached `lastNatType` in nat.ts
+    // stays — it's still the best prior we have until a new probe lands.
+    natProbeStarted = false
     initialized = false
     currentToken = ''
     // Revoke every cached download URL — these point at File/Blob objects
@@ -437,6 +549,10 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
       peers: [], selectedSessionId: null, transfers: [],
       chatMessages: {}, pendingFiles: {}, connectedPeers: new Set(), unreadByPeer: {},
       sendingPeers: new Set(),
+      // Preserve the last detected NAT type — it's still a useful prior
+      // until the next init() probes again. Reset autoTurnAvailable
+      // because the new session may target a different signaling server.
+      autoTurnAvailable: true,
     })
   },
 
@@ -642,7 +758,8 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
         const request = await buildResumeRequest(transferId)
         const peerNodeId = get().peers.find(p => p.sessionId === peerSessionId)?.nodeId ?? 0
         const lanes = await ensureTransferLanes(peerSessionId)
-        engineSendFileParallel(lanes, file, transferId, peerNodeId, peerSessionId, record, undefined, request?.receivedChunks)
+        const peerBitmap = request ? decodeResumeRequest(request, record.totalChunks) : undefined
+        engineSendFileParallel(lanes, file, transferId, peerNodeId, peerSessionId, record, undefined, peerBitmap)
           .then(() => sendingFiles.delete(transferId))
           .catch(() => {})
       }
@@ -1244,6 +1361,38 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
         if (msg.type === 'meta') {
           const meta = msg as MetaMessage
           const peerNodeId = useNetworkStore.getState().peers.find(p => p.sessionId === peerSessionId)?.nodeId ?? 0
+
+          // P1-5: refuse files that would force an in-memory IDB assemble
+          // larger than MAX_INMEMORY_RECEIVE_BYTES — for those, this tab
+          // would OOM mid-receive on low-end devices. The check is BEFORE
+          // shortId registration so we don't accidentally accept the
+          // chunk stream that follows.
+          const rejection = checkMetaOOMGuard(meta)
+          if (rejection) {
+            // Tell the sender to stop — they're about to ship hundreds of
+            // megabytes that we'd throw away.
+            try {
+              dc.send(JSON.stringify({ type: 'transfer-cancel', transferId: meta.transferId }))
+            } catch { /* peer DC might already be dying — ignore */ }
+            useNetworkStore.setState(s => {
+              if (s.transfers.some(t => t.id === meta.transferId)) return s
+              return {
+                transfers: [...s.transfers, {
+                  id: meta.transferId, direction: 'recv' as const,
+                  peerSessionId, peerNodeId,
+                  fileName: meta.fileName, fileSize: meta.fileSize,
+                  progress: 0, speedBps: 0,
+                  status: 'failed:unsupported' as const,
+                  error: rejection.message,
+                  startedAt: Date.now(),
+                }],
+              }
+            })
+            appendSystemChat(peerSessionId, `已拒绝接收 ${meta.fileName}：${rejection.message}`)
+            playSound('error')
+            return
+          }
+
           // Register shortId → transferId BEFORE any await. If a chunk for
           // this transfer arrives while handleMetaMessage is still in flight
           // (very common — meta + chunk are queued back-to-back on the lane),
@@ -1305,7 +1454,11 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
           if (file && record) {
             const peerNodeId = useNetworkStore.getState().peers.find(p => p.sessionId === peerSessionId)?.nodeId ?? 0
             const lanes = await ensureTransferLanes(peerSessionId)
-            engineSendFileParallel(lanes, file, resumeRequest.transferId, peerNodeId, peerSessionId, record, undefined, resumeRequest.receivedChunks)
+            // decodeResumeRequest handles both legacy (`receivedChunks`)
+            // and new (`receivedRanges`) wire formats, capped at totalChunks
+            // so a malformed peer can't trigger an oversize bitmap alloc.
+            const peerBitmap = decodeResumeRequest(resumeRequest, record.totalChunks)
+            engineSendFileParallel(lanes, file, resumeRequest.transferId, peerNodeId, peerSessionId, record, undefined, peerBitmap)
               .then(() => sendingFiles.delete(resumeRequest.transferId))
               .catch(() => {})
           }

@@ -8,8 +8,28 @@ export interface TransferRecord {
   fileSize: number
   fileHash: string
   totalChunks: number
+  /**
+   * Legacy persistence format: a sorted, deduped array of every received
+   * (or, on the sender side, sent-and-acked) chunk index. Kept on the
+   * type for backwards-compatibility with records written by older
+   * builds — on read we lazy-migrate into `receivedBitmap` so the hot
+   * path never touches this field directly.
+   *
+   * New writes leave this empty (`[]`) — the source of truth is
+   * `receivedBitmap`. Legacy clients reading new records still get an
+   * empty array, which is correct (they'll re-receive everything, which
+   * is benign because chunks are content-authenticated).
+   */
   receivedChunks: number[]
-  status: 'active' | 'paused' | 'completed' | 'failed'
+  /**
+   * Compact bit-array of received chunk indexes, sized
+   * `bitmapByteLength(totalChunks)`. Replaces `receivedChunks` for any
+   * non-trivial transfer — a 1 TB transfer goes from ~1 MB JSON-per-tick
+   * to ~2 MB binary written once per tick. Optional so legacy records
+   * load cleanly.
+   */
+  receivedBitmap?: ArrayBuffer
+  status: 'active' | 'paused' | 'completed' | 'failed' | 'failed:unsupported'
   createdAt: number
   updatedAt: number
 }

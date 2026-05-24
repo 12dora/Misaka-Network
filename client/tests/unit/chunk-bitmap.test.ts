@@ -1,0 +1,166 @@
+// Unit tests for the chunk-index bitmap helpers. The bitmap replaces the
+// previous `Set<number>` / sorted `number[]` representation in both the
+// hot path and the IDB persistence layer (P1-4) so it has to behave
+// EXACTLY the same as the Set semantics on the boundaries:
+//   - set/has are O(1) and stable
+//   - popcount matches the number of distinct set bits
+//   - bitmap ↔ indexes round-trip preserves identity
+//   - bitmap → ranges → bitmap round-trip preserves identity
+//   - Set → ranges takes the same shape as bitmap → ranges
+//
+// Random fuzz cases lean on the round-trips so we catch off-by-one
+// boundary errors at byte edges (idx=7, 8, 15, 16 …) without enumerating.
+
+import { describe, it, expect } from 'vitest'
+import {
+  bitmapByteLength,
+  newBitmap,
+  bitmapSet,
+  bitmapHas,
+  bitmapPopcount,
+  bitmapFromIndexes,
+  bitmapToIndexes,
+  bitmapToRanges,
+  rangesToBitmap,
+  setToRanges,
+  preferRangesOverIndexes,
+} from '../../src/lib/chunk-bitmap'
+
+describe('chunk-bitmap basics', () => {
+  it('byte length rounds up to whole bytes', () => {
+    expect(bitmapByteLength(0)).toBe(0)
+    expect(bitmapByteLength(1)).toBe(1)
+    expect(bitmapByteLength(7)).toBe(1)
+    expect(bitmapByteLength(8)).toBe(1)
+    expect(bitmapByteLength(9)).toBe(2)
+    expect(bitmapByteLength(16)).toBe(2)
+    expect(bitmapByteLength(17)).toBe(3)
+    expect(bitmapByteLength(1024)).toBe(128)
+  })
+
+  it('set/has agree across byte boundaries', () => {
+    const b = newBitmap(20)
+    expect(bitmapHas(b, 0)).toBe(false)
+    expect(bitmapSet(b, 0)).toBe(true)   // 0→1
+    expect(bitmapSet(b, 0)).toBe(false)  // already set
+    expect(bitmapHas(b, 0)).toBe(true)
+    // boundary cases: bit 7 (last of byte 0) and bit 8 (first of byte 1)
+    bitmapSet(b, 7)
+    bitmapSet(b, 8)
+    bitmapSet(b, 15)
+    bitmapSet(b, 19)
+    expect(bitmapHas(b, 7)).toBe(true)
+    expect(bitmapHas(b, 8)).toBe(true)
+    expect(bitmapHas(b, 15)).toBe(true)
+    expect(bitmapHas(b, 19)).toBe(true)
+    expect(bitmapHas(b, 16)).toBe(false)
+    expect(bitmapHas(b, 9)).toBe(false)
+  })
+
+  it('out-of-range set / has silently no-op', () => {
+    const b = newBitmap(10)
+    expect(bitmapSet(b, -1)).toBe(false)
+    expect(bitmapSet(b, 999)).toBe(false)
+    expect(bitmapHas(b, -1)).toBe(false)
+    expect(bitmapHas(b, 999)).toBe(false)
+  })
+
+  it('popcount matches manual count', () => {
+    const b = newBitmap(64)
+    for (const i of [0, 1, 2, 7, 8, 31, 63]) bitmapSet(b, i)
+    expect(bitmapPopcount(b)).toBe(7)
+  })
+})
+
+describe('bitmap ↔ index round-trips', () => {
+  it('fromIndexes → toIndexes preserves the sorted unique set', () => {
+    const indexes = [5, 1, 19, 1, 5, 0, 19, 7, 8]
+    const b = bitmapFromIndexes(indexes, 20)
+    expect(bitmapToIndexes(b, 20)).toEqual([0, 1, 5, 7, 8, 19])
+  })
+
+  it('out-of-range indexes are dropped, not aliased', () => {
+    const b = bitmapFromIndexes([5, 100, -1, 8], 10)
+    expect(bitmapToIndexes(b, 10)).toEqual([5, 8])
+  })
+
+  it('empty bitmap → empty array', () => {
+    expect(bitmapToIndexes(newBitmap(100), 100)).toEqual([])
+  })
+
+  it('fuzz: random index sets round-trip identically', () => {
+    const TOTAL = 200
+    for (let trial = 0; trial < 50; trial++) {
+      const want = new Set<number>()
+      const count = Math.floor(Math.random() * TOTAL)
+      for (let k = 0; k < count; k++) {
+        want.add(Math.floor(Math.random() * TOTAL))
+      }
+      const b = bitmapFromIndexes(want, TOTAL)
+      const got = new Set(bitmapToIndexes(b, TOTAL))
+      expect(got.size).toBe(want.size)
+      for (const i of want) expect(got.has(i)).toBe(true)
+    }
+  })
+})
+
+describe('RLE ranges', () => {
+  it('contiguous run produces a single range', () => {
+    const b = bitmapFromIndexes([0, 1, 2, 3, 4], 10)
+    expect(bitmapToRanges(b, 10)).toEqual([[0, 5]])
+  })
+
+  it('multiple gaps produce multiple ranges', () => {
+    const b = bitmapFromIndexes([0, 1, 5, 6, 7, 9], 10)
+    expect(bitmapToRanges(b, 10)).toEqual([[0, 2], [5, 3], [9, 1]])
+  })
+
+  it('empty bitmap → no ranges', () => {
+    expect(bitmapToRanges(newBitmap(50), 50)).toEqual([])
+  })
+
+  it('range touching the end is included', () => {
+    const b = bitmapFromIndexes([7, 8, 9], 10)
+    expect(bitmapToRanges(b, 10)).toEqual([[7, 3]])
+  })
+
+  it('rangesToBitmap is the exact inverse', () => {
+    const original = bitmapFromIndexes([0, 1, 2, 9, 13, 14, 19], 20)
+    const ranges = bitmapToRanges(original, 20)
+    const rebuilt = rangesToBitmap(ranges, 20)
+    expect(bitmapToIndexes(rebuilt, 20)).toEqual(bitmapToIndexes(original, 20))
+  })
+
+  it('rangesToBitmap silently clamps oversize ranges', () => {
+    const buf = rangesToBitmap([[5, 100]], 10)
+    expect(bitmapToIndexes(buf, 10)).toEqual([5, 6, 7, 8, 9])
+  })
+
+  it('setToRanges agrees with bitmapToRanges', () => {
+    const set = new Set([0, 1, 2, 9, 13, 14, 19])
+    const fromSet = setToRanges(set, 20)
+    const fromBitmap = bitmapToRanges(bitmapFromIndexes(set, 20), 20)
+    expect(fromSet).toEqual(fromBitmap)
+  })
+})
+
+describe('memory cost', () => {
+  it('a 1 TB transfer (~16M chunks) fits in ~2 MB', () => {
+    const totalChunks = 16_000_000
+    const bytes = bitmapByteLength(totalChunks)
+    expect(bytes).toBeLessThan(2.1 * 1024 * 1024)
+    expect(bytes).toBeGreaterThan(1.9 * 1024 * 1024)
+  })
+})
+
+describe('preferRangesOverIndexes', () => {
+  it('small sets prefer the indexes form', () => {
+    expect(preferRangesOverIndexes(0)).toBe(false)
+    expect(preferRangesOverIndexes(100)).toBe(false)
+    expect(preferRangesOverIndexes(1024)).toBe(false)
+  })
+  it('large sets prefer RLE ranges', () => {
+    expect(preferRangesOverIndexes(1025)).toBe(true)
+    expect(preferRangesOverIndexes(1_000_000)).toBe(true)
+  })
+})

@@ -7,10 +7,36 @@ import { encryptChunk, decryptChunk, makeChunkIv, randomIvPrefix } from './crypt
 import {
   CHUNK_SIZE, HIGH_WATER_MARK, LOW_WATER_MARK,
   TRANSFER_PROGRESS_INTERVAL_MS, TRANSFER_RECORD_INTERVAL_MS,
-  TRANSFER_LANE_COUNT,
+  TRANSFER_LANE_COUNT, MAX_INMEMORY_RECEIVE_BYTES,
 } from '@/constants'
+import {
+  newBitmap, bitmapSet, bitmapHas, bitmapPopcount,
+  bitmapFromIndexes, bitmapToRanges, rangesToBitmap,
+  preferRangesOverIndexes,
+} from './chunk-bitmap'
 
 export { CHUNK_SIZE }
+
+/**
+ * Build a Uint8Array bitmap from whatever shape a TransferRecord happens
+ * to carry. New records persist `receivedBitmap`; legacy records still
+ * have `receivedChunks: number[]`. Either way callers get a bitmap they
+ * can mutate freely (the result is always a fresh allocation — we never
+ * hand back an alias into the record).
+ */
+function bitmapFromRecord(record: TransferRecord): Uint8Array<ArrayBuffer> {
+  if (record.receivedBitmap && record.receivedBitmap.byteLength > 0) {
+    // Copy: the underlying buffer was structured-cloned out of IDB but the
+    // session is about to mutate it; never share storage between two live
+    // sessions for the same transferId (cancel-then-resume edge case).
+    const copy = record.receivedBitmap.slice(0) as ArrayBuffer
+    return new Uint8Array(copy)
+  }
+  if (record.receivedChunks && record.receivedChunks.length > 0) {
+    return bitmapFromIndexes(record.receivedChunks, record.totalChunks)
+  }
+  return newBitmap(record.totalChunks)
+}
 
 // ── Protocol types ───────────────────────────────────────────────────
 
@@ -25,10 +51,26 @@ export interface MetaMessage {
   mime: string
 }
 
+/**
+ * Resume request sent by the receiver to the sender after reconnect. The
+ * wire format carries one of two encodings:
+ *
+ *   - `receivedRanges`: RLE pairs [start, length]. Preferred when the
+ *     receiver already has many chunks (~> 1 K) — even after thousands of
+ *     contiguous chunks this is typically a handful of entries.
+ *
+ *   - `receivedChunks`: the legacy flat array. Used for small transfers
+ *     and to remain parseable by older clients that don't know about
+ *     `receivedRanges`.
+ *
+ * Receivers MAY include both; the sender prefers `receivedRanges` when
+ * present. Parsing always tolerates omissions and arbitrary index ordering.
+ */
 export interface ResumeRequest {
   type: 'resume'
   transferId: string
-  receivedChunks: number[]
+  receivedChunks?: number[]
+  receivedRanges?: Array<[number, number]>
 }
 
 export type DCProtocolMessage = MetaMessage | ResumeRequest | { type: 'ecdh-pub'; pub: string }
@@ -114,7 +156,7 @@ export async function sendFileParallel(
   peerSessionId: string,
   existingRecord?: TransferRecord,
   callbacks?: SendCallbacks,
-  peerReceivedChunks?: number[],
+  peerReceivedBitmap?: Uint8Array,
 ): Promise<void> {
   const lanes = dcs.filter(dc => dc.readyState === 'open').slice(0, TRANSFER_LANE_COUNT)
   const activeLanes = lanes.length > 0 ? lanes : (dcs[0] ? [dcs[0]] : [])
@@ -146,9 +188,28 @@ export async function sendFileParallel(
   }
   await saveTransfer(record)
 
-  const skipSet = new Set(peerReceivedChunks ?? (existingRecord ? await getSavedChunkIndexes(transferId) : []))
-  const sentChunkIndexes = new Set(record.receivedChunks)
-  let sent = skipSet.size
+  // skipBitmap: chunks the receiver already has (from a prior session) OR
+  // the sender already shipped (from its own persisted record). Either way
+  // we don't re-send. Two cheap O(n bytes) bitmaps, NOT a 50 B/entry Set.
+  // We always own a fresh ArrayBuffer-backed bitmap so subsequent
+  // `.buffer.slice(0)` writes to IDB stay variance-clean.
+  let skipBitmap: Uint8Array<ArrayBuffer>
+  if (peerReceivedBitmap) {
+    skipBitmap = newBitmap(totalChunks)
+    const copyLen = Math.min(skipBitmap.length, peerReceivedBitmap.length)
+    skipBitmap.set(peerReceivedBitmap.subarray(0, copyLen))
+  } else if (existingRecord) {
+    skipBitmap = bitmapFromIndexes(await getSavedChunkIndexes(transferId), totalChunks)
+  } else {
+    skipBitmap = newBitmap(totalChunks)
+  }
+  // sentBitmap mirrors what we've successfully shipped (and the receiver
+  // ack'd via DataChannel ordering — DC is ordered+reliable, so once
+  // dc.send returns the chunk has been queued and SCTP will deliver it).
+  // Seeded from the existing record so cross-session resume picks up where
+  // it left off.
+  const sentBitmap = bitmapFromRecord(record)
+  let sent = bitmapPopcount(skipBitmap)
   let nextChunk = 0
   let cancelled = false
   let lastProgressAt = performance.now()
@@ -182,7 +243,7 @@ export async function sendFileParallel(
   function nextIndex(): number | null {
     while (nextChunk < totalChunks) {
       const idx = nextChunk++
-      if (!skipSet.has(idx)) return idx
+      if (!bitmapHas(skipBitmap, idx)) return idx
     }
     return null
   }
@@ -190,8 +251,16 @@ export async function sendFileParallel(
   async function flushRecord(force = false) {
     if (!recordDirty && !force) return
     if (!force && performance.now() - lastRecordAt < TRANSFER_RECORD_INTERVAL_MS) return
-    record.receivedChunks = Array.from(sentChunkIndexes).sort((a, b) => a - b)
-    await updateTransfer(transferId, { receivedChunks: record.receivedChunks })
+    // Persist the bitmap (fixed-size, O(totalChunks/8) bytes) instead of
+    // serialising every chunk index. IDB structured-clones the buffer at
+    // commit time so we keep our session's buffer pristine while the
+    // copy is on the IDB side.
+    record.receivedChunks = []
+    record.receivedBitmap = sentBitmap.buffer.slice(0)
+    await updateTransfer(transferId, {
+      receivedChunks: [],
+      receivedBitmap: record.receivedBitmap,
+    })
     recordDirty = false
     lastRecordAt = performance.now()
   }
@@ -242,9 +311,11 @@ export async function sendFileParallel(
     while (prepared && !cancelled) {
       // If this lane has closed under us (NAT/firewall reset a single SCTP
       // stream), don't take the chunk off the queue with a doomed send.
-      // Put it back so a healthy lane can pick it up.
+      // Put it back so a healthy lane can pick it up. (Bitmap doesn't
+      // need explicit clears — nextChunk rewind makes the index re-enter
+      // the loop and bitmapHas(skipBitmap, idx) is still false since we
+      // never set it.)
       if (dc.readyState !== 'open') {
-        skipSet.delete(prepared.i)
         nextChunk = Math.min(nextChunk, prepared.i)
         return
       }
@@ -264,20 +335,17 @@ export async function sendFileParallel(
         // Don't abort the whole transfer for a single bad lane — re-queue
         // this index and exit this lane. Healthy lanes pick up the slack.
         console.warn('[transfer] lane send failed, re-queueing chunk', current.i, laneErr)
-        skipSet.delete(current.i)
         nextChunk = Math.min(nextChunk, current.i)
         // Drain the upcoming so the encrypted bytes aren't lost — also
         // re-queue it.
         const orphan = await upcoming.catch(() => null)
         if (orphan) {
-          skipSet.delete(orphan.i)
           nextChunk = Math.min(nextChunk, orphan.i)
         }
         return
       }
 
-      sent++
-      sentChunkIndexes.add(current.i)
+      if (bitmapSet(sentBitmap, current.i)) sent++
       recordDirty = true
       if (shouldFlushProgress(lastProgressAt, sent, totalChunks)) {
         callbacks?.onProgress?.(sent, totalChunks)
@@ -316,7 +384,13 @@ type ReceiveSession = {
   fileHash: string
   totalChunks: number
   mime: string
-  received: Set<number>
+  // Bit-array (length = ceil(totalChunks/8)) of chunk indexes already
+  // accepted. Replaces a Set<number> which was ~50 B per chunk — a 1 TB
+  // transfer used to need ~800 MB just for tracking. Now it's ~2 MB.
+  // Backed by a plain ArrayBuffer (never SharedArrayBuffer) so it
+  // round-trips through IDB structured clone without TS variance issues.
+  received: Uint8Array<ArrayBuffer>
+  receivedCount: number
   lastRecordAt: number
   lastProgressAt: number   // throttle React store updates — 4000 setState/GB otherwise
   storageMode: 'pending' | 'stream' | 'indexeddb'
@@ -327,6 +401,41 @@ const receiveSessions = new Map<string, ReceiveSession>()
 
 export function getReceiveSession(transferId: string): ReceiveSession | undefined {
   return receiveSessions.get(transferId)
+}
+
+/**
+ * Reason why a transfer's meta should be rejected before any chunks land.
+ * Currently only one case (P1-5): receiver lacks both File System Access
+ * and OPFS, and the incoming file is bigger than what an in-memory IDB
+ * assemble can safely handle on a low-end device.
+ */
+export interface MetaRejection {
+  reason: 'too-large-for-fallback'
+  message: string
+  limitBytes: number
+}
+
+/**
+ * Pre-flight check: would accepting this transfer almost certainly OOM the
+ * tab on the only storage path we have? If yes, returns a rejection the
+ * caller can surface as a `failed:unsupported` transfer card and propagate
+ * to the sender via the existing `transfer-cancel` control plane.
+ *
+ * Returns null when the transfer is fine to accept.
+ */
+export function checkMetaOOMGuard(meta: MetaMessage): MetaRejection | null {
+  if (meta.fileSize <= MAX_INMEMORY_RECEIVE_BYTES) return null
+  // If EITHER streaming-disk path is available, we won't hit the
+  // in-memory IDB assemble step.
+  if (supportsFileSystemAccess()) return null
+  if (supportsOPFS()) return null
+  const mb = Math.round(meta.fileSize / (1024 * 1024))
+  const limitMb = Math.round(MAX_INMEMORY_RECEIVE_BYTES / (1024 * 1024))
+  return {
+    reason: 'too-large-for-fallback',
+    message: `文件大小 ${mb} MB 超出当前浏览器的内存接收上限（${limitMb} MB）。请使用 Chrome / Edge 或升级 Firefox 到 111+ 以支持大文件流式落盘。`,
+    limitBytes: MAX_INMEMORY_RECEIVE_BYTES,
+  }
 }
 
 export async function handleMetaMessage(msg: MetaMessage, peerNodeId: number): Promise<ReceiveSession> {
@@ -349,7 +458,8 @@ export async function handleMetaMessage(msg: MetaMessage, peerNodeId: number): P
     fileHash: msg.fileHash,
     totalChunks: msg.totalChunks,
     mime: msg.mime,
-    received: new Set(),
+    received: newBitmap(msg.totalChunks),
+    receivedCount: 0,
     lastRecordAt: performance.now(),
     lastProgressAt: 0,
     storageMode: 'pending',
@@ -360,20 +470,27 @@ export async function handleMetaMessage(msg: MetaMessage, peerNodeId: number): P
   // Resume-aware: if a TransferRecord already exists from a prior session
   // (page reload mid-transfer), restore the bitmap so subsequent chunk
   // arrivals can still hit the `received === total` completion gate.
-  // Chunks that race ahead of this restoration just add their indexes to
-  // session.received normally — duplicate adds on a Set are a no-op.
+  // Chunks that race ahead of this restoration just set their bits
+  // normally — bitmapSet is idempotent.
   try {
     const prior = await getTransfer(msg.transferId)
     if (prior && prior.direction === 'recv') {
+      const fromRecord = bitmapFromRecord(prior)
+      // OR-merge into session.received.
+      for (let i = 0; i < fromRecord.length && i < session.received.length; i++) {
+        session.received[i] |= fromRecord[i]
+      }
+      // Chunks already persisted on disk (IDB or OPFS may have written
+      // them between the last record flush and the shutdown).
       const saved = await getSavedChunkIndexes(msg.transferId)
-      for (const idx of prior.receivedChunks) session.received.add(idx)
-      for (const idx of saved) session.received.add(idx)
+      for (const idx of saved) bitmapSet(session.received, idx)
+      session.receivedCount = bitmapPopcount(session.received)
     }
   } catch { /* fresh transfer */ }
 
   // Persist (with whatever we just restored — keeps the record in sync if
   // the prior shutdown happened between a chunk save and the next interval
-  // flush).
+  // flush). New writes leave `receivedChunks: []` and persist the bitmap.
   await saveTransfer({
     transferId: msg.transferId,
     direction: 'recv',
@@ -382,7 +499,8 @@ export async function handleMetaMessage(msg: MetaMessage, peerNodeId: number): P
     fileSize: msg.fileSize,
     fileHash: msg.fileHash,
     totalChunks: msg.totalChunks,
-    receivedChunks: Array.from(session.received).sort((a, b) => a - b),
+    receivedChunks: [],
+    receivedBitmap: session.received.buffer.slice(0),
     status: 'active',
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -425,14 +543,21 @@ export async function receiveChunk(
     await saveChunk(transferId, index, decrypted)
   }
 
-  session.received.add(index)
+  // bitmapSet returns true only on the 0→1 transition, so a duplicate
+  // chunk doesn't double-count toward receivedCount.
+  if (bitmapSet(session.received, index)) session.receivedCount++
 
   if (
     performance.now() - session.lastRecordAt >= TRANSFER_RECORD_INTERVAL_MS ||
-    session.received.size === session.totalChunks
+    session.receivedCount === session.totalChunks
   ) {
+    // Slice into a fresh buffer so IDB's structured-clone copy and the
+    // session bitmap don't share underlying storage. Cost is one O(bytes)
+    // memcpy per TRANSFER_RECORD_INTERVAL_MS — orders of magnitude cheaper
+    // than the previous JSON serialise of every received chunk index.
     await updateTransfer(transferId, {
-      receivedChunks: Array.from(session.received).sort((a, b) => a - b),
+      receivedChunks: [],
+      receivedBitmap: session.received.buffer.slice(0),
       updatedAt: Date.now(),
     })
     session.lastRecordAt = performance.now()
@@ -442,9 +567,9 @@ export async function receiveChunk(
   // the receiver fires setState ~4000×/GB, drowning the main thread in React
   // re-renders. Always emit the final tick so the "received === total"
   // delivery hook in network.ts still runs.
-  const done = session.received.size === session.totalChunks
+  const done = session.receivedCount === session.totalChunks
   if (done || performance.now() - session.lastProgressAt >= TRANSFER_PROGRESS_INTERVAL_MS) {
-    callbacks?.onProgress?.(session.received.size, session.totalChunks)
+    callbacks?.onProgress?.(session.receivedCount, session.totalChunks)
     session.lastProgressAt = performance.now()
   }
 
@@ -491,15 +616,50 @@ export function cancelReceive(transferId: string) {
 export async function buildResumeRequest(transferId: string): Promise<ResumeRequest | null> {
   const record = await getTransfer(transferId)
   if (!record || record.status !== 'active') return null
-  const chunks = [...new Set([
-    ...record.receivedChunks,
-    ...await getSavedChunkIndexes(transferId),
-  ])].sort((a, b) => a - b)
-  return {
-    type: 'resume',
-    transferId,
-    receivedChunks: chunks,
+
+  // Merge the persisted record's bitmap with the actual chunks on disk —
+  // disk is the authoritative source if the record was flushed before
+  // the last write, and vice versa. OR-merge keeps both.
+  const merged = bitmapFromRecord(record)
+  const savedIndexes = await getSavedChunkIndexes(transferId)
+  for (const idx of savedIndexes) bitmapSet(merged, idx)
+
+  const popcount = bitmapPopcount(merged)
+  const req: ResumeRequest = { type: 'resume', transferId }
+  if (preferRangesOverIndexes(popcount)) {
+    // RLE: tiny on the wire (a few hundred bytes even for in-progress
+    // resumes of multi-thousand-chunk transfers).
+    req.receivedRanges = bitmapToRanges(merged, record.totalChunks)
+  } else {
+    // Small enough that a flat array is fine — and it's the legacy format
+    // older clients still parse.
+    const out: number[] = []
+    for (let i = 0; i < record.totalChunks; i++) {
+      if (bitmapHas(merged, i)) out.push(i)
+    }
+    req.receivedChunks = out
   }
+  return req
+}
+
+/**
+ * Decode a `ResumeRequest` from any peer (old or new) into a bitmap
+ * suitable for `sendFileParallel`'s `peerReceivedBitmap` argument. Old
+ * peers send `receivedChunks` only; new peers prefer `receivedRanges`
+ * but may include both. We tolerate both, and `totalChunks` bounds the
+ * decoded bitmap so a malformed peer can't trigger an over-allocation.
+ */
+export function decodeResumeRequest(
+  req: { receivedChunks?: number[]; receivedRanges?: Array<[number, number]> },
+  totalChunks: number,
+): Uint8Array {
+  if (req.receivedRanges && req.receivedRanges.length > 0) {
+    return rangesToBitmap(req.receivedRanges, totalChunks)
+  }
+  if (req.receivedChunks && req.receivedChunks.length > 0) {
+    return bitmapFromIndexes(req.receivedChunks, totalChunks)
+  }
+  return newBitmap(totalChunks)
 }
 
 // ── Flow control ─────────────────────────────────────────────────────

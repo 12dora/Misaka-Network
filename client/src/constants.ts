@@ -46,6 +46,15 @@ export const ENCRYPTION_TIMEOUT_MS = 30_000      // ECDH negotiation timeout
 // ── NAT detection ─────────────────────────────────────────────────────
 export const NAT_DETECTION_TIMEOUT_MS = 8_000
 
+// ── IDB fallback ceiling ───────────────────────────────────────────────
+// When neither File System Access nor OPFS is available (Firefox < 111 +
+// Android privacy modes), incoming files have to be assembled in memory
+// before they can be delivered as a Blob. Files larger than this would
+// either OOM the tab on low-end devices or stall the main thread for
+// many seconds — refuse the transfer upfront with a clear UX message
+// instead. (See `MAX_INMEMORY_BYTES` callsite in transfer.ts.)
+export const MAX_INMEMORY_RECEIVE_BYTES = 256 * 1024 * 1024  // 256 MB
+
 // ── Signaling / WebSocket ─────────────────────────────────────────────
 export const HEARTBEAT_INTERVAL_MS = 45_000
 export const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 16000]
