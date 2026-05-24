@@ -1,8 +1,17 @@
 // ── Runtime configuration ──────────────────────────────────────────
-// Priority: window.__MISAKA_CONFIG__ > Vite env vars > defaults
+// Priority (production): window.__MISAKA_CONFIG__ > runtime config.json >
+//                        Vite env > hard-coded project default
 //
-// On GitHub Pages, edit public/config.json to point to your server.
-// In local dev, use VITE_ env vars or the Vite proxy (defaults work).
+// The project default points at the official public signaling server
+// (https://misaka.konata.tv) so a fresh GitHub Pages deployment of the
+// repo works out of the box without anyone having to edit config.json.
+// Forks can still override via public/config.json or VITE_API_BASE.
+//
+// In local dev (`vite dev`), defaults are empty so the Vite proxy at
+// /api and /ws takes over — keeps the dev loop self-contained.
+
+const DEFAULT_API_BASE = 'https://misaka.konata.tv'
+const DEFAULT_WS_URL = 'wss://misaka.konata.tv/ws'
 
 interface AppConfig {
   API_BASE: string
@@ -17,6 +26,20 @@ declare global {
 }
 
 let _config: AppConfig | null = null
+
+function resolveApiBase(runtime: Partial<AppConfig>): string {
+  if (import.meta.env.DEV) {
+    return import.meta.env.VITE_API_BASE || runtime.API_BASE || ''
+  }
+  return runtime.API_BASE || import.meta.env.VITE_API_BASE || DEFAULT_API_BASE
+}
+
+function resolveWsUrl(runtime: Partial<AppConfig>): string {
+  if (import.meta.env.DEV) {
+    return import.meta.env.VITE_WS_URL || runtime.WS_URL || ''
+  }
+  return runtime.WS_URL || import.meta.env.VITE_WS_URL || DEFAULT_WS_URL
+}
 
 export async function loadConfig(): Promise<AppConfig> {
   // Already loaded
@@ -36,14 +59,8 @@ export async function loadConfig(): Promise<AppConfig> {
   const runtime = window.__MISAKA_CONFIG__ ?? {}
 
   _config = {
-    // In dev mode VITE_ env vars take precedence so the Vite proxy is used.
-    // In production, config.json (runtime) defines where the server lives.
-    API_BASE: import.meta.env.DEV
-      ? (import.meta.env.VITE_API_BASE || runtime.API_BASE || '')
-      : (runtime.API_BASE || import.meta.env.VITE_API_BASE || ''),
-    WS_URL: import.meta.env.DEV
-      ? (import.meta.env.VITE_WS_URL || runtime.WS_URL || '')
-      : (runtime.WS_URL || import.meta.env.VITE_WS_URL || ''),
+    API_BASE: resolveApiBase(runtime),
+    WS_URL: resolveWsUrl(runtime),
   }
 
   return _config
@@ -51,15 +68,11 @@ export async function loadConfig(): Promise<AppConfig> {
 
 export function getConfig(): AppConfig {
   if (!_config) {
-    // If loadConfig hasn't been called yet, use what's available synchronously
+    // If loadConfig hasn't been called yet, use what's available synchronously.
     const runtime = window.__MISAKA_CONFIG__ ?? {}
     return {
-      API_BASE: import.meta.env.DEV
-        ? (import.meta.env.VITE_API_BASE || runtime.API_BASE || '')
-        : (runtime.API_BASE || import.meta.env.VITE_API_BASE || ''),
-      WS_URL: import.meta.env.DEV
-        ? (import.meta.env.VITE_WS_URL || runtime.WS_URL || '')
-        : (runtime.WS_URL || import.meta.env.VITE_WS_URL || ''),
+      API_BASE: resolveApiBase(runtime),
+      WS_URL: resolveWsUrl(runtime),
     }
   }
   return _config

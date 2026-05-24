@@ -8,22 +8,27 @@ import { setWSS } from './activity.js'
 import { startCleanupTask, stopCleanupTask } from './cleanup.js'
 import { loadTurnState, startPersistFlusher, stopPersistFlusher, flushTurnState, loadPersistedLocks } from './persist.js'
 import { startTurnPollers, stopTurnPollers, startTurnRevokeRetry, stopTurnRevokeRetry } from './turn.js'
-import { allowedOrigins, isOriginAllowed, isOriginAllowedForRequest } from './origin.js'
+import { allowedOrigins, isOriginAllowed, isOriginAllowedForRequest, isWildcardOriginMode } from './origin.js'
 import { PORT, SHUTDOWN_TIMEOUT_MS } from './config.js'
 
 const app = express()
 
 app.set('trust proxy', 1)
 
-// Explicit CORS allow-list — replaces the previous `cors()` (which echoed
-// every Origin). With credentials enabled, `*` would be unsafe anyway.
-// Three accept conditions: no Origin (non-browser), Origin in ALLOWED_ORIGINS,
-// or same-origin request (Origin equals the request's own host — covers the
-// common single-domain deployment). Implemented as middleware (not the `cors`
-// option callback) because we need the full Request to compare against Host.
+// CORS policy:
+//   - ALLOWED_ORIGINS=* → wildcard mode (echo any Origin). Intended for the
+//     canonical public signaling deployment (GitHub Pages frontend + this
+//     server) where any fork's origin should work zero-config.
+//   - Otherwise → strict allowlist + same-origin auto-allow. Private
+//     deployments stay locked down.
+// Implemented as middleware (rather than the cors() callback) because we
+// need the full Request to compare Origin against Host for same-origin.
 app.use((req, res, next) => {
   const origin = req.headers.origin
   if (!origin) return cors({ origin: false, credentials: false })(req, res, next)
+  if (isWildcardOriginMode()) {
+    return cors({ origin, credentials: false })(req, res, next)
+  }
   const ok = allowedOrigins().includes(origin) || isOriginAllowedForRequest(req)
   return cors({ origin: ok ? origin : false, credentials: false })(req, res, next)
 })
