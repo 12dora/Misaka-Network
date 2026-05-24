@@ -5,6 +5,7 @@
 // that drives an RTCPeerConnection.
 
 import { DEFAULT_STUN, NAT_DETECTION_TIMEOUT_MS } from '@/constants'
+import { SUPPLEMENTAL_STUN } from './turn'
 import { classifyNat, parseCandidate, type NatDetectionResult, type NatType, type ParsedCandidate } from './nat-classify'
 
 export type { NatType, NatDetectionResult, ParsedCandidate } from './nat-classify'
@@ -28,8 +29,15 @@ export function setDetectedNatType(t: NatType) {
   if (lastNatType === t) return
   lastNatType = t
   for (const fn of natListeners) {
-    try { fn(t) } catch (err) { console.warn('[nat] listener failed', err) }
+    try { fn(t) } catch (err) { nlog('listener failed', err) }
   }
+}
+
+// P2-9: scoped + timestamped warn (mirrors webrtc.ts wlog without forcing
+// a cross-module import cycle).
+function nlog(...args: unknown[]) {
+  const ts = new Date().toISOString().slice(11, 23)
+  console.warn(`[nat ${ts}]`, ...args)
 }
 
 export function onNatTypeChange(fn: NatTypeListener): () => void {
@@ -37,8 +45,15 @@ export function onNatTypeChange(fn: NatTypeListener): () => void {
   return () => natListeners.delete(fn)
 }
 
+// P1-6: discard the cached verdict (e.g. on network change / unhide) so
+// the next detectNatType() re-probes from scratch. Goes through
+// setDetectedNatType so all subscribers see the reset.
+export function invalidateDetectedNatType() {
+  setDetectedNatType('unknown')
+}
+
 export async function detectNatType(
-  stunServers: RTCIceServer[] = DEFAULT_STUN,
+  stunServers: RTCIceServer[] = [...DEFAULT_STUN, ...SUPPLEMENTAL_STUN],
 ): Promise<NatDetectionResult> {
   if (typeof RTCPeerConnection === 'undefined') {
     return {

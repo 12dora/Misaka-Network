@@ -4,11 +4,20 @@ import {
   type TransferRecord,
 } from './db'
 import { encryptChunk, decryptChunk, makeChunkIv, randomIvPrefix } from './crypto'
-import {
+import * as constants from '@/constants'
+const {
   CHUNK_SIZE, HIGH_WATER_MARK, LOW_WATER_MARK,
   TRANSFER_PROGRESS_INTERVAL_MS, TRANSFER_RECORD_INTERVAL_MS,
   TRANSFER_LANE_COUNT, MAX_INMEMORY_RECEIVE_BYTES,
-} from '@/constants'
+} = constants
+// P1-5: sender-side upper bound on the file size we accept. The main
+// agent will publish `MAX_FILE_SIZE` from constants.ts; until then, fall
+// back to 16 GB so the guard still functions. The CHUNK_SIZE×uint32
+// index space allows roughly 1 PB but 16 GB matches the practical
+// receiver-side OPFS quota on most browsers and stays far away from
+// Number.MAX_SAFE_INTEGER (~9 PB) math edges.
+const MAX_FILE_SIZE: number =
+  (constants as { MAX_FILE_SIZE?: number }).MAX_FILE_SIZE ?? (16 * 1024 * 1024 * 1024)
 import {
   newBitmap, bitmapSet, bitmapHas, bitmapPopcount,
   bitmapFromIndexes, bitmapToRanges, rangesToBitmap,
@@ -158,6 +167,15 @@ export async function sendFileParallel(
   callbacks?: SendCallbacks,
   peerReceivedBitmap?: Uint8Array,
 ): Promise<void> {
+  // P1-5: refuse to start an over-cap transfer up-front. Without this
+  // guard, a multi-hundred-GB drop would either OOM the sender's
+  // file.slice() loop or run into the receiver's OPFS quota many GB in,
+  // both of which look like silent corruption from the user's seat. We
+  // throw a precise error the caller can surface as a toast.
+  if (file.size > MAX_FILE_SIZE) {
+    const gb = Math.round(MAX_FILE_SIZE / (1024 * 1024 * 1024))
+    throw new Error(`文件过大（>${gb}GB）`)
+  }
   const lanes = dcs.filter(dc => dc.readyState === 'open').slice(0, TRANSFER_LANE_COUNT)
   const activeLanes = lanes.length > 0 ? lanes : (dcs[0] ? [dcs[0]] : [])
   if (activeLanes.length === 0) throw new Error('No open DataChannel lane available')
@@ -213,8 +231,9 @@ export async function sendFileParallel(
   let nextChunk = 0
   let cancelled = false
   let lastProgressAt = performance.now()
-  let lastRecordAt = performance.now()
-  let recordDirty = false
+  // P2-13: `lastRecordAt` / `recordDirty` removed — sender-side
+  // flushRecord is now a no-op (the sender holds the source File in
+  // memory; there's no resume-from-IDB path on the send side).
 
   // Meta is always (re)sent so the receiver can register the new shortId for
   // this connection — cheap and avoids a separate "remap" message on resume.
@@ -240,29 +259,39 @@ export async function sendFileParallel(
 
   callbacks?.onProgress?.(sent, totalChunks)
 
-  function nextIndex(): number | null {
+  // P0-3: synchronous "take a chunk index" — the sole point at which
+  // `nextChunk` is mutated. JS is single-threaded so the read+increment
+  // is already atomic at the language level, but we also filter on
+  // `sentBitmap` so that the error-path rollback (`nextChunk = min(...)`
+  // in laneLoop) cannot hand the same index to a fresh lane after a
+  // healthy lane already shipped it. Without this, a dying lane that
+  // rolls nextChunk back to N would cause both N (re-tried) and any
+  // healthy-lane indexes between N and the previous high-water mark to
+  // be sent twice if they weren't yet marked in sentBitmap — possible
+  // when the healthy lane's send had completed but its bitmap update
+  // hadn't been reached yet.
+  function acquireChunk(): number | null {
     while (nextChunk < totalChunks) {
       const idx = nextChunk++
-      if (!bitmapHas(skipBitmap, idx)) return idx
+      if (bitmapHas(skipBitmap, idx)) continue
+      if (bitmapHas(sentBitmap, idx)) continue
+      return idx
     }
     return null
   }
+  // Kept the old name as an alias so the surrounding code reads
+  // unchanged; the new behaviour is the additional sentBitmap filter.
+  const nextIndex = acquireChunk
 
-  async function flushRecord(force = false) {
-    if (!recordDirty && !force) return
-    if (!force && performance.now() - lastRecordAt < TRANSFER_RECORD_INTERVAL_MS) return
-    // Persist the bitmap (fixed-size, O(totalChunks/8) bytes) instead of
-    // serialising every chunk index. IDB structured-clones the buffer at
-    // commit time so we keep our session's buffer pristine while the
-    // copy is on the IDB side.
-    record.receivedChunks = []
-    record.receivedBitmap = sentBitmap.buffer.slice(0)
-    await updateTransfer(transferId, {
-      receivedChunks: [],
-      receivedBitmap: record.receivedBitmap,
-    })
-    recordDirty = false
-    lastRecordAt = performance.now()
+  async function flushRecord(_force = false) {
+    // P2-13: sender-side flushRecord is a no-op. The sender already
+    // holds the source File reference in memory for the duration of
+    // sendFileParallel — there is no shutdown path that resumes from
+    // the IDB sentBitmap (a refresh drops the File and the user has to
+    // re-pick it). Persisting a sender-side bitmap every second was
+    // pure write amplification with zero recovery value. Kept the
+    // function signature so existing callsites compile unchanged.
+    return
   }
 
   // Pause/cancel check shared by the prefetcher and the send loop.
@@ -300,7 +329,11 @@ export async function sendFileParallel(
     const start = i * CHUNK_SIZE
     const end = Math.min(start + CHUNK_SIZE, file.size)
     const raw = await file.slice(start, end).arrayBuffer()
-    const { iv, encrypted } = await encryptChunk(raw, peerSessionId, makeChunkIv(ivPrefix, i))
+    // P1-9: domain-separate the IV with transferId so two transfers
+    // can never produce the same (key, IV) pair even if their random
+    // 8-byte prefixes happen to collide.
+    const ivForChunk = await makeChunkIv(ivPrefix, i, transferId)
+    const { iv, encrypted } = await encryptChunk(raw, peerSessionId, ivForChunk)
     return { i, iv, encrypted }
   }
 
@@ -346,11 +379,13 @@ export async function sendFileParallel(
       }
 
       if (bitmapSet(sentBitmap, current.i)) sent++
-      recordDirty = true
       if (shouldFlushProgress(lastProgressAt, sent, totalChunks)) {
         callbacks?.onProgress?.(sent, totalChunks)
         lastProgressAt = performance.now()
       }
+      // P2-13: flushRecord is a no-op now; kept the call so future
+      // resume-via-IDB plumbing can re-enable persistence with one
+      // function-body change.
       await flushRecord(sent === totalChunks)
 
       prepared = await upcoming
@@ -395,6 +430,14 @@ type ReceiveSession = {
   lastProgressAt: number   // throttle React store updates — 4000 setState/GB otherwise
   storageMode: 'pending' | 'stream' | 'indexeddb'
   direction: 'recv'
+  // P0-2: track every saveChunk promise we kick off so `cancelReceive`
+  // can drain them BEFORE deleteChunks runs. Without this, a slow IDB
+  // write that started just before cancel resolves AFTER deleteChunks
+  // and leaves an orphan chunk row that survives forever — a guaranteed
+  // quota blow-up across many cancellations. We track the promise itself
+  // (not a counter) so the drain can `await Promise.allSettled` rather
+  // than spin on a condition variable.
+  inflightSaves: Set<Promise<unknown>>
 }
 
 const receiveSessions = new Map<string, ReceiveSession>()
@@ -464,6 +507,7 @@ export async function handleMetaMessage(msg: MetaMessage, peerNodeId: number): P
     lastProgressAt: 0,
     storageMode: 'pending',
     direction: 'recv',
+    inflightSaves: new Set(),
   }
   receiveSessions.set(msg.transferId, session)
 
@@ -531,49 +575,90 @@ export async function receiveChunk(
   if (signal?.paused) return
   if (signal?.cancelled) return
 
-  // AES-GCM authenticates the encrypted payload — no separate per-chunk
-  // checksum is needed (and the sender no longer ships one).
-  const decrypted = await decryptChunk(iv, encrypted, peerSessionId)
-
-  const hasStreamingTarget = getWriteHandle(transferId) || getOPFSHandle(transferId)
-  if (session.storageMode === 'pending') {
-    session.storageMode = hasStreamingTarget ? 'stream' : 'indexeddb'
-  }
-  if (session.storageMode === 'indexeddb') {
-    await saveChunk(transferId, index, decrypted)
-  }
-
-  // bitmapSet returns true only on the 0→1 transition, so a duplicate
-  // chunk doesn't double-count toward receivedCount.
-  if (bitmapSet(session.received, index)) session.receivedCount++
-
-  if (
-    performance.now() - session.lastRecordAt >= TRANSFER_RECORD_INTERVAL_MS ||
-    session.receivedCount === session.totalChunks
-  ) {
-    // Slice into a fresh buffer so IDB's structured-clone copy and the
-    // session bitmap don't share underlying storage. Cost is one O(bytes)
-    // memcpy per TRANSFER_RECORD_INTERVAL_MS — orders of magnitude cheaper
-    // than the previous JSON serialise of every received chunk index.
-    await updateTransfer(transferId, {
-      receivedChunks: [],
-      receivedBitmap: session.received.buffer.slice(0),
-      updatedAt: Date.now(),
-    })
-    session.lastRecordAt = performance.now()
+  // P1-4: duplicate-chunk fast path. If we already have this index in
+  // the bitmap, the sender re-shipped it (typical during resume —
+  // sender's `peerReceivedBitmap` snapshot lags one progress flush) and
+  // we have nothing to do. Skip decrypt (AES-GCM is the hot CPU cost
+  // for any non-trivial transfer) and skip saveChunk (which would be a
+  // write-amplification storm against an already-stored row). The
+  // throttled progress callback can still fire so the UI sees a heartbeat.
+  if (bitmapHas(session.received, index)) {
+    return
   }
 
-  // Throttle progress callbacks the same way the sender does. Without this
-  // the receiver fires setState ~4000×/GB, drowning the main thread in React
-  // re-renders. Always emit the final tick so the "received === total"
-  // delivery hook in network.ts still runs.
-  const done = session.receivedCount === session.totalChunks
-  if (done || performance.now() - session.lastProgressAt >= TRANSFER_PROGRESS_INTERVAL_MS) {
-    callbacks?.onProgress?.(session.receivedCount, session.totalChunks)
-    session.lastProgressAt = performance.now()
-  }
+  // P0-2: track the WHOLE receive-and-persist operation so cancelReceive
+  // can drain in-flight work before deleteChunks. We register a tracking
+  // promise BEFORE the first await (decryptChunk) so a cancel issued
+  // immediately after dispatch still sees the operation. The operation
+  // resolves when (and only when) the save has fully landed; cancel can
+  // then run deleteChunks with confidence that no late write will follow.
+  let opResolve!: () => void
+  const opPromise = new Promise<void>(resolve => { opResolve = resolve })
+  session.inflightSaves.add(opPromise)
 
-  return { decrypted, storageMode: session.storageMode }
+  try {
+    // AES-GCM authenticates the encrypted payload — no separate per-chunk
+    // checksum is needed (and the sender no longer ships one).
+    const decrypted = await decryptChunk(iv, encrypted, peerSessionId)
+
+    const hasStreamingTarget = getWriteHandle(transferId) || getOPFSHandle(transferId)
+    if (session.storageMode === 'pending') {
+      session.storageMode = hasStreamingTarget ? 'stream' : 'indexeddb'
+    }
+    if (session.storageMode === 'indexeddb') {
+      try {
+        await saveChunk(transferId, index, decrypted)
+      } catch (err) {
+        // P1-6: normalize QuotaExceededError into a uniform error string
+        // so the UI surfaces one consistent message regardless of which
+        // storage path tripped the quota. Drop the in-memory session so
+        // subsequent chunks for this transfer no-op at the top guard.
+        if (isQuotaExceeded(err)) {
+          // Fire-and-forget cancel so we don't await it inside the hot
+          // path — the orphan-cleanup is best-effort here; whatever made
+          // it to disk gets reaped by the user's next cancel anyway.
+          cancelReceive(transferId).catch(() => {})
+          throw new StorageQuotaExceededError(err)
+        }
+        throw err
+      }
+    }
+
+    // bitmapSet returns true only on the 0→1 transition, so a duplicate
+    // chunk doesn't double-count toward receivedCount.
+    if (bitmapSet(session.received, index)) session.receivedCount++
+
+    if (
+      performance.now() - session.lastRecordAt >= TRANSFER_RECORD_INTERVAL_MS ||
+      session.receivedCount === session.totalChunks
+    ) {
+      // Slice into a fresh buffer so IDB's structured-clone copy and the
+      // session bitmap don't share underlying storage. Cost is one O(bytes)
+      // memcpy per TRANSFER_RECORD_INTERVAL_MS — orders of magnitude cheaper
+      // than the previous JSON serialise of every received chunk index.
+      await updateTransfer(transferId, {
+        receivedChunks: [],
+        receivedBitmap: session.received.buffer.slice(0),
+        updatedAt: Date.now(),
+      })
+      session.lastRecordAt = performance.now()
+    }
+
+    // Throttle progress callbacks the same way the sender does. Without this
+    // the receiver fires setState ~4000×/GB, drowning the main thread in React
+    // re-renders. Always emit the final tick so the "received === total"
+    // delivery hook in network.ts still runs.
+    const done = session.receivedCount === session.totalChunks
+    if (done || performance.now() - session.lastProgressAt >= TRANSFER_PROGRESS_INTERVAL_MS) {
+      callbacks?.onProgress?.(session.receivedCount, session.totalChunks)
+      session.lastProgressAt = performance.now()
+    }
+
+    return { decrypted, storageMode: session.storageMode }
+  } finally {
+    session.inflightSaves.delete(opPromise)
+    opResolve()
+  }
 }
 
 export async function assembleFile(transferId: string): Promise<File> {
@@ -602,13 +687,26 @@ export async function completeReceive(transferId: string): Promise<File> {
   return file
 }
 
-export function cancelReceive(transferId: string) {
+export function cancelReceive(transferId: string): Promise<void> {
+  const session = receiveSessions.get(transferId)
   receiveSessions.delete(transferId)
-  // Without this, cancelled IndexedDB-fallback transfers leak their partial
-  // chunks forever — multi-GB orphans accumulate across many cancellations
-  // and silently consume the user's storage quota.
-  deleteChunks(transferId).catch(() => {})
-  updateTransfer(transferId, { status: 'failed' })
+  // P0-2: drain any in-flight saveChunk promises BEFORE deleteChunks. A
+  // slow IDB write that started just before cancel would otherwise
+  // resolve AFTER deleteChunks and leave an orphan chunk row that
+  // survives the cleanup forever (quota blow-up across many cancels).
+  const pending = session?.inflightSaves ? Array.from(session.inflightSaves) : []
+  // Always return a promise so callers can `await cancelReceive(id)` if
+  // they need to sequence further IDB work. Existing callers that don't
+  // await the result remain correct: deleteChunks still runs, just
+  // sequenced after the in-flight saves it would otherwise race.
+  return Promise.allSettled(pending).then(() => {
+    // Without this, cancelled IndexedDB-fallback transfers leak their
+    // partial chunks forever.
+    return deleteChunks(transferId).catch(() => {})
+  }).then(() => {
+    // Best-effort status update — never blocks the cancel from completing.
+    return updateTransfer(transferId, { status: 'failed' }).catch(() => {})
+  })
 }
 
 // ── Resume ───────────────────────────────────────────────────────────
@@ -664,14 +762,22 @@ export function decodeResumeRequest(
 
 // ── Flow control ─────────────────────────────────────────────────────
 
+// P2-11: was a 200 ms setTimeout polling loop — woke the event loop
+// every 200 ms during long pauses and added up to 200 ms latency to
+// resume. Now: pause stores a `notifyResume` resolver on the signal;
+// `resumeTransfer` calls it directly. Zero polling, zero latency.
 function waitWhilePaused(transferId: string): Promise<void> {
-  return new Promise(resolve => {
-    const check = () => {
-      const s = transferSignals.get(transferId)
-      if (!s || !s.paused) resolve()
-      else setTimeout(check, 200)
+  const s = transferSignals.get(transferId)
+  if (!s || !s.paused) return Promise.resolve()
+  return new Promise<void>(resolve => {
+    // Chain any prior notifier so multiple awaiters all wake up. In
+    // practice there's only ever one waiter (the lane prep loop) but
+    // we don't bake that assumption into the signal shape.
+    const prior = s.notifyResume
+    s.notifyResume = () => {
+      prior?.()
+      resolve()
     }
-    check()
   })
 }
 
@@ -696,6 +802,11 @@ function waitForBuffer(dc: RTCDataChannel): Promise<void> {
 interface TransferSignal {
   paused: boolean
   cancelled: boolean
+  // P2-11: replaces the prior 200 ms polling loop in `waitWhilePaused`.
+  // Set when the lane parks itself; cleared+invoked from `resumeTransfer`
+  // and `cancelTransfer` to wake the waiter immediately. May be undefined
+  // when nobody is waiting.
+  notifyResume?: () => void
 }
 
 const transferSignals = new Map<string, TransferSignal>()
@@ -714,13 +825,23 @@ export function pauseTransfer(transferId: string) {
 }
 
 export function resumeTransfer(transferId: string) {
-  getSignal(transferId).paused = false
+  const s = getSignal(transferId)
+  s.paused = false
+  // P2-11: wake the pause-waiter immediately rather than waiting up to
+  // 200 ms for the next polling tick.
+  const notify = s.notifyResume
+  s.notifyResume = undefined
+  notify?.()
 }
 
 export function cancelTransfer(transferId: string) {
   const s = getSignal(transferId)
   s.cancelled = true
   s.paused = false // unblock any waiting
+  // P2-11: also fire the wake so any awaiter sees cancelled === true.
+  const notify = s.notifyResume
+  s.notifyResume = undefined
+  notify?.()
   transferSignals.delete(transferId)
 }
 
@@ -731,7 +852,10 @@ export function humanizeError(error: Error | string, channelType?: string): stri
     return '连接超时 — 请检查网络或稍后重试'
   }
   if (msg.includes('加密') || msg.includes('AES') || msg.includes('key')) return '加密协商失败，请重新连接后重试'
-  if (msg.includes('checksum')) return '数据校验失败，文件可能已损坏'
+  // P2-10: the `checksum` branch was dead code — we removed the
+  // pre-transfer whole-file SHA-256 some time ago (per-chunk AES-GCM
+  // auth tags do the integrity work end-to-end). No code path emits a
+  // 'checksum' error any more.
   if (msg.includes('DataChannel')) return '数据信道断开 — 尝试更换信道类型'
   return msg || '传输失败，请检查网络连接后重试'
 }
@@ -742,6 +866,33 @@ export function createTransferId(): string {
 
 export async function checkForResumableTransfers(): Promise<TransferRecord[]> {
   return getActiveTransfers()
+}
+
+// P1-6: detect QuotaExceededError across the three storage paths we
+// touch (IDB, OPFS, FSAccess). DOMException name is `QuotaExceededError`
+// in all modern browsers; older Safari sometimes uses code 22. Stringy
+// fallback covers the rare case where the underlying lib re-wraps with
+// `Error` (idb-on-error path, mocked DOMs).
+function isQuotaExceeded(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false
+  const e = err as { name?: string; code?: number; message?: string }
+  if (e.name === 'QuotaExceededError') return true
+  if (e.code === 22) return true
+  if (typeof e.message === 'string' && e.message.includes('QuotaExceeded')) return true
+  return false
+}
+
+// Uniform error class so receivers / UI can pattern-match without
+// regexing on message text. We tag the original error on `.cause`
+// manually because the 2-arg `Error(msg, { cause })` constructor needs
+// ES2022 and the project targets ES2020.
+class StorageQuotaExceededError extends Error {
+  cause?: unknown
+  constructor(cause: unknown) {
+    super('STORAGE_QUOTA_EXCEEDED')
+    this.name = 'StorageQuotaExceededError'
+    this.cause = cause
+  }
 }
 
 // ── Async write queue (fire-and-forget + backpressure) ────────────────
@@ -793,7 +944,11 @@ class WriteQueue {
 export interface OPFSReceiveHandle {
   writable: FileSystemWritableFileStream
   fileHandle: FileSystemFileHandle
-  written: Set<number>
+  // P1-7: was `Set<number>` (~50 B per chunk → ~800 MB for a 1 TB
+  // transfer). Now a fixed-size bitmap sized at handle creation. We keep
+  // the field name `written` to minimise call-site churn; helpers
+  // `bitmapSet` / `bitmapHas` handle the bit math.
+  written: Uint8Array<ArrayBuffer>
   totalChunks: number
   fileName: string
   queue: WriteQueue
@@ -818,13 +973,29 @@ export async function createOPFSReceiveFile(
   // sender which chunk indexes are still missing; sparse writes here fill
   // exactly those.
   const writable = await fileHandle.createWritable({ keepExistingData: true })
-  const handle: OPFSReceiveHandle = { writable, fileHandle, written: new Set(), totalChunks, fileName, queue: new WriteQueue() }
+  const handle: OPFSReceiveHandle = {
+    writable,
+    fileHandle,
+    written: newBitmap(totalChunks),
+    totalChunks,
+    fileName,
+    queue: new WriteQueue(),
+  }
   opfsHandles.set(transferId, handle)
   return handle
 }
 
 export function getOPFSHandle(transferId: string): OPFSReceiveHandle | undefined {
   return opfsHandles.get(transferId)
+}
+
+/** Popcount over the OPFS handle's `written` bitmap. Use this in place of
+ *  `opfsHandle.written.size` after the bitmap migration (P1-7); the field
+ *  is now a Uint8Array, not a Set. Returns 0 when the handle isn't known. */
+export function opfsWrittenCount(transferId: string): number {
+  const handle = opfsHandles.get(transferId)
+  if (!handle) return 0
+  return bitmapPopcount(handle.written)
 }
 
 export async function writeChunkToOPFS(
@@ -835,12 +1006,20 @@ export async function writeChunkToOPFS(
   const handle = opfsHandles.get(transferId)
   if (!handle) return
   const offset = index * CHUNK_SIZE
-  handle.written.add(index)
-  const wait = handle.queue.enqueue(
-    handle.writable.write({ type: 'write', position: offset, data: new Uint8Array(data) }),
-    data.byteLength,
-  )
+  bitmapSet(handle.written, index)
+  // P1-6: kick off the write with a quota-normalising wrapper so callers
+  // see one error string regardless of which storage backend ran out.
+  const writePromise = handle.writable.write({ type: 'write', position: offset, data: new Uint8Array(data) })
+  const tagged = writePromise.catch((err: unknown) => {
+    if (isQuotaExceeded(err)) throw new StorageQuotaExceededError(err)
+    throw err
+  })
+  const wait = handle.queue.enqueue(tagged, data.byteLength)
+  // Always await the tagged write so a synchronous quota error reaches
+  // the caller instead of being swallowed by the WriteQueue's logging
+  // catch. The backpressure await (`wait`) still applies when set.
   if (wait) await wait
+  await tagged
 }
 
 export async function getOPFSFile(transferId: string): Promise<File> {
@@ -855,6 +1034,7 @@ export async function getOPFSFile(transferId: string): Promise<File> {
 
 export async function cleanupOPFS(transferId: string) {
   const handle = opfsHandles.get(transferId)
+  const fileName = handle?.fileName
   if (handle) {
     // Drain queued writes BEFORE closing — otherwise pending write promises
     // reject with "stream closed" and the OPFS directory entry can briefly
@@ -863,15 +1043,17 @@ export async function cleanupOPFS(transferId: string) {
     await handle.writable.close().catch(() => {})
     opfsHandles.delete(transferId)
   }
+  // P1-8: only remove the EXACT entry this transfer owns. Previously we
+  // walked the directory and matched `name.startsWith(transferId)`,
+  // which could wipe unrelated files when one transferId was a prefix
+  // of another (UUID collisions, or any two IDs that happened to share
+  // a prefix). With the in-memory handle we already know the file name;
+  // use it directly.
+  if (!fileName) return
   try {
     const root = await navigator.storage.getDirectory()
     const dir = await root.getDirectoryHandle('misaka-transfers', { create: false })
-    // Find and remove the OPFS file for this transfer
-    for await (const [name] of dir as any) {
-      if (name.startsWith(transferId)) {
-        await dir.removeEntry(name).catch(() => {})
-      }
-    }
+    await dir.removeEntry(`${transferId}-${fileName}`).catch(() => {})
   } catch { /* directory may not exist */ }
 }
 
@@ -921,11 +1103,15 @@ export async function streamChunkToDisk(
   if (!handle) return
   const offset = index * CHUNK_SIZE
   handle.written.add(index)
-  const wait = handle.queue.enqueue(
-    handle.writable.write({ type: 'write', position: offset, data: new Uint8Array(data) }),
-    data.byteLength,
-  )
+  // P1-6: same quota-normalising pattern as writeChunkToOPFS.
+  const writePromise = handle.writable.write({ type: 'write', position: offset, data: new Uint8Array(data) })
+  const tagged = writePromise.catch((err: unknown) => {
+    if (isQuotaExceeded(err)) throw new StorageQuotaExceededError(err)
+    throw err
+  })
+  const wait = handle.queue.enqueue(tagged, data.byteLength)
   if (wait) await wait
+  await tagged
 }
 
 export async function finalizeStreamedFile(transferId: string): Promise<File> {
@@ -945,4 +1131,95 @@ export function cancelStreamWrite(transferId: string) {
     handle.writable.close().catch(() => {})
     writeHandles.delete(transferId)
   }
+}
+
+// ── Receive storage selection (3-tier fallback) ───────────────────────
+// One entry point the store calls right after handleMetaMessage to pick
+// the best disk-backed write target for an incoming transfer. Order:
+//
+//   1. File System Access (showSaveFilePicker) — Chromium desktop, Edge.
+//      Requires a user gesture; the caller is responsible for invoking
+//      this from within the click handler that accepts the file. User
+//      cancellation (AbortError / NotAllowedError) silently falls through.
+//
+//   2. OPFS — modern Chrome/Edge/Firefox 111+/Safari 15.2+. Origin-
+//      private, no picker. iOS Safari <17 exposes the directory handle
+//      but `createWritable()` throws NotAllowedError — probe it once so
+//      we don't strand the receiver against an unwritable handle.
+//
+//   3. IndexedDB chunk store (`saveChunk`). Always available; we keep
+//      whole-file Blob assembly bounded by `checkMetaOOMGuard` upstream.
+//
+// Returning `mode` only; the caller (network.ts) sets the matching
+// `storageMode` on the Transfer card and the receive session already
+// picks its write path via `getWriteHandle` / `getOPFSHandle` lookups in
+// `receiveChunk`.
+export interface PrepareReceiveStorageResult {
+  mode: 'fsa' | 'opfs' | 'idb'
+}
+
+export async function prepareReceiveStorage(meta: {
+  transferId: string
+  fileName: string
+  totalChunks: number
+  size: number
+}): Promise<PrepareReceiveStorageResult> {
+  // Tier 1: File System Access.
+  if (supportsFileSystemAccess()) {
+    try {
+      await requestWriteHandle(meta.transferId, meta.fileName, meta.totalChunks)
+      return { mode: 'fsa' }
+    } catch (err) {
+      // AbortError = user cancelled; NotAllowedError = no gesture / blocked.
+      // Either way fall through to the next tier rather than failing the
+      // entire transfer.
+      const name = (err as { name?: string })?.name
+      if (name && name !== 'AbortError' && name !== 'NotAllowedError') {
+        console.warn('[transfer] FSA save picker failed', err)
+      }
+    }
+  }
+
+  // Tier 2: OPFS — probe `createWritable` against a throwaway handle so
+  // we don't promise an OPFS receive path on iOS Safari <17 where
+  // getDirectory works but writes are forbidden.
+  if (supportsOPFS()) {
+    try {
+      const root = await navigator.storage.getDirectory()
+      const dir = await root.getDirectoryHandle('misaka-transfers', { create: true })
+      const probeName = `${meta.transferId}-${meta.fileName}`
+      const fileHandle = await dir.getFileHandle(probeName, { create: true })
+      // Probe write capability. If `createWritable` throws (iOS Safari
+      // <17, some PWAs in restricted modes), treat OPFS as unavailable.
+      const writable = await fileHandle.createWritable({ keepExistingData: true })
+      // Reuse the same handle for the real receive path so we don't pay
+      // a second `createWritable` (some browsers serialize all writes to
+      // a single open writable per file).
+      const handle: OPFSReceiveHandle = {
+        writable,
+        fileHandle,
+        written: newBitmap(meta.totalChunks),
+        totalChunks: meta.totalChunks,
+        fileName: meta.fileName,
+        queue: new WriteQueue(),
+      }
+      opfsHandles.set(meta.transferId, handle)
+      return { mode: 'opfs' }
+    } catch (err) {
+      // Clean up any partial OPFS state (the probe file may have been
+      // created even though createWritable failed).
+      try {
+        const root = await navigator.storage.getDirectory()
+        const dir = await root.getDirectoryHandle('misaka-transfers', { create: false })
+        await dir.removeEntry(`${meta.transferId}-${meta.fileName}`).catch(() => {})
+      } catch { /* ignored */ }
+      const name = (err as { name?: string })?.name
+      if (name !== 'NotAllowedError') {
+        console.warn('[transfer] OPFS probe failed, falling back to IDB', err)
+      }
+    }
+  }
+
+  // Tier 3: IndexedDB.
+  return { mode: 'idb' }
 }

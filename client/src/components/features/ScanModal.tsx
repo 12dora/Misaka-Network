@@ -218,11 +218,22 @@ export default function ScanModal({ onClose }: Props) {
     }
   }
 
-  // When QR detected, navigate
+  // When QR detected, navigate. P1-7: openDetectedUrl returns false for
+  // arbitrary QR codes (a Wi-Fi QR, a non-misaka URL, etc.). Previously
+  // that branch silently no-op'd while the modal stayed open with the
+  // "✓ 已识别" overlay — the user assumed the app was hung. Clear the
+  // detected state, close the modal, and surface a brief toast hint.
   useEffect(() => {
-    if (detected) {
-      stopCamera()
-      openDetectedUrl(detected)
+    if (!detected) return
+    stopCamera()
+    const ok = openDetectedUrl(detected)
+    if (!ok) {
+      setDetected(null)
+      // Use the manualError slot to surface the message inline before
+      // closing — without this the modal disappears with no explanation.
+      setManualError('非御坂网络的 QR 码，已忽略')
+      // Brief delay so the message is visible, then dismiss the modal.
+      setTimeout(() => modal.requestClose(), 1500)
     }
   }, [detected])
 

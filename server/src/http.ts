@@ -1,11 +1,17 @@
 import { Router, type Request, type Response, type NextFunction } from 'express'
-import { createHash, randomBytes } from 'crypto'
+import { randomBytes } from 'crypto'
 import { nanoid } from 'nanoid'
 import { z } from 'zod'
-import { nodes, channels, qrTokens, reports, stats, getOnlineCount, getLongestUptimeMs, countNodesByIp, getCpuUsagePercent, findSessionByToken, attemptLocks, attemptKey } from './store.js'
+import {
+  nodes, channels, qrTokens, reports, stats, getOnlineCount, getLongestUptimeMs, countNodesByIp,
+  getCpuUsagePercent, findSessionByToken, attemptLocks, attemptKey,
+  nodeFreezes, hashPassCodeIdentity, newPassCodeRecord, verifyAndMaybeUpgrade,
+  deriveCustomIdentifier, redactCustomIdentifier,
+} from './store.js'
 import { broadcast } from './activity.js'
 import { checkRateLimit } from './ratelimit.js'
 import { issueCredentials, getTurnStatus } from './turn.js'
+import { isHttpOriginAllowed, getRequestOrigin } from './origin.js'
 import type { NodeSession, QrTokenRecord, ReportRecord } from './types.js'
 import {
   MAX_NODES, MAX_NODES_PER_IP, NODE_ID_MIN, NODE_ID_MAX,
@@ -13,16 +19,34 @@ import {
   SESSION_TTL_MS, QR_TOKEN_TTL_MS,
   RATE_LIMIT_PER_MIN, RATE_WINDOW_MS,
   REPORT_RATE_MAX, REPORT_RATE_WINDOW_MS, REPORT_WARN_COUNT, REPORT_WARN_WINDOW_MS,
+  NODE_FREEZE_THRESHOLD, NODE_FREEZE_WINDOW_MS, NODE_FREEZE_DURATION_MS,
+  QR_REDEEM_RATE_LIMIT, QR_REDEEM_RATE_WINDOW_MS,
 } from './config.js'
 
 export const router = Router()
 
-function hashPassCode(code: string) {
-  return createHash('sha256').update(code).digest('hex')
+// Re-export so legacy import sites keep working without touching the new
+// derivation location (which lives in store.js to avoid a circular import
+// between turn.ts and http.ts).
+export { deriveCustomIdentifier, redactCustomIdentifier }
+
+// Canonical client-IP extractor used by every HTTP handler. Express'
+// `req.ip` already honours `app.set('trust proxy', 1)`, so X-Forwarded-For's
+// first hop becomes req.ip in test scripts that pass that header. Falling
+// back to the socket address keeps unit tests that bypass the proxy chain
+// (and any non-proxied prod request) from getting an "unknown" IP.
+export function getClientIP(req: Request): string {
+  return req.ip ?? req.socket.remoteAddress ?? 'unknown'
 }
 
-function getClientIP(req: Request): string {
-  return req.ip ?? req.socket.remoteAddress ?? 'unknown'
+// Shared origin guard for CSRF-sensitive routes. We refuse if the request
+// arrived with an Origin header that isn't on the allow-list. Missing
+// Origin (server-to-server / native client / curl) keeps falling through
+// to whatever token auth the route already requires.
+function enforceOrigin(req: Request, res: Response): boolean {
+  if (isHttpOriginAllowed(req)) return true
+  res.status(403).json({ error: 'BAD_ORIGIN', origin: getRequestOrigin(req) ?? null })
+  return false
 }
 
 // Rate limit middleware
@@ -35,8 +59,66 @@ router.use((req: Request, res: Response, next: NextFunction) => {
   next()
 })
 
+// ── nodeId-freeze helpers (P1-5) ─────────────────────────────────────
+function pruneFreezeFailures(freeze: { recentFailures: Array<{ at: number; ip: string }> }, now: number) {
+  const cutoff = now - NODE_FREEZE_WINDOW_MS
+  if (freeze.recentFailures.length === 0) return
+  // Keep entries newer than cutoff. Most freezes hold a handful of entries
+  // so a single pass is fine; only when we reach the threshold (default 20)
+  // do we even allocate.
+  freeze.recentFailures = freeze.recentFailures.filter(r => r.at >= cutoff)
+}
+
+function isNodeFrozen(nodeId: number, now: number): { frozen: true; until: number } | { frozen: false } {
+  const freeze = nodeFreezes.get(nodeId)
+  if (!freeze) return { frozen: false }
+  if (freeze.frozenUntil > now) return { frozen: true, until: freeze.frozenUntil }
+  // Expired freeze — clear and let the caller proceed normally.
+  if (freeze.frozenUntil > 0) {
+    freeze.frozenUntil = 0
+    freeze.recentFailures = []
+  }
+  return { frozen: false }
+}
+
+function recordFailedPasscodeAttempt(nodeId: number, ip: string, now: number) {
+  let freeze = nodeFreezes.get(nodeId)
+  if (!freeze) {
+    freeze = { recentFailures: [], frozenUntil: 0 }
+    nodeFreezes.set(nodeId, freeze)
+  }
+  pruneFreezeFailures(freeze, now)
+  freeze.recentFailures.push({ at: now, ip })
+  // Trigger condition: total failures from N distinct IPs in window OR raw
+  // failure count >= threshold. We treat the latter as the dominant signal
+  // because a single noisy attacker rotating proxies still funnels through
+  // shared egress IPs sometimes.
+  if (freeze.recentFailures.length >= NODE_FREEZE_THRESHOLD) {
+    freeze.frozenUntil = now + NODE_FREEZE_DURATION_MS
+  }
+}
+
+function clearNodeFreezeOnSuccess(nodeId: number) {
+  // Owner just succeeded — drop the freeze counter (but not an active
+  // freeze, which they cannot dismiss by themselves; that requires the
+  // duration to elapse). This avoids a freeze caused by past noise from
+  // unrelated attempters persisting forever in memory.
+  const freeze = nodeFreezes.get(nodeId)
+  if (!freeze) return
+  if (freeze.frozenUntil === 0) {
+    nodeFreezes.delete(nodeId)
+  } else {
+    // Active freeze — keep the timer running but stop bleeding the counter
+    // upward. The owner getting in (impossible during a freeze for new
+    // registers; only their existing session would still be authenticated)
+    // is logged but doesn't unfreeze.
+  }
+}
+
 // POST /api/register
 router.post('/register', (req, res) => {
+  if (!enforceOrigin(req, res)) return
+
   const parsed = z.object({
     nodeId:   z.number().int().min(NODE_ID_MIN).max(NODE_ID_MAX),
     passCode: z.string().length(6).regex(/^\d{6}$/),
@@ -50,7 +132,17 @@ router.post('/register', (req, res) => {
   const { nodeId, passCode } = parsed.data
   const ip = getClientIP(req)
   const now = Date.now()
-  const passCodeHash = hashPassCode(passCode)
+  const identityHash = hashPassCodeIdentity(passCode)
+
+  // Per-nodeId global freeze (P1-5). Refuses *every* register from any IP
+  // while the freeze is active — even the owner from a new IP. The owner's
+  // already-open WS session continues working (this only gates new
+  // registrations).
+  const frozen = isNodeFrozen(nodeId, now)
+  if (frozen.frozen) {
+    res.status(423).json({ error: 'NODE_LOCKED', reason: 'NODE_FROZEN', unlockAt: frozen.until })
+    return
+  }
 
   // Brute-force lock (Bug F7): the lock follows the *attempter*, not the
   // owner. Key = (ip, nodeId). If the attempter is currently locked we
@@ -70,28 +162,29 @@ router.post('/register', (req, res) => {
     lock = undefined
   }
 
-  // Identity = (nodeId, passCodeHash). Reject if any session already exists
-  // with the same nodeId but a different passcode — that nodeId is "owned" by
-  // someone else. Otherwise we permit a brand-new session for this identity:
-  // multiple devices may share the same identity (phone + PC1 + PC2) and the
-  // cluster channel relies on that.
+  // Identity = (nodeId, identityHash). Reject if any session already exists
+  // with the same nodeId but a different identity hash — that nodeId is
+  // "owned" by someone else. Otherwise we permit a brand-new session for
+  // this identity: multiple devices may share the same identity
+  // (phone + PC1 + PC2) and the cluster channel relies on that.
   const sameNodeSessions: NodeSession[] = []
   for (const s of nodes.values()) {
     if (s.nodeId === nodeId) sameNodeSessions.push(s)
   }
-  const conflict = sameNodeSessions.find(s => s.passCodeHash !== passCodeHash)
+  const conflict = sameNodeSessions.find(s => s.passCodeHash !== identityHash)
   if (conflict) {
-    // Failure attributed to (ip, nodeId), NOT to the owner session. The
-    // owner's NodeSession.failedAttempts / lockedUntil are now legacy and
-    // remain zero in normal operation — they are kept on the type only so
-    // that persisted state from older builds can be loaded without
-    // crashing. Brute-force semantics live entirely in `attemptLocks`.
+    // Failure attributed to (ip, nodeId), NOT to the owner session.
     if (!lock) {
       lock = { attempts: 0, lockedUntil: 0, lastAttemptAt: now }
       attemptLocks.set(lockKey, lock)
     }
     lock.attempts++
     lock.lastAttemptAt = now
+
+    // Also feed the per-nodeId global counter so IP-rotation attacks get
+    // caught even though each IP individually never reaches MAX_ATTEMPTS.
+    recordFailedPasscodeAttempt(nodeId, ip, now)
+
     if (lock.attempts >= MAX_ATTEMPTS) {
       lock.lockedUntil = now + LOCK_DURATION_MS
       res.status(423).json({ error: 'NODE_LOCKED', reason: 'WRONG_PASSCODE', unlockAt: lock.lockedUntil })
@@ -113,10 +206,11 @@ router.post('/register', (req, res) => {
 
   const sessionId = nanoid(16)
   const token = randomBytes(32).toString('hex')
+  const pcRecord = newPassCodeRecord(passCode)
   const session: NodeSession = {
     sessionId,
     nodeId,
-    passCodeHash,
+    passCodeHash: pcRecord.passCodeHash,
     token,
     socket: null,
     lastSeen: now,
@@ -127,13 +221,25 @@ router.post('/register', (req, res) => {
     joinedAt: now,
     ip,
   }
+  // Attach scrypt verification fields. These may not exist on the
+  // NodeSession type yet — the main agent will add them — so we use a
+  // cast for the per-field assignment until the type is updated.
+  const sessAny = session as NodeSession & {
+    passCodeVerifyHash?: string
+    passCodeSalt?: string
+    passCodeAlgo?: 'sha256' | 'scrypt'
+  }
+  sessAny.passCodeVerifyHash = pcRecord.passCodeVerifyHash
+  sessAny.passCodeSalt = pcRecord.passCodeSalt
+  sessAny.passCodeAlgo = pcRecord.passCodeAlgo
+
   nodes.set(sessionId, session)
 
   // A successful register from this (ip, nodeId) means the caller knows the
   // right passcode, so clear any prior lockout we'd been tracking against
-  // this attempter. Without this, a user who typed wrong once and right the
-  // second time would still see a lingering counter on their next try.
+  // this attempter.
   attemptLocks.delete(lockKey)
+  clearNodeFreezeOnSuccess(nodeId)
 
   broadcast({ type: 'join', nodeId, message: `御坂 ${nodeId} 号已接入网络` })
 
@@ -141,39 +247,15 @@ router.post('/register', (req, res) => {
 })
 
 // POST /api/release-by-ip
-// Releases the caller's stale sessions from the caller's IP. Used by the
-// client when the IP node limit is hit so the user can wipe stale sessions
-// (typical for local dev with multiple browsers) and try again.
-//
-// Security (F6): this endpoint MUST require a valid Bearer token. Without
-// auth, any anonymous attacker on a shared egress IP (CGNAT, corporate NAT,
-// dorm WiFi) could wipe every other Misaka user behind that same IP. We
-// authenticate the caller, then only release sessions that belong to the
-// SAME identity (same token == same registration). Other users on the same
-// IP are untouched.
 router.post('/release-by-ip', (req, res) => {
+  if (!enforceOrigin(req, res)) return
+
   const authHeader = req.headers.authorization
   const ip = getClientIP(req)
   const now = Date.now()
 
-  // Test escape hatch: when the server is launched with
-  // E2E_ALLOW_UNAUTH_RELEASE_BY_IP=1, allow anonymous calls to wipe every
-  // session on the caller's IP. The e2e suite uses this in beforeEach to
-  // prevent cross-test pollution. Production never sets this.
   const testBypass = process.env.E2E_ALLOW_UNAUTH_RELEASE_BY_IP === '1'
 
-  // Two acceptable identity proofs:
-  //   (a) Bearer <token>  — caller has an existing session.
-  //   (b) Body { nodeId, passCode } — caller has no session yet because the
-  //       IP cap blocked their initial register; they re-prove the identity
-  //       they want to free up. This is the production-realistic path
-  //       triggered by the "释放并重试" button on the IP_LIMITED prompt.
-  //
-  // Path (b) is rate-limited via the existing attemptLocks bucket: if the
-  // (ip, nodeId) is currently locked from prior wrong attempts at /register,
-  // we refuse here too — otherwise this endpoint would be a parallel
-  // passcode-guessing oracle. A wrong passcode here also increments the
-  // same lock so the two surfaces share a budget.
   let scopeNodeId: number | null = null
   let scopePassHash: string | null = null
 
@@ -192,6 +274,14 @@ router.post('/release-by-ip', (req, res) => {
     }).safeParse(req.body)
     if (!parsed.success) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
 
+    // Per-nodeId freeze applies here too — otherwise this endpoint would
+    // be a parallel verification oracle.
+    const frozen = isNodeFrozen(parsed.data.nodeId, now)
+    if (frozen.frozen) {
+      res.status(423).json({ error: 'NODE_LOCKED', reason: 'NODE_FROZEN', unlockAt: frozen.until })
+      return
+    }
+
     const lockKey = attemptKey(ip, parsed.data.nodeId)
     let lock = attemptLocks.get(lockKey)
     if (lock && now < lock.lockedUntil) {
@@ -203,17 +293,21 @@ router.post('/release-by-ip', (req, res) => {
       lock = undefined
     }
 
-    const passHash = hashPassCode(parsed.data.passCode)
-    // Find at least one matching session on this IP. If none, treat it
-    // exactly like a wrong-passcode attempt against /register — bump the
-    // shared brute-force counter and return 401 without revealing whether
-    // the nodeId exists at all.
-    let matched = false
+    const identity = hashPassCodeIdentity(parsed.data.passCode)
+    // Find at least one matching session on this IP. We verify *both* the
+    // identity hash (cheap pre-filter) AND the per-session scrypt hash via
+    // verifyAndMaybeUpgrade (real authentication). Without the scrypt
+    // step this would still be a brute-force oracle against scrypt's
+    // protection.
+    let matched: NodeSession | null = null
     for (const s of nodes.values()) {
       if (s.ip !== ip) continue
       if (s.nodeId !== parsed.data.nodeId) continue
-      if (s.passCodeHash !== passHash) continue
-      matched = true
+      if (s.passCodeHash !== identity) continue
+      const { ok, upgrade } = verifyAndMaybeUpgrade(parsed.data.passCode, s as NodeSession & { passCodeVerifyHash?: string; passCodeSalt?: string; passCodeAlgo?: 'sha256' | 'scrypt' })
+      if (!ok) continue
+      if (upgrade) Object.assign(s, upgrade)
+      matched = s
       break
     }
     if (!matched) {
@@ -226,21 +320,19 @@ router.post('/release-by-ip', (req, res) => {
       if (lock.attempts >= MAX_ATTEMPTS) {
         lock.lockedUntil = now + LOCK_DURATION_MS
       }
+      recordFailedPasscodeAttempt(parsed.data.nodeId, ip, now)
       res.status(401).json({ error: 'UNAUTHORIZED' })
       return
     }
     scopeNodeId = parsed.data.nodeId
-    scopePassHash = passHash
-    // Clear any stale brute-force counter — caller proved the passcode.
+    scopePassHash = identity
     attemptLocks.delete(lockKey)
+    clearNodeFreezeOnSuccess(parsed.data.nodeId)
   }
 
   let released = 0
   for (const [sessionId, session] of nodes) {
     if (session.ip !== ip) continue
-    // Authenticated scopes: only release sessions belonging to the same
-    // identity (same nodeId + passCodeHash). Test-bypass with no scope
-    // releases everything on the IP.
     if (scopeNodeId !== null && (session.nodeId !== scopeNodeId || session.passCodeHash !== scopePassHash)) continue
     if (session.socket) {
       try { session.socket.close() } catch { /* ignore */ }
@@ -292,10 +384,6 @@ router.get('/stats', (_req, res) => {
 })
 
 // GET /api/turn-credentials
-// Auth: Bearer <session token>. Returns short-lived TURN credentials issued
-// by Cloudflare and tagged with customIdentifier=`misaka-${sessionId}`.
-// All enforcement (per-IP rate / global kill switch) lives in
-// turn.issueCredentials — clients are pure consumers.
 router.get('/turn-credentials', async (req, res) => {
   const authHeader = req.headers.authorization
   if (!authHeader?.startsWith('Bearer ')) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
@@ -305,7 +393,6 @@ router.get('/turn-credentials', async (req, res) => {
 
   const result = await issueCredentials(session.sessionId, session.ip)
   if (!result.ok) {
-    // Map abuse reasons to HTTP status; client should fall back to no auto TURN.
     const status = result.reason === 'DISABLED' || result.reason === 'NOT_CONFIGURED' ? 503
       : result.reason === 'GLOBAL_QUOTA_EXCEEDED' ? 503
       : result.reason === 'IP_RATE_LIMITED' || result.reason === 'IP_BYTES_LIMITED' ? 429
@@ -318,7 +405,9 @@ router.get('/turn-credentials', async (req, res) => {
     enabled: true,
     iceServers: result.iceServers,
     expiresAt: result.expiresAt,
-    // customIdentifier is intentionally not returned — it embeds sessionId.
+    // customIdentifier is intentionally not returned — it's an internal
+    // CF correlation id and is now a sha256-based derivation that should
+    // not leave the server.
   })
 })
 
@@ -363,16 +452,29 @@ router.get('/qr-token', (req, res) => {
   const ownerSession = findSessionByToken(token)
   if (!ownerSession) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
 
+  // passCode (if supplied) MUST match the canonical 6-digit shape — same
+  // rule as /register. The previous code accepted any string here, so the
+  // matching qr-redeem check could never trip on the format.
+  const passCodeRaw = req.query.passCode
+  let passCode: string | undefined
+  if (typeof passCodeRaw === 'string' && passCodeRaw.length > 0) {
+    const parsed = z.string().regex(/^\d{6}$/).safeParse(passCodeRaw)
+    if (!parsed.success) {
+      res.status(400).json({ error: 'INVALID_INPUT', message: 'passCode 必须是 6 位数字' })
+      return
+    }
+    passCode = parsed.data
+  }
+
   const qrToken = nanoid(32)
   const channelId = nanoid(8)
   const expiresAt = Date.now() + QR_TOKEN_TTL_MS
-  const passCode = req.query.passCode as string | undefined
   const record: QrTokenRecord = {
     token: qrToken,
     ownerNodeId: ownerSession.nodeId,
     type: 'node',
     channelId,
-    passCodeHash: passCode ? hashPassCode(passCode) : undefined,
+    passCodeHash: passCode ? hashPassCodeIdentity(passCode) : undefined,
     createdAt: Date.now(),
     expiresAt,
     used: false,
@@ -383,10 +485,22 @@ router.get('/qr-token', (req, res) => {
 
 // POST /api/qr-redeem
 router.post('/qr-redeem', (req, res) => {
+  if (!enforceOrigin(req, res)) return
+
+  // Dedicated tighter rate limit on this endpoint — it accepts a 6-digit
+  // passcode and was previously only bounded by the (looser) global API
+  // limiter. 10 req/min/IP is plenty for legitimate use and turns the
+  // worst case into a 1-in-100k brute-force from any single IP per day.
+  const ip = getClientIP(req)
+  if (!checkRateLimit(`qr-redeem:${ip}`, QR_REDEEM_RATE_LIMIT, QR_REDEEM_RATE_WINDOW_MS)) {
+    res.status(429).json({ error: 'RATE_LIMITED', message: 'QR 兑换请求过于频繁，请稍后再试' })
+    return
+  }
+
   const parsed = z.object({
     qrToken:    z.string(),
     myNodeId:   z.number().int().min(NODE_ID_MIN).max(NODE_ID_MAX),
-    myPassCode: z.string().length(6),
+    myPassCode: z.string().regex(/^\d{6}$/),
   }).safeParse(req.body)
 
   if (!parsed.success) { res.status(400).json({ error: 'INVALID_INPUT' }); return }
@@ -398,7 +512,7 @@ router.post('/qr-redeem', (req, res) => {
   }
 
   if (record.passCodeHash) {
-    if (hashPassCode(parsed.data.myPassCode) !== record.passCodeHash) {
+    if (hashPassCodeIdentity(parsed.data.myPassCode) !== record.passCodeHash) {
       res.status(401).json({ error: 'WRONG_PASSCODE' })
       return
     }
@@ -455,7 +569,6 @@ router.post('/report', (req, res) => {
   }
   reports.push(record)
 
-  // If a node gets too many reports in a short time, broadcast a warning
   const recentOnTarget = reports.filter(r => r.targetNodeId === targetNodeId && now - r.reportedAt < REPORT_WARN_WINDOW_MS).length
   if (recentOnTarget >= REPORT_WARN_COUNT) {
     broadcast({ type: 'channel', message: `树形图设计者已注意到御坂 ${targetNodeId} 号的行为` })

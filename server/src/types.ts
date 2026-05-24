@@ -3,7 +3,10 @@ import type { WebSocket } from 'ws'
 export interface NodeSession {
   sessionId: string         // unique per WS session — primary routing key
   nodeId: number            // user-input node id; shared across devices of same identity
-  passCodeHash: string
+  passCodeHash: string      // legacy sha256(passcode) — kept for migration window
+  passCodeVerifyHash?: string  // scrypt(passcode, salt) — primary verification field for new sessions
+  passCodeSalt?: string        // 16-byte hex salt for scrypt; absent for legacy sha256 records
+  passCodeAlgo?: 'sha256' | 'scrypt'  // absent = 'sha256' (legacy)
   token: string             // auth token (private)
   socket: WebSocket | null
   lastSeen: number

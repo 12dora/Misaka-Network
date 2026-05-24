@@ -101,22 +101,27 @@ export async function getChunk(transferId: string, index: number): Promise<Array
   return db.get('chunks', chunkKey(transferId, index))
 }
 
+// P2-12: keys are of the form `${transferId}:${index}`. We bound the
+// scan with `IDBKeyRange.bound(${id}:, ${id};)` — `:` is 0x3a and `;`
+// is 0x3b, so the half-open range exactly contains every chunk row for
+// `transferId` and excludes any prefix-sibling (e.g. `id`+'extra:0').
+// On a chunks store with millions of rows across long-lived sessions,
+// this turns an O(total) JS-side filter into an O(targetRows) range
+// scan handled inside IDB.
+function chunkRangeFor(transferId: string): IDBKeyRange {
+  return IDBKeyRange.bound(`${transferId}:`, `${transferId};`, false, true)
+}
+
 export async function deleteChunks(transferId: string) {
   const db = await getDB()
-  const tx = db.transaction('chunks', 'readwrite')
-  const keys = await tx.store.getAllKeys()
-  const prefix = `${transferId}:`
-  for (const key of keys) {
-    if (typeof key === 'string' && key.startsWith(prefix)) {
-      await tx.store.delete(key)
-    }
-  }
-  await tx.done
+  // One range-delete is atomic and faster than the prior
+  // getAllKeys + filter + per-key delete loop.
+  await db.delete('chunks', chunkRangeFor(transferId))
 }
 
 export async function getSavedChunkIndexes(transferId: string): Promise<number[]> {
   const db = await getDB()
-  const keys = await db.getAllKeys('chunks')
+  const keys = await db.getAllKeys('chunks', chunkRangeFor(transferId))
   const prefix = `${transferId}:`
   const indexes: number[] = []
   for (const key of keys) {

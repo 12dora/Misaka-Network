@@ -8,6 +8,10 @@ export const NODE_ID_MAX = 20001
 
 // ── File transfer ─────────────────────────────────────────────────────
 export const CHUNK_SIZE = 252 * 1024             // 252 KB — must stay ≤ 256 KiB SCTP max after AES-GCM (+16 B) + IV (+12 B) overhead
+// Hard upper bound on file size the sender will accept. Keeps chunk index well within uint32
+// (16 GB / 252 KB ≈ 66K chunks) and well below Number.MAX_SAFE_INTEGER for byte arithmetic.
+// Receiver may further refuse via MAX_INMEMORY_RECEIVE_BYTES when no streaming sink is available.
+export const MAX_FILE_SIZE = 16 * 1024 * 1024 * 1024  // 16 GB
 // Sized for LAN: a 32 MB high-water mark pushed Chrome's SCTP send buffer
 // into stop-and-go territory (bufferedAmountLow fired late, lane loops
 // stalled in bursts). 8 MB is ~30 chunks of headroom, enough to absorb a
@@ -40,7 +44,7 @@ export const MAX_ICE_RESTART_ATTEMPTS = 5
 export const ICE_RESTART_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 16_000]
 export const ICE_DISCONNECTED_RESTART_DELAY_MS = 5_000  // restart if 'disconnected' persists
 
-export const DC_OPEN_TIMEOUT_MS = 15_000         // DataChannel open timeout
+export const DC_OPEN_TIMEOUT_MS = 25_000         // DataChannel open timeout — relaxed for cross-continent TURN relay
 export const ENCRYPTION_TIMEOUT_MS = 30_000      // ECDH negotiation timeout
 
 // ── NAT detection ─────────────────────────────────────────────────────

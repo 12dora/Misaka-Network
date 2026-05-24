@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Link, useLocation } from 'react-router-dom'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { useAuthStore } from '@/store/auth'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import QRModal from '@/components/features/QRModal'
@@ -14,6 +14,7 @@ const LINKS = [
 
 export default function TopNav() {
   const location   = useLocation()
+  const navigate   = useNavigate()
   const isConnected = useAuthStore(s => s.isConnected)
   const identity    = useAuthStore(s => s.identity)
   const [menuOpen, setMenuOpen] = useState(false)
@@ -76,6 +77,22 @@ export default function TopNav() {
     return to === '/' ? location.pathname === '/' : location.pathname.startsWith(to)
   }
 
+  // P2-15: when an unauthenticated user clicks the disabled "网络" pill we
+  // used to do nothing — the pointer cursor changed to not-allowed and that
+  // was the entire feedback. Bounce them to the home page (where LoginCard
+  // lives) and surface a tiny toast so they know why. We also try to scroll
+  // the login card into view after navigation completes.
+  function nudgeToLogin() {
+    setInstallToast('请先在首页接入御坂网络')
+    setTimeout(() => setInstallToast(prev => (prev === '请先在首页接入御坂网络' ? null : prev)), 2400)
+    navigate('/')
+    // Wait a tick for the home page to mount before attempting to scroll.
+    setTimeout(() => {
+      const el = document.querySelector('[data-login-card]') as HTMLElement | null
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    }, 180)
+  }
+
   return (
     <>
       <nav
@@ -108,9 +125,10 @@ export default function TopNav() {
               return (
                 <button
                   key={to}
-                  className="nav-pill text-sm opacity-40 cursor-not-allowed"
-                  disabled
+                  className="nav-pill text-sm opacity-60 cursor-pointer"
+                  onClick={nudgeToLogin}
                   title="请先接入网络"
+                  aria-label="网络（需先接入）"
                 >
                   {label}
                 </button>
@@ -214,17 +232,22 @@ export default function TopNav() {
             const needsAuth = to === '/network' && !isConnected
             if (needsAuth) {
               return (
-                <div
+                <button
                   key={to}
-                  className="flex items-center gap-3 px-6 py-4 border-b opacity-40"
+                  type="button"
+                  onClick={() => { setMenuOpen(false); nudgeToLogin() }}
+                  className="flex items-center gap-3 px-6 py-4 border-b opacity-70 text-left cursor-pointer"
                   style={{
                     borderColor: 'rgba(255,255,255,0.08)',
+                    background: 'transparent',
+                    width: '100%',
                   }}
+                  aria-label="网络（需先接入）"
                 >
                   <MisakaKanjiBlock char={kanji} size="sm" />
                   <span className="font-kanji font-semibold text-white">{label}</span>
                   <span className="ml-auto font-kanji text-[10px] text-[var(--text-muted)]">需登录</span>
-                </div>
+                </button>
               )
             }
             return (

@@ -110,4 +110,72 @@ describe('classifyNat', () => {
     expect(r.type).toBe('symmetric')
     expect(r.publicEndpoints).toHaveLength(2)
   })
+
+  // P1-3: an IPv6-only network (T-Mobile, residential CGNAT-v6, China-mobile)
+  // can yield zero IPv4 srflx candidates because the v4-only STUN servers
+  // never answer. Old behaviour misclassified that as 'blocked' (= UDP
+  // firewalled). Now: when *all* srflx candidates are IPv6, we report a
+  // dedicated 'cone-v6' type so the UX can tell the user "we're on IPv6
+  // only" instead of "your firewall is blocking UDP".
+  describe('IPv6-only network (cone-v6)', () => {
+    it('returns "cone-v6" when every srflx candidate is IPv6 and there is exactly one mapping per local', () => {
+      const r = classifyNat([
+        { type: 'host', protocol: 'udp', address: 'fe80::1', port: 50000 },
+        {
+          type: 'srflx',
+          protocol: 'udp',
+          address: '2001:db8::5',
+          port: 33445,
+          relatedAddress: '2001:db8:1::10',
+          relatedPort: 50000,
+        },
+      ])
+      expect(r.type).toBe('cone-v6')
+      expect(r.publicEndpoints).toEqual(['2001:db8::5:33445'])
+    })
+
+    it('mixed v4 + v6 srflx → still classified by v4 logic (cone)', () => {
+      const r = classifyNat([
+        {
+          type: 'srflx',
+          protocol: 'udp',
+          address: '203.0.113.5',
+          port: 33445,
+          relatedAddress: '192.168.1.10',
+          relatedPort: 50000,
+        },
+        {
+          type: 'srflx',
+          protocol: 'udp',
+          address: '2001:db8::5',
+          port: 33445,
+          relatedAddress: '2001:db8:1::10',
+          relatedPort: 50001,
+        },
+      ])
+      expect(r.type).toBe('cone')
+    })
+
+    it('still detects symmetric NAT when collisions are present even for IPv6-only', () => {
+      const r = classifyNat([
+        {
+          type: 'srflx',
+          protocol: 'udp',
+          address: '2001:db8::5',
+          port: 33445,
+          relatedAddress: '2001:db8:1::10',
+          relatedPort: 50000,
+        },
+        {
+          type: 'srflx',
+          protocol: 'udp',
+          address: '2001:db8::5',
+          port: 33999,
+          relatedAddress: '2001:db8:1::10',
+          relatedPort: 50000,
+        },
+      ])
+      expect(r.type).toBe('symmetric')
+    })
+  })
 })

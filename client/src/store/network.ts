@@ -8,6 +8,7 @@ import {
   createPeerConnection, createDataChannel, createOffer, createAnswer,
   applyAnswer, addIceCandidate, getSelectedChannelType, getSelectedIcePath,
   ensureAutoTurnReady, applyIceConfigToAll,
+  whenSignalingStable, endOfCandidatesFor, installIceErrorListener,
 } from '@/lib/webrtc'
 import {
   generateECDHKeyPair, getMyPublicKey, setPeerPublicKey,
@@ -17,17 +18,18 @@ import {
   sendFileParallel as engineSendFileParallel, handleMetaMessage, receiveChunk,
   completeReceive, cancelReceive, createTransferId, buildResumeRequest,
   pauseTransfer, resumeTransfer, cancelTransfer as engineCancelTransfer,
-  supportsFileSystemAccess, streamChunkToDisk,
+  streamChunkToDisk,
   finalizeStreamedFile, cancelStreamWrite, getWriteHandle,
-  supportsOPFS, createOPFSReceiveFile, writeChunkToOPFS, getOPFSFile, getOPFSHandle, cleanupOPFS,
+  writeChunkToOPFS, getOPFSFile, getOPFSHandle, cleanupOPFS,
   decodeChunkFrame, decodeResumeRequest, checkMetaOOMGuard,
+  prepareReceiveStorage, opfsWrittenCount,
   type MetaMessage, type SendCallbacks, type ResumeRequest,
 } from '@/lib/transfer'
 import { getTransfer, getActiveTransfers } from '@/lib/db'
 import { playSound } from '@/lib/sound'
 import { notifyIncomingFile } from '@/lib/notify'
 import { refreshAutoTurn, clearAutoTurn, onTurnConfigChange, fetchTurnStatus, getAutoTurnState, loadTurnSettings } from '@/lib/turn'
-import { detectNatType, onNatTypeChange, getDetectedNatType, type NatType } from '@/lib/nat'
+import { detectNatType, onNatTypeChange, getDetectedNatType, invalidateDetectedNatType, type NatType } from '@/lib/nat'
 import {
   MAX_ICE_RESTART_ATTEMPTS, ICE_RESTART_BACKOFF_MS, ICE_DISCONNECTED_RESTART_DELAY_MS,
   DC_OPEN_TIMEOUT_MS, ENCRYPTION_TIMEOUT_MS,
@@ -284,9 +286,15 @@ function recoverConnections() {
   const now = Date.now()
   if (now - lastRecoverAt < 1_500) return
   lastRecoverAt = now
+  // Network environment may have changed (Wi-Fi ↔ cellular, VPN flip) — cached
+  // NAT classification is stale; force a re-probe on the next request so
+  // buildIceConfig picks the right relay policy.
+  invalidateDetectedNatType()
+  natProbeStarted = false
   if (currentToken) {
     reconnectNow()
     void refreshAutoTurn()
+    startNatAndTurnProbes()
   }
   for (const peer of useNetworkStore.getState().peers) {
     const pc = peerConnections.get(peer.sessionId)
@@ -346,10 +354,20 @@ interface NetworkState {
   pauseTransfer: (transferId: string) => void
   resumeTransfer: (transferId: string, peerSessionId: string) => Promise<void>
   cancelTransferAction: (transferId: string) => void
+  // Convenience wrappers for receiver-side controls. The receiver UI only knows
+  // the transferId; these look up the peerSessionId from the live transfer record
+  // and delegate to pauseTransfer/resumeTransfer/cancelTransferAction.
+  pauseReceiveTransfer: (transferId: string) => void
+  resumeReceiveTransfer: (transferId: string) => Promise<void>
+  cancelReceiveTransfer: (transferId: string) => void
   sendChatMessage: (peerSessionId: string, text: string) => void
   retryChatMessage: (peerSessionId: string, msgId: string) => void
   blockPeer: (sessionId: string) => void
   recoverConnections: () => void
+  // Force-rebuild a peer connection (used by the "立即重连此节点" button on the
+  // offline-peer banner). Resolves once the rebuild attempt has been kicked off
+  // — the actual ICE handshake completes asynchronously.
+  reconnectPeer: (sessionId: string) => Promise<void>
 }
 
 export const useNetworkStore = create<NetworkState>((set, get) => ({
@@ -483,6 +501,20 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
         case 'SIGNAL_ICE_END':
           await handleRemoteICEEnd(msg.fromSessionId)
           break
+
+        case 'PEER_OFFLINE': {
+          // Server-side hint that our outbound SIGNAL_SDP / SIGNAL_ICE never
+          // reached the target — they have no live socket. Mark the peer
+          // 'offline' so the UI can offer the "立即重连" affordance instead
+          // of letting the user stare at a silent 30s ICE failure timeout.
+          const sid = msg.targetSessionId
+          set(s => ({
+            peers: s.peers.map(p =>
+              p.sessionId === sid ? { ...p, status: 'offline' as NodeStatus } : p,
+            ),
+          }))
+          break
+        }
 
         case 'SERVER_SHUTDOWN':
           console.warn(`[Signaling] 服务器关闭: ${msg.reason}`)
@@ -778,12 +810,51 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
       }
     }
     engineCancelTransfer(transferId)
-    cancelReceive(transferId)
+    // cancelReceive is now async (P0-2 fix): it awaits in-flight saveChunk
+    // ops before clearing IDB chunks to avoid orphan rows. Fire-and-forget
+    // here is intentional — the UI removes the card synchronously below.
+    void cancelReceive(transferId)
     cancelStreamWrite(transferId)
     cleanupOPFS(transferId).catch(() => {})
     sendingFiles.delete(transferId)
     transferSpeedSamples.delete(transferId)
     set(s => ({ transfers: s.transfers.filter(t => t.id !== transferId) }))
+  },
+
+  pauseReceiveTransfer(transferId) {
+    get().pauseTransfer(transferId)
+  },
+
+  async resumeReceiveTransfer(transferId) {
+    const t = get().transfers.find(tr => tr.id === transferId)
+    if (!t) return
+    await get().resumeTransfer(transferId, t.peerSessionId)
+  },
+
+  cancelReceiveTransfer(transferId) {
+    get().cancelTransferAction(transferId)
+  },
+
+  async reconnectPeer(sessionId) {
+    // Tear the dead PC down explicitly — recoverConnections() rate-limits to
+    // 1.5s and may no-op if the user is mashing the button. This path is
+    // explicit user intent, so bypass the throttle for this specific peer.
+    cleanupPeerConnection(sessionId, { failQueuedMessages: false })
+    useNetworkStore.setState(s => ({
+      peers: s.peers.map(p =>
+        p.sessionId === sessionId ? { ...p, status: 'connecting' as const } : p,
+      ),
+    }))
+    try {
+      await initiateWebRTC(sessionId)
+    } catch (err) {
+      console.warn('[net] reconnectPeer failed', err)
+      useNetworkStore.setState(s => ({
+        peers: s.peers.map(p =>
+          p.sessionId === sessionId ? { ...p, status: 'offline' as const } : p,
+        ),
+      }))
+    }
   },
 }))
 
@@ -955,6 +1026,7 @@ async function initiateWebRTC(peerSessionId: string) {
   // TURN. Wait briefly for credentials so the very first handshake has them.
   await ensureAutoTurnReady()
   const pc = createPeerConnection()
+  installIceErrorListener(pc)
   peerConnections.set(peerSessionId, pc)
 
   const dc = createDataChannel(pc)
@@ -1037,6 +1109,7 @@ async function handleRemoteSDP(fromSessionId: string, fromNodeId: number, sdp: R
     // also has TURN servers in its first PC.
     await ensureAutoTurnReady()
     pc = createPeerConnection()
+    installIceErrorListener(pc)
     peerConnections.set(fromSessionId, pc)
 
     pc.ondatachannel = (e) => {
@@ -1150,8 +1223,10 @@ async function handleRemoteICEEnd(fromSessionId: string) {
   // Empty-candidate marker per RFC 8445 §8.1.2 — signals the peer has
   // finished gathering. Browsers accept this to short-circuit waits.
   if (!pc.remoteDescription) return // marker before SDP is meaningless
-  try { await pc.addIceCandidate({ candidate: '', sdpMid: '', sdpMLineIndex: 0 }) }
-  catch { /* some browsers reject the marker; harmless */ }
+  // Firefox rejects sdpMid:'' — endOfCandidatesFor reads a real mid from
+  // the PC's first transceiver so both Chrome and FF accept the marker.
+  try { await pc.addIceCandidate(endOfCandidatesFor(pc)) }
+  catch { /* some browsers still reject the marker; harmless */ }
 }
 
 function handleIceStateChange(pc: RTCPeerConnection, peerSessionId: string) {
@@ -1406,8 +1481,21 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
           }
           peerMap.set(meta.shortId, meta.transferId)
           await handleMetaMessage(meta, peerNodeId)
-          if (supportsOPFS() && !supportsFileSystemAccess()) {
-            createOPFSReceiveFile(meta.transferId, meta.fileName, meta.totalChunks).catch(() => {})
+          // Three-tier storage selection: prompt FSA → OPFS probe → IDB fallback.
+          // Failure is non-fatal (we still display the card and let receiveChunk
+          // run; on truly unsupported environments the IDB OOM guard will refuse
+          // and surface failed:unsupported).
+          let storageMode: Transfer['storageMode'] = 'idb'
+          try {
+            const sel = await prepareReceiveStorage({
+              transferId: meta.transferId,
+              fileName: meta.fileName,
+              totalChunks: meta.totalChunks,
+              size: meta.fileSize,
+            })
+            storageMode = sel.mode
+          } catch (err) {
+            console.warn('[net] prepareReceiveStorage failed, falling back to idb', err)
           }
           useNetworkStore.setState(s => {
             if (s.transfers.some(t => t.id === meta.transferId)) return s
@@ -1418,6 +1506,7 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
                 fileName: meta.fileName, fileSize: meta.fileSize,
                 progress: 0, speedBps: 0, status: 'transferring' as const,
                 startedAt: Date.now(),
+                storageMode,
               }],
             }
           })
@@ -1581,13 +1670,18 @@ async function attemptIceRestart(peerSessionId: string) {
       return
     }
 
-    // If we're not in 'stable', a restart offer would either collide with our
-    // own outstanding offer or step on an inbound one. Skip — the
-    // perfect-negotiation rollback in handleRemoteSDP will recover us.
-    // Don't burn an attempt for a no-op.
+    // If we're not in 'stable', a restart offer would collide with an outstanding
+    // local or inbound offer. Wait briefly for stable rather than skipping outright —
+    // if perfect-negotiation rollback recovers us first, signalingState returns to
+    // stable and the restart still goes through. If glare wedges us, the 10s
+    // timeout caps the wait and we yield to the normal recovery path.
     if (pc.signalingState !== 'stable') {
-      console.warn('[net] skipping iceRestart, signalingState=', pc.signalingState)
-      return
+      try {
+        await whenSignalingStable(pc, { timeoutMs: 10_000 })
+      } catch (err) {
+        console.warn('[net] iceRestart wait-for-stable timed out', err)
+        return
+      }
     }
 
     iceRestartAttempts.set(peerSessionId, attempts + 1)
@@ -1627,7 +1721,7 @@ async function deliverCompletedFile(transferId: string, peerSessionId: string) {
       deliveredTransfers.delete(transferId)
       playSound('error')
     }
-  } else if (opfsHandle && opfsHandle.written.size === opfsHandle.totalChunks) {
+  } else if (opfsHandle && opfsWrittenCount(transferId) === opfsHandle.totalChunks) {
     try {
       const file = await getOPFSFile(transferId)
       const url = URL.createObjectURL(file)

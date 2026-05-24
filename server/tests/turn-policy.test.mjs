@@ -73,7 +73,12 @@ async function main() {
   console.log('[1] Successful issuance')
   const r1 = await issueCredentials('sess-A', '1.1.1.1')
   assert(r1.ok === true, 'returns ok=true')
-  assert(r1.ok && r1.customIdentifier === 'misaka-sess-A', 'customIdentifier embeds sessionId')
+  // customIdentifier is now a one-way derivation (sha256 over sessionId +
+  // SERVER_SECRET, truncated to 16 hex chars). We assert the shape but not
+  // the legacy `misaka-${sessionId}` form, since that form leaked sessionId
+  // to CF logs (see P2-11).
+  assert(r1.ok && typeof r1.customIdentifier === 'string' && /^[0-9a-f]{16}$/.test(r1.customIdentifier),
+    'customIdentifier is opaque 16-hex derivation (not the legacy misaka-${sessionId} form)')
   assert(r1.ok && Array.isArray(r1.iceServers) && r1.iceServers.length > 0, 'iceServers populated')
   assert(Object.keys(getTurnState().activeCredentials).length === 1, 'activeCredentials has 1 entry')
   assert(getTurnState().monthlyUsage.bytesObserved > 0, 'monthly bytes incremented (pessimistic)')

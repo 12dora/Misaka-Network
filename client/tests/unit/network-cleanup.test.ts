@@ -134,13 +134,12 @@ vi.mock('@/lib/webrtc', () => ({
   addIceCandidate: vi.fn(async () => {}),
   getSelectedChannelType: vi.fn(async () => 'direct'),
   getSelectedIcePath: vi.fn(async () => null),
-  // Added when ensureAutoTurnReady() was wired into initiateWebRTC /
-  // handleRemoteSDP to pre-warm Cloudflare credentials. In tests we
-  // resolve immediately — no real fetch.
   ensureAutoTurnReady: vi.fn(async () => {}),
-  // P0-4 / P1-2: live PCs are re-configured via this helper when TURN
-  // creds rotate or force-relay toggles. No live PCs in test, no-op.
   applyIceConfigToAll: vi.fn(),
+  // New helpers from B's webrtc.ts that store/network.ts now imports.
+  whenSignalingStable: vi.fn(async () => {}),
+  endOfCandidatesFor: vi.fn(() => ({ candidate: '', sdpMid: '0', sdpMLineIndex: 0 })),
+  installIceErrorListener: vi.fn(),
 }))
 
 vi.mock('@/lib/crypto', () => ({
@@ -156,24 +155,36 @@ vi.mock('@/lib/transfer', () => ({
   handleMetaMessage: vi.fn(async () => {}),
   receiveChunk: vi.fn(async () => null),
   completeReceive: vi.fn(async () => new File([], 'x')),
-  cancelReceive: vi.fn(),
+  cancelReceive: vi.fn(async () => {}),     // C P0-2: now async
   createTransferId: () => 't',
   buildResumeRequest: vi.fn(async () => null),
   pauseTransfer: vi.fn(),
   resumeTransfer: vi.fn(),
   cancelTransfer: vi.fn(),
-  supportsFileSystemAccess: () => false,
   streamChunkToDisk: vi.fn(),
   finalizeStreamedFile: vi.fn(),
   cancelStreamWrite: vi.fn(),
   getWriteHandle: () => null,
-  supportsOPFS: () => false,
-  createOPFSReceiveFile: vi.fn(),
   writeChunkToOPFS: vi.fn(),
   getOPFSFile: vi.fn(),
   getOPFSHandle: () => null,
   cleanupOPFS: vi.fn(async () => {}),
   decodeChunkFrame: () => null,
+  // C's new exports.
+  prepareReceiveStorage: vi.fn(async () => ({ mode: 'idb' })),
+  opfsWrittenCount: vi.fn(() => 0),
+  decodeResumeRequest: vi.fn(() => undefined),
+  checkMetaOOMGuard: vi.fn(() => null),
+}))
+
+// network.ts imports detectNatType/onNatTypeChange/getDetectedNatType/
+// invalidateDetectedNatType from @/lib/nat. Mock to no-ops so init() doesn't
+// touch real RTCPeerConnection or scheduling.
+vi.mock('@/lib/nat', () => ({
+  detectNatType: vi.fn(async () => ({ type: 'unknown' })),
+  onNatTypeChange: vi.fn(() => () => {}),
+  getDetectedNatType: vi.fn(() => null),
+  invalidateDetectedNatType: vi.fn(),
 }))
 
 vi.mock('@/lib/db', () => ({
@@ -185,12 +196,12 @@ vi.mock('@/lib/db', () => ({
 vi.mock('@/lib/sound', () => ({ playSound: vi.fn() }))
 vi.mock('@/lib/notify', () => ({ notifyIncomingFile: vi.fn() }))
 vi.mock('@/lib/turn', () => ({
-  refreshAutoTurn: vi.fn(async () => {}),
+  refreshAutoTurn: vi.fn(async () => []),
   clearAutoTurn: vi.fn(),
-  // network.ts subscribes to TURN config changes so it can re-apply
-  // RTCConfiguration on live PCs (P0-4 / P1-2). The mock returns a no-op
-  // unsubscriber so init() doesn't blow up.
   onTurnConfigChange: vi.fn(() => () => {}),
+  fetchTurnStatus: vi.fn(async () => ({ available: false })),
+  getAutoTurnState: vi.fn(() => null),
+  loadTurnSettings: vi.fn(),
 }))
 
 // ── Test helpers ───────────────────────────────────────────────────────

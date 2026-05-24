@@ -27,11 +27,15 @@ const deleteChunksSpy = vi.mocked(db.deleteChunks)
 const updateTransferSpy = vi.mocked(db.updateTransfer)
 
 describe('cancelReceive: cleans up persisted chunks', () => {
-  it('calls deleteChunks(transferId) so cancelled inbound transfers do not leak', () => {
-    cancelReceive('abandoned-transfer-id')
+  it('calls deleteChunks(transferId) so cancelled inbound transfers do not leak', async () => {
+    // Cancel now returns a promise — the in-flight save drain (P0-2)
+    // sequences deleteChunks after a microtask, so callers wanting
+    // deterministic cleanup ordering must await.
+    await cancelReceive('abandoned-transfer-id')
 
-    // The order is: receiveSessions.delete → deleteChunks → updateTransfer.
-    // We only need to assert that deleteChunks was called with the right id.
+    // The order is: receiveSessions.delete → drain in-flight saves →
+    // deleteChunks → updateTransfer. We only need to assert that
+    // deleteChunks was called with the right id.
     expect(deleteChunksSpy).toHaveBeenCalledWith('abandoned-transfer-id')
     // And the record is marked failed so the UI / resume logic doesn't try
     // to bring it back from the dead.

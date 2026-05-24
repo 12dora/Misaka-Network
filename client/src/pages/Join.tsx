@@ -2,10 +2,11 @@ import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
+import IpFullPrompt from '@/components/features/IpFullPrompt'
 import { useAuthStore } from '@/store/auth'
 import { apiUrl } from '@/config'
 
-type JoinStatus = 'connecting' | 'needs-passcode' | 'error'
+type JoinStatus = 'connecting' | 'needs-passcode' | 'error' | 'ip-limited'
 
 function decodePassCode(encoded: string | null): string {
   if (!encoded) return ''
@@ -29,6 +30,10 @@ export default function Join() {
   const [passCode, setPassCode] = useState(() => decodePassCode(params.get('c')))
   const [manualPass, setManualPass] = useState('')
   const [attempt, setAttempt] = useState(0)
+  // P0-2: gates the IpFullPrompt's busy state while release-by-ip is
+  // in-flight. Declared at the top so the hook order is grouped with the
+  // rest of useState calls.
+  const [releasing, setReleasing] = useState(false)
 
   const joinInfo = useMemo(() => ({
     type: params.get('type') ?? 'node',
@@ -100,11 +105,19 @@ export default function Join() {
         await auth.connect()
         if (cancelled) return
 
-        if (useAuthStore.getState().isConnected) {
+        const after = useAuthStore.getState()
+        if (after.isConnected) {
           navigate('/network', { replace: true })
+        } else if (after.ipFullPrompt) {
+          // P0-2: surface the shared release-and-retry UI here so the Join
+          // flow doesn't dead-end on "接入失败" when the issue is actually
+          // "this IP already has 10 nodes registered". The user's nodeId +
+          // passcode are already in auth state from setNodeId/setPassCode
+          // above, so releaseAllFromIp() has everything it needs.
+          setStatus('ip-limited')
         } else {
           setStatus('error')
-          setErrorMsg(useAuthStore.getState().error ?? '接入失败，请稍后重试')
+          setErrorMsg(after.error ?? '接入失败，请稍后重试')
         }
       } catch {
         if (!cancelled) {
@@ -127,6 +140,28 @@ export default function Join() {
     setPassCode(next)
     setManualPass('')
     setAttempt(prev => prev + 1)
+  }
+
+  async function handleReleaseAndRetry(): Promise<number> {
+    setReleasing(true)
+    try {
+      const released = await useAuthStore.getState().releaseAllFromIp()
+      if (released > 0) {
+        // Re-run the join attempt — the previous run hit IP_LIMITED and
+        // bailed before redeeming the QR token. Bumping `attempt` re-fires
+        // the effect with the same inputs.
+        setStatus('connecting')
+        setAttempt(prev => prev + 1)
+      }
+      return released
+    } finally {
+      setReleasing(false)
+    }
+  }
+  function dismissIpFull() {
+    useAuthStore.getState().dismissIpFullPrompt()
+    setStatus('error')
+    setErrorMsg('本机已注册节点过多，无法接入')
   }
 
   return (
@@ -187,6 +222,14 @@ export default function Join() {
               </MisakaButton>
             </div>
           </>
+        )}
+
+        {status === 'ip-limited' && (
+          <IpFullPrompt
+            busy={releasing}
+            onConfirm={handleReleaseAndRetry}
+            onCancel={dismissIpFull}
+          />
         )}
 
         {status === 'error' && (

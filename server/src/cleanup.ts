@@ -1,6 +1,9 @@
-import { nodes, channels, qrTokens, reports, attemptLocks } from './store.js'
+import { nodes, channels, qrTokens, reports, attemptLocks, nodeFreezes } from './store.js'
 import { cleanupRateLimitWindows } from './ratelimit.js'
-import { CLEANUP_INTERVAL_MS, DISCONNECTED_TTL_MS, LOCK_DURATION_MS, REPORT_TTL_MS } from './config.js'
+import {
+  CLEANUP_INTERVAL_MS, DISCONNECTED_TTL_MS, LOCK_DURATION_MS, REPORT_TTL_MS,
+  NODE_FREEZE_WINDOW_MS,
+} from './config.js'
 
 let cleanupTimer: NodeJS.Timeout | null = null
 
@@ -44,6 +47,25 @@ export function startCleanupTask() {
       const idle = now - lock.lastAttemptAt >= LOCK_DURATION_MS
       if (lockExpired && idle) {
         attemptLocks.delete(key)
+      }
+    }
+
+    // Purge expired node freezes (P1-5). When a freeze has elapsed AND its
+    // most recent failure is older than the rolling window, the entry is
+    // pure garbage — drop it.
+    for (const [nodeId, freeze] of nodeFreezes) {
+      const freezeExpired = freeze.frozenUntil === 0 || now >= freeze.frozenUntil
+      const lastFailureAt = freeze.recentFailures.length
+        ? freeze.recentFailures[freeze.recentFailures.length - 1].at
+        : 0
+      const idle = now - lastFailureAt >= NODE_FREEZE_WINDOW_MS
+      if (freezeExpired && idle) {
+        nodeFreezes.delete(nodeId)
+      } else if (freezeExpired) {
+        // Reset the timer but keep recent failure history so a re-trigger
+        // is fast.
+        freeze.frozenUntil = 0
+        freeze.recentFailures = freeze.recentFailures.filter(r => now - r.at < NODE_FREEZE_WINDOW_MS)
       }
     }
 

@@ -22,7 +22,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 
 import {
   getAutoTurnIceServers, isAutoTurnStaleWithin,
-  refreshAutoTurn, clearAutoTurn,
+  refreshAutoTurn, clearAutoTurn, testTurnServer,
 } from '../../src/lib/turn'
 
 // Stub authedFetch so refreshAutoTurn() resolves deterministically.
@@ -81,6 +81,64 @@ describe('auto-TURN staleness handling', () => {
       expect(isAutoTurnStaleWithin(0)).toBe(true)
     } finally {
       Date.now = realNow
+    }
+  })
+})
+
+// P2-7: testTurnServer used to close the PC but leave its event handlers
+// attached; a late onicecandidate event kept the underlying ICE agent in
+// the GC graph. Verify all handlers are detached prior to close.
+describe('testTurnServer: listener cleanup before close', () => {
+  it('clears every event handler on the timeout path', async () => {
+    const handlers = {
+      onicecandidate: vi.fn(),
+      onicecandidateerror: vi.fn(),
+      onicegatheringstatechange: vi.fn(),
+      oniceconnectionstatechange: vi.fn(),
+      onconnectionstatechange: vi.fn(),
+      onsignalingstatechange: vi.fn(),
+      ondatachannel: vi.fn(),
+    }
+    const closed = vi.fn()
+    // Track set-to-null assignments so we can verify cleanup. Use a Proxy
+    // so any property the implementation nulls is visible to the test.
+    const cleared = new Set<string>()
+    const pcStub: any = new Proxy({
+      createDataChannel: () => ({}),
+      createOffer: async () => ({ type: 'offer', sdp: '' }),
+      setLocalDescription: async () => {},
+      close: closed,
+      ...handlers,
+    }, {
+      set(t, k, v) {
+        if (typeof k === 'string' && v === null) cleared.add(k)
+        ;(t as any)[k] = v
+        return true
+      },
+      get(t, k) { return (t as any)[k] },
+    })
+
+    const origRtc = (globalThis as any).RTCPeerConnection
+    ;(globalThis as any).RTCPeerConnection = function () { return pcStub } as any
+
+    vi.useFakeTimers()
+    const promise = testTurnServer({
+      id: 'x', url: 'turn:none.example.com', username: 'u', credential: 'c',
+      enabled: true,
+    })
+    // Let the createOffer + setLocalDescription microtasks settle.
+    await vi.advanceTimersByTimeAsync(0)
+    vi.advanceTimersByTime(5_001)
+    const verdict = await promise
+    vi.useRealTimers()
+    ;(globalThis as any).RTCPeerConnection = origRtc
+
+    expect(verdict).toBe(false)
+    expect(closed).toHaveBeenCalled()
+    // All the listener properties we care about were set to null before
+    // close() so a stray late candidate cannot revive the agent.
+    for (const key of Object.keys(handlers)) {
+      expect(cleared.has(key), `expected ${key} to be nulled`).toBe(true)
     }
   })
 })
