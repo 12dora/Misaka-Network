@@ -7,7 +7,7 @@ import MisakaProgressBar from '@/components/ui/MisakaProgressBar'
 import AppFooter from '@/components/ui/AppFooter'
 import QRModal from '@/components/features/QRModal'
 import SettingsModal from '@/components/features/SettingsModal'
-import { useNetworkStore } from '@/store/network'
+import { useNetworkStore, isLikelyUnreachable } from '@/store/network'
 import { useAuthStore } from '@/store/auth'
 import { appUrl } from '@/lib/appBase'
 import { authedFetch, AuthRequiredError } from '@/lib/api'
@@ -636,6 +636,19 @@ function TaskPanel({ transfers, onPause, onResume, onCancel }: {
               )}
             </>
           )}
+          {t.status === 'failed:unsupported' && (
+            <>
+              <div className="flex items-center gap-2 mt-1">
+                <span style={{ color: 'var(--state-danger)' }} className="font-mono text-xs">✗ 浏览器不支持</span>
+                <MisakaButton variant="pill" size="sm" className="ml-auto text-xs py-1 px-3" onClick={() => onCancel(t.id)}>✕ 移除</MisakaButton>
+              </div>
+              {t.error && (
+                <div className="mt-1 text-[10px] font-kanji leading-snug" style={{ color: 'var(--text-on-white-2)' }}>
+                  {t.error}
+                </div>
+              )}
+            </>
+          )}
         </MisakaCard>
       ))}
 
@@ -699,6 +712,52 @@ const TABS: { id: TabId; kanji: string; label: string }[] = [
   { id: 'channel', kanji: '道', label: '信道' },
   { id: 'tasks',   kanji: '流', label: '任务' },
 ]
+
+// ── NAT-unreachability banner ────────────────────────────────────
+// Surfaces a one-shot, dismissible warning when (a) we've classified
+// the local NAT as symmetric AND (b) neither auto nor manual TURN is
+// available. Without this, two such peers wait through ~5 ICE restart
+// attempts (~30 s) only to land on a generic "连接已断开" banner with
+// no actionable hint. The banner deliberately doesn't block any
+// interaction — direct LAN peers may still connect just fine.
+function NatUnreachableBanner({ onOpenSettings }: { onOpenSettings: () => void }) {
+  const [dismissed, setDismissed] = useState(false)
+  if (dismissed) return null
+  return (
+    <div
+      className="mx-4 mt-4 md:mx-6 md:mt-6 px-4 py-3 rounded-lg flex items-center gap-3 text-sm font-kanji"
+      style={{
+        background: 'rgba(255, 178, 61, 0.12)',
+        border: '1px solid rgba(255, 178, 61, 0.4)',
+        color: 'var(--text-on-blue)',
+      }}
+      role="status"
+      aria-live="polite"
+    >
+      <span aria-hidden="true">⚠</span>
+      <div className="flex-1 leading-snug">
+        检测到本机为对称 NAT 且 TURN 中继不可用 — 与某些对端可能无法直接建立连接。
+      </div>
+      <button
+        type="button"
+        onClick={onOpenSettings}
+        className="text-xs underline decoration-dotted cursor-pointer shrink-0"
+        style={{ background: 'transparent', border: 'none', color: 'var(--accent-cyan)', padding: 0 }}
+      >
+        打开设置
+      </button>
+      <button
+        type="button"
+        onClick={() => setDismissed(true)}
+        className="text-xs cursor-pointer shrink-0"
+        aria-label="忽略提示"
+        style={{ background: 'transparent', border: 'none', color: 'var(--text-on-blue-2)', padding: '0 4px' }}
+      >
+        ✕
+      </button>
+    </div>
+  )
+}
 
 // ── Page ──────────────────────────────────────────────────────────
 export default function Network() {
@@ -790,9 +849,19 @@ export default function Network() {
   }
 
   const peerEntity = store.peers.find(p => p.sessionId === store.selectedSessionId) ?? null
+  // P1-1: precompute the unreachability hint here so both desktop and
+  // mobile renders can show the same banner without duplicating the
+  // selector.
+  const unreachable = isLikelyUnreachable({
+    myNatType: store.myNatType,
+    autoTurnAvailable: store.autoTurnAvailable,
+  })
 
   return (
     <div className="pt-16 flex flex-col" style={{ background: 'var(--bg-primary)', minHeight: '100dvh' }}>
+      {unreachable && (
+        <NatUnreachableBanner onOpenSettings={() => setShowSettings(true)} />
+      )}
       {/* Desktop 3-column */}
       <div className="hidden md:grid gap-6 p-6" style={{ gridTemplateColumns: 'minmax(220px, 1fr) minmax(0, 2fr) minmax(220px, 1fr)', minHeight: 'calc(100dvh - 64px - 73px)' }}>
         <div className="overflow-y-auto">

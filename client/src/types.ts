@@ -55,6 +55,10 @@ export type TransferStatus =
   | 'completed'
   | 'failed'
   | 'reconnecting'
+  // P1-5: receiver refused the transfer up-front because the current
+  // browser can't safely assemble a file this large (no OPFS / no FSA).
+  // Surfaced as a distinct red card with a recovery hint.
+  | 'failed:unsupported'
 
 export interface Transfer {
   id: string

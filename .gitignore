@@ -11,3 +11,4 @@ server/data/
 .vscode/
 .idea/
 test-results/
+client/coverage/
