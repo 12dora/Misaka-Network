@@ -27,6 +27,7 @@ import { getTransfer, getActiveTransfers } from '@/lib/db'
 import { playSound } from '@/lib/sound'
 import { notifyIncomingFile } from '@/lib/notify'
 import { refreshAutoTurn, clearAutoTurn, onTurnConfigChange } from '@/lib/turn'
+import { onNatTypeChange } from '@/lib/nat'
 import {
   MAX_ICE_RESTART_ATTEMPTS, ICE_RESTART_BACKOFF_MS, ICE_DISCONNECTED_RESTART_DELAY_MS,
   DC_OPEN_TIMEOUT_MS, ENCRYPTION_TIMEOUT_MS,
@@ -146,6 +147,7 @@ function waitForPrimaryChannel(peerSessionId: string, timeoutMs = 10_000): Promi
 let recoveryInstalled = false
 let lastRecoverAt = 0
 let turnConfigUnsubscribe: (() => void) | null = null
+let natConfigUnsubscribe: (() => void) | null = null
 
 function installTurnConfigPropagation() {
   if (turnConfigUnsubscribe) return
@@ -157,6 +159,14 @@ function installTurnConfigPropagation() {
     // ignored until the PC is torn down and re-built.
     applyIceConfigToAll(peerConnections.values())
   })
+  // P1: also rebuild config when NAT type changes (e.g. user clicks the
+  // detect button in Settings and we discover symmetric NAT). Same rationale
+  // as TURN config — existing PCs would otherwise stay on the old policy.
+  if (!natConfigUnsubscribe) {
+    natConfigUnsubscribe = onNatTypeChange(() => {
+      applyIceConfigToAll(peerConnections.values())
+    })
+  }
 }
 
 function installForegroundRecovery() {
@@ -170,6 +180,18 @@ function installForegroundRecovery() {
   window.addEventListener('focus', recover)
   window.addEventListener('pageshow', recover)
   document.addEventListener('visibilitychange', recover)
+  // P3: iOS Safari freezes the page on pagehide (entering BFCache); the WS
+  // and any TURN-relayed PC will drop. We don't tear anything down here —
+  // the resume path runs on `pageshow` — but we *do* want to make sure no
+  // stale timers race during the freeze, so push a recovery as soon as the
+  // page becomes visible again. (pageshow + visibilitychange + online are
+  // already wired; pagehide just covers the bf-cache-restore edge.)
+  window.addEventListener('pagehide', () => {
+    // Best-effort cleanup of speed sample timers — they don't run during
+    // BFCache anyway, but the entries linger and pollute the next session's
+    // speed calculation if we restore without clearing them.
+    transferSpeedSamples.clear()
+  })
 }
 
 function recoverConnections() {
@@ -398,6 +420,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     resetCrypto()
     clearAutoTurn()
     if (turnConfigUnsubscribe) { turnConfigUnsubscribe(); turnConfigUnsubscribe = null }
+    if (natConfigUnsubscribe) { natConfigUnsubscribe(); natConfigUnsubscribe = null }
     initialized = false
     currentToken = ''
     // Revoke every cached download URL — these point at File/Blob objects

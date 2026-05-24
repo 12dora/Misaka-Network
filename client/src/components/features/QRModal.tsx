@@ -132,12 +132,16 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
       onClick={handleBackdrop}
     >
       <div
-        className={`relative flex flex-col items-center gap-5 rounded-2xl p-8 ${modal.panelClass}`}
+        className={`relative flex flex-col items-center gap-5 rounded-2xl p-6 xs:p-8 ${modal.panelClass}`}
         style={{
           background: 'var(--surface)',
           boxShadow: 'var(--shadow-float)',
-          minWidth: 300,
-          maxWidth: 360,
+          // P0-2: drop the hard `minWidth: 300`. On a 320px-wide iPhone SE
+          // with the outer `p-4` (16px) backdrop padding, available content
+          // width is 288px — the old minWidth would force horizontal
+          // overflow. Use a clamp so the modal still tries to be 360px on
+          // wider screens but gracefully shrinks down on phones.
+          width: 'min(360px, 100% - 8px)',
           // P1-13: previously had no maxHeight, so on iPhone landscape /
           // iPad split-view the QR + node info + buttons stack ran off the
           // viewport and the close / refresh / copy actions became

@@ -24,6 +24,10 @@ export default function TopNav() {
     prompt: () => Promise<void>
     userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>
   }>(null)
+  // P2: PWA install used to be silent — the prompt button vanished after the
+  // user resolved the system dialog with no confirmation either way. Surface
+  // the outcome so a deferred install doesn't look like a broken click.
+  const [installToast, setInstallToast] = useState<string | null>(null)
 
   useEffect(() => {
     const onBeforeInstallPrompt = (e: Event) => {
@@ -50,11 +54,21 @@ export default function TopNav() {
       // resolves the event is consumed regardless of accepted/dismissed, so
       // clear it either way. Leaving it around would leave a dead "安装应用"
       // button that no longer does anything.
-      await installPrompt.userChoice
+      const choice = await installPrompt.userChoice
+      if (choice.outcome === 'accepted') {
+        setInstallToast('已开始安装到主屏 / 应用列表')
+      } else {
+        setInstallToast('已取消安装；稍后可通过浏览器菜单再次安装')
+      }
     } catch {
       // ignore — user choice may reject in some browsers
+      setInstallToast('安装请求未完成，请稍后再试')
     } finally {
       setInstallPrompt(null)
+      // Clear via state-equality guard so a concurrent toast doesn't get
+      // wiped by a delayed timer from an earlier install attempt.
+      const current = installToast
+      setTimeout(() => setInstallToast(prev => (prev === current ? null : prev)), 3000)
     }
   }
 
@@ -270,6 +284,19 @@ export default function TopNav() {
       )}
       {showSettings && (
         <SettingsModal onClose={() => setShowSettings(false)} />
+      )}
+
+      {/* P2: PWA install confirmation toast. Uses the same `misaka-toast`
+          positioning class as Network's toast so it reserves home-indicator
+          safe area on mobile. */}
+      {installToast && (
+        <div
+          className="misaka-toast fixed left-1/2 -translate-x-1/2 z-[120] px-4 py-2 rounded-lg text-sm font-kanji shadow-lg"
+          style={{ background: 'var(--bg-deep)', color: '#fff' }}
+          role="status"
+        >
+          {installToast}
+        </div>
       )}
     </>
   )

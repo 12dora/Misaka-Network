@@ -18,6 +18,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { runTest } from './_harness.mjs'
 
 const TMP_DIR = mkdtempSync(join(tmpdir(), 'misaka-turn-life-'))
 
@@ -72,7 +73,8 @@ async function main() {
 
   if (failed > 0) {
     console.error(`\n❌ ${failed} 用例失败`)
-    process.exit(1)
+    process.exitCode = 1
+    return
   }
   console.log('\n✅ 全部测试通过')
 }
@@ -143,8 +145,13 @@ async function caseMonthRolloverResetsState() {
     'killSwitchTriggeredAt 重置为 0')
 }
 
-try {
-  await main()
-} finally {
-  rmSync(TMP_DIR, { recursive: true, force: true })
-}
+// CLAUDE.md "test-script lifecycle": wrap with runTest so any stray handle
+// (CF graphql interval, dangling fetch promise, expired-cred reaper timer)
+// can't keep the process alive and silently wedge CI.
+runTest(async () => {
+  try {
+    await main()
+  } finally {
+    rmSync(TMP_DIR, { recursive: true, force: true })
+  }
+})

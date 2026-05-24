@@ -11,6 +11,7 @@
 import { mkdtempSync, rmSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { runTest } from './_harness.mjs'
 
 const TMP_DIR = mkdtempSync(join(tmpdir(), 'misaka-turn-'))
 
@@ -124,17 +125,21 @@ async function main() {
 
   if (failed > 0) {
     console.error(`\n❌ ${failed} assertion(s) failed`)
-    process.exit(1)
+    process.exitCode = 1
+    return
   }
   console.log('\n✅ 全部测试通过')
 }
 
-try {
-  await main()
-} catch (err) {
-  console.error('TEST CRASH:', err)
-  process.exit(1)
-} finally {
-  globalThis.fetch = originalFetch
-  rmSync(TMP_DIR, { recursive: true, force: true })
-}
+// CLAUDE.md "test-script lifecycle": every server test script must wrap its
+// entry point with runTest so cleanup (open handles, stray timers) cannot
+// silently wedge CI. The previous try/finally + raw `process.exit(1)` on
+// crash bypassed that guard.
+runTest(async () => {
+  try {
+    await main()
+  } finally {
+    globalThis.fetch = originalFetch
+    rmSync(TMP_DIR, { recursive: true, force: true })
+  }
+})

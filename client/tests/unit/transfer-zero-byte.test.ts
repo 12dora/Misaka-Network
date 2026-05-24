@@ -10,7 +10,7 @@
 // The fix short-circuits both paths so an empty file completes deterministically.
 
 import { describe, it, expect, vi } from 'vitest'
-import { sendFileParallel } from '../../src/lib/transfer'
+import { sendFileParallel, handleMetaMessage, getReceiveSession, type MetaMessage } from '../../src/lib/transfer'
 
 // Stub the DB layer so we don't touch IndexedDB in jsdom.
 vi.mock('../../src/lib/db', () => ({
@@ -74,5 +74,39 @@ describe('sendFileParallel: zero-byte file', () => {
     expect(meta).toMatchObject({
       type: 'meta', fileSize: 0, totalChunks: 0,
     })
+  })
+})
+
+// Receiver-side regression. The store in network.ts has an explicit branch
+// for `totalChunks === 0 && fileSize === 0` that synthesizes the completion
+// (no chunk frames will ever follow a zero-byte meta). This test locks in
+// the *transfer engine's* contract that supports that flow: after
+// handleMetaMessage with totalChunks=0, the registered ReceiveSession must
+// be in a state where `received.size === totalChunks` is already true.
+describe('handleMetaMessage: zero-byte receiver session', () => {
+  it('creates a session whose completion gate is already satisfied', async () => {
+    const meta: MetaMessage = {
+      type: 'meta',
+      transferId: 'zero-recv',
+      shortId: 1,
+      fileName: 'empty.txt',
+      fileSize: 0,
+      fileHash: '',
+      totalChunks: 0,
+      mime: 'text/plain',
+    }
+    const session = await handleMetaMessage(meta, 42)
+
+    // Completion gate: received.size === totalChunks. Both are 0, so the
+    // gate is true the instant the session is registered, without any
+    // receiveChunk() call. network.ts:1262 reads this state to deliver the
+    // empty File synchronously.
+    expect(session.totalChunks).toBe(0)
+    expect(session.received.size).toBe(0)
+    expect(session.received.size).toBe(session.totalChunks)
+
+    // The session must also be retrievable by transferId so the meta
+    // handler in network.ts can clean up the demux entry afterwards.
+    expect(getReceiveSession('zero-recv')).toBe(session)
   })
 })

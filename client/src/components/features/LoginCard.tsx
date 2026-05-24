@@ -200,13 +200,19 @@ export default function LoginCard() {
             max={20001}
             value={identity.nodeId}
             onChange={e => handleNodeIdChange(e.target.value)}
-            className="min-w-0 flex-1 px-3 py-2 rounded-lg border text-center font-mono font-bold text-lg text-[var(--text-on-white)] focus:outline-none transition-colors"
+            // P2 (mobile): force at least 16px on phones so iOS Safari doesn't
+            // zoom on focus. text-lg = 1.125rem = 18px, which is already ≥16px,
+            // but the inline style is explicit so future class changes don't
+            // silently re-trigger the zoom.
+            className="misaka-focus-ring min-w-0 flex-1 px-3 py-2 rounded-lg border text-center font-mono font-bold text-base xs:text-lg text-[var(--text-on-white)] focus:outline-none transition-colors"
             style={{
               borderColor: 'var(--border-card)',
               background: 'var(--surface)',
+              fontSize: '16px',
             }}
             onFocus={e => (e.target.style.borderColor = 'var(--bg-deep)')}
             onBlur={e => (e.target.style.borderColor = 'var(--border-card)')}
+            aria-label="节点编号"
           />
           <span className="font-kanji text-xs xs:text-sm text-[var(--text-on-white-2)] shrink-0">号</span>
           <button
@@ -254,12 +260,17 @@ export default function LoginCard() {
                 e.target.select()
               }}
               onBlur={e => (e.target.style.borderColor = 'var(--border-card)')}
-              className="w-full min-w-0 h-11 xs:h-12 text-center font-mono font-bold text-lg rounded-lg border focus:outline-none transition-colors"
+              // P0-3: `misaka-focus-ring` re-establishes a visible focus
+              // outline. Tailwind's `focus:outline-none` is kept so the
+              // platform default doesn't clash with the kanji-style ring.
+              className="misaka-focus-ring w-full min-w-0 h-11 xs:h-12 text-center font-mono font-bold text-lg rounded-lg border focus:outline-none transition-colors"
               style={{
                 borderColor: 'var(--border-card)',
                 background: 'var(--surface)',
                 color: 'var(--text-on-white)',
+                fontSize: '16px',
               }}
+              aria-label={`通行码第 ${i + 1} 位`}
             />
           ))}
           <button
