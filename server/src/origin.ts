@@ -31,19 +31,24 @@ let cachedList: string[] | null = null
 let cachedWildcard: boolean | null = null
 
 /**
- * "Public signaling" mode: ALLOWED_ORIGINS=* lets the server accept any
- * Origin. Intended for the canonical public deployment where the frontend
- * lives on GitHub Pages (one origin per fork) and the backend serves
- * everyone. Cross-site CSRF risk is mitigated by the other defences —
- * scrypt-hashed 6-digit passcode, 5s WS AUTH grace, global per-nodeId
- * brute-force freeze, per-IP rate limits — so the Origin lock-down is the
- * appropriate-to-disable layer for a service that's deliberately open.
+ * "Public signaling" mode — server accepts any Origin. Triggered by:
+ *   - ALLOWED_ORIGINS=*     → explicit opt-in.
+ *   - ALLOWED_ORIGINS unset → default. The project's design goal is "low-
+ *     barrier public signaling": anyone in the world should be able to
+ *     point a fork at this server. CSRF risk is mitigated by the other
+ *     defences (scrypt 6-digit passcode, 5s WS AUTH grace, per-nodeId
+ *     global brute-force freeze, per-IP rate limits, 64KB body cap).
  *
- * Private deployments should leave this unset and list specific origins.
+ * Private deployments lock down by setting `ALLOWED_ORIGINS` to an
+ * explicit comma-separated list of trusted browser origins.
  */
 export function isWildcardOriginMode(): boolean {
   if (cachedWildcard !== null) return cachedWildcard
-  cachedWildcard = (process.env.ALLOWED_ORIGINS ?? '').trim() === '*'
+  const raw = process.env.ALLOWED_ORIGINS
+  // Treat "unset" (undefined) and "*" identically. An EMPTY string is
+  // explicit lockdown intent — keep strict in that case so an operator
+  // who writes `ALLOWED_ORIGINS=` doesn't silently get wildcard.
+  cachedWildcard = raw === undefined || raw.trim() === '*'
   return cachedWildcard
 }
 
