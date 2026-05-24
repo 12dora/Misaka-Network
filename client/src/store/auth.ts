@@ -4,6 +4,35 @@ import { apiUrl } from '@/config'
 import { NODE_ID_MIN, NODE_ID_MAX } from '@/constants'
 import { onAuthInvalid } from '@/lib/signaling'
 
+// Web Locks API mutex: hold this lock for the lifetime of the tab. If another
+// tab in the same origin tries to register the same nodeId, its `request()`
+// with `ifAvailable: true` returns null and we surface a clear conflict
+// message. Browsers without Web Locks (older Safari) silently no-op — degraded
+// behavior matches the pre-existing "last writer wins" anyway.
+let nodeIdLockRelease: (() => void) | null = null
+
+async function acquireNodeIdLock(nodeId: number): Promise<boolean> {
+  if (typeof navigator === 'undefined' || !('locks' in navigator)) return true
+  // Release any previously held lock (user changed nodeId).
+  if (nodeIdLockRelease) { nodeIdLockRelease(); nodeIdLockRelease = null }
+  return new Promise<boolean>((resolve) => {
+    // ifAvailable: true → never block, returns null on contention.
+    navigator.locks.request(
+      `misaka-node-${nodeId}`,
+      { ifAvailable: true },
+      (lock) => {
+        if (!lock) { resolve(false); return undefined }
+        resolve(true)
+        // Hold for the tab's lifetime via a never-resolving promise; the
+        // browser releases the lock automatically on tab close / refresh.
+        return new Promise<void>((release) => {
+          nodeIdLockRelease = release
+        })
+      },
+    ).catch(() => resolve(true))   // unexpected → don't block the user
+  })
+}
+
 function randomInt(min: number, max: number) {
   return Math.floor(Math.random() * (max - min + 1)) + min
 }
@@ -11,8 +40,12 @@ function randomInt(min: number, max: number) {
 function generateIdentity(): Identity {
   const cached = sessionStorage.getItem('misaka.identity')
   if (cached) {
-    const data = JSON.parse(cached) as { nodeId: number; passCode?: string; createdAt: number }
-    return { nodeId: data.nodeId, passCode: data.passCode ?? '', createdAt: data.createdAt }
+    // P1: passCode is NEVER restored from storage — it is private credential
+    // material and only the nodeId/createdAt are safe to persist. If a session
+    // token is also cached and still valid, no re-entry is needed; otherwise
+    // the user must re-type the passcode (the trade-off for strong privacy).
+    const data = JSON.parse(cached) as { nodeId: number; createdAt: number }
+    return { nodeId: data.nodeId, passCode: '', createdAt: data.createdAt }
   }
   const identity: Identity = {
     nodeId: randomInt(NODE_ID_MIN, NODE_ID_MAX),
@@ -24,7 +57,8 @@ function generateIdentity(): Identity {
 }
 
 function persistIdentity(identity: Identity) {
-  sessionStorage.setItem('misaka.identity', JSON.stringify({ nodeId: identity.nodeId, passCode: identity.passCode, createdAt: identity.createdAt }))
+  // Only nodeId + createdAt — passCode stays in memory.
+  sessionStorage.setItem('misaka.identity', JSON.stringify({ nodeId: identity.nodeId, createdAt: identity.createdAt }))
 }
 
 /** Try to restore a saved session from sessionStorage (survives page refresh). */
@@ -100,6 +134,15 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     const current = get().identity
     set({ isLoading: true, error: null, ipFullPrompt: false })
 
+    const ownsLock = await acquireNodeIdLock(current.nodeId)
+    if (!ownsLock) {
+      set({
+        isLoading: false,
+        error: '该节点编号已在本浏览器的另一个标签页接入。请关闭其他标签页或更换节点编号。',
+      })
+      return
+    }
+
     try {
       const res = await fetch(apiUrl('/api/register'), {
         method: 'POST',
@@ -121,7 +164,18 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         const mins = Math.ceil((data.unlockAt - Date.now()) / 60000)
         const msg = data.reason === 'WRONG_PASSCODE'
           ? `通行码错误次数过多，节点已临时锁定（${mins} 分钟后解除）`
-          : `检测到异常接入尝试，节点已临时锁定（${mins} 分钟后解除）`
+          : data.reason === 'NODE_FROZEN'
+            ? `该节点被多 IP 频繁试探，已全局冻结（${mins} 分钟后解除）。请稍后再试，或更换节点编号。`
+            : `检测到异常接入尝试，节点已临时锁定（${mins} 分钟后解除）`
+        set({ isLoading: false, error: msg })
+        return
+      }
+
+      if (res.status === 403) {
+        const data = await res.json().catch(() => ({ error: 'BAD_ORIGIN' })) as { error: string; message?: string }
+        const msg = data.error === 'BAD_ORIGIN'
+          ? '请求来源不被允许。请确认在官方部署域名下访问，而非直接打开 HTML。'
+          : (data.message ?? '请求被拒绝')
         set({ isLoading: false, error: msg })
         return
       }
@@ -198,6 +252,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   clearSession() {
     sessionStorage.removeItem('misaka.session')
+    if (nodeIdLockRelease) { nodeIdLockRelease(); nodeIdLockRelease = null }
     set({ session: null, isConnected: false })
   },
 
@@ -211,6 +266,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       }).catch(() => {})
     }
     sessionStorage.removeItem('misaka.session')
+    if (nodeIdLockRelease) { nodeIdLockRelease(); nodeIdLockRelease = null }
     set({ session: null, isConnected: false, error: null })
   },
 }))

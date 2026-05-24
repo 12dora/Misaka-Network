@@ -17,12 +17,13 @@ import {
   TURN_MAX_BYTES_PER_SESSION, TURN_MAX_BYTES_PER_HOUR_PER_IP, TURN_MAX_ISSUE_PER_HOUR_PER_IP,
   TURN_GLOBAL_MONTHLY_BYTES_LIMIT, TURN_GLOBAL_THRESHOLD_PCT, TURN_REVOKE_ALL_ON_KILL,
   TURN_PESSIMISTIC_RATE_BPS,
-  TURN_ABUSE_POLL_SEC, TURN_GLOBAL_POLL_SEC,
+  TURN_ABUSE_POLL_SEC, TURN_GLOBAL_POLL_SEC, TURN_REVOKE_RETRY_INTERVAL_MS,
 } from './config.js'
 import {
   getTurnState, markDirty, rollMonthIfNeeded,
   type ActiveCredential,
 } from './persist.js'
+import { deriveCustomIdentifier, redactCustomIdentifier } from './store.js'
 
 const CF_API_BASE = 'https://rtc.live.cloudflare.com/v1'
 const CF_GRAPHQL = 'https://api.cloudflare.com/client/v4/graphql'
@@ -99,13 +100,14 @@ export async function issueCredentials(sessionId: string, ip: string): Promise<I
     return { ok: false, reason: 'IP_BYTES_LIMITED' }
   }
 
-  // Call CF
-  const customIdentifier = `misaka-${sessionId}`
+  // Call CF. customIdentifier is a one-way derivation of (sessionId,
+  // SERVER_SECRET); CF logs never see the sessionId directly.
+  const customIdentifier = deriveCustomIdentifier(sessionId)
   let cfResp: CfCredentialsResponse
   try {
     cfResp = await cfGenerateCredentials(customIdentifier, TURN_CREDENTIAL_TTL_SEC)
   } catch (err) {
-    console.error('[turn] cf issue failed for', customIdentifier, '-', (err as Error).message)
+    console.error('[turn] cf issue failed for', redactCustomIdentifier(customIdentifier), '-', (err as Error).message)
     return { ok: false, reason: 'CF_ERROR' }
   }
 
@@ -140,7 +142,9 @@ export async function issueCredentials(sessionId: string, ip: string): Promise<I
 
 /**
  * Best-effort revoke. Used both on abuse and on global kill (if configured).
- * Logs failures but never throws to caller.
+ * Logs failures but never throws to caller. Returns whether the CF call
+ * succeeded; callers that care use it to decide whether to drop or queue
+ * the entry for retry.
  */
 export async function revokeCustomIdentifier(customIdentifier: string): Promise<boolean> {
   try {
@@ -152,12 +156,12 @@ export async function revokeCustomIdentifier(customIdentifier: string): Promise<
       },
     })
     if (!res.ok) {
-      console.error(`[turn] revoke ${customIdentifier} failed: HTTP ${res.status}`)
+      console.error(`[turn] revoke ${redactCustomIdentifier(customIdentifier)} failed: HTTP ${res.status}`)
       return false
     }
     return true
   } catch (err) {
-    console.error(`[turn] revoke ${customIdentifier} error:`, (err as Error).message)
+    console.error(`[turn] revoke ${redactCustomIdentifier(customIdentifier)} error:`, (err as Error).message)
     return false
   }
 }
@@ -224,6 +228,65 @@ export function stopTurnPollers() {
     clearTimeout(initialGlobalPoller)
     initialGlobalPoller = null
   }
+}
+
+// ── Revoke-retry loop (P1-6) ─────────────────────────────────────────
+//
+// When a CF revoke call fails (HTTP 5xx, transient network, etc.) we leave
+// the credential in activeCredentials with `revokePending = true`. This
+// background loop walks every pending entry on a slow cadence and retries.
+// On success the entry is dropped; on failure we just bump the attempt
+// counter for log triage and try again next tick. Natural TTL expiry
+// (pruneActiveCredentials) is still the final backstop.
+
+let revokeRetryTimer: NodeJS.Timeout | null = null
+
+export function startTurnRevokeRetry() {
+  if (revokeRetryTimer) return
+  revokeRetryTimer = setInterval(() => {
+    retryPendingRevokes().catch(err => console.error('[turn] revoke retry error:', err.message))
+  }, TURN_REVOKE_RETRY_INTERVAL_MS)
+  revokeRetryTimer.unref?.()
+}
+
+export function stopTurnRevokeRetry() {
+  if (revokeRetryTimer) {
+    clearInterval(revokeRetryTimer)
+    revokeRetryTimer = null
+  }
+}
+
+async function retryPendingRevokes() {
+  const state = getTurnState()
+  const now = Date.now()
+  // Snapshot to avoid mutating-while-iterating; revokes are sequential to
+  // keep CF rate-limit pressure minimal.
+  const pending = Object.entries(state.activeCredentials).filter(([, c]) => c.revokePending)
+  if (pending.length === 0) return
+  for (const [cid, active] of pending) {
+    if (active.expiresAt < now) {
+      // The credential has aged out anyway — pruneActiveCredentials will
+      // clear it on the next issue, but be tidy and drop now.
+      delete state.activeCredentials[cid]
+      markDirty()
+      continue
+    }
+    const ok = await revokeCustomIdentifier(cid)
+    if (ok) {
+      delete state.activeCredentials[cid]
+      markDirty()
+    } else {
+      active.revokeAttempts = (active.revokeAttempts ?? 0) + 1
+      active.lastRevokeAttemptAt = now
+      markDirty()
+    }
+  }
+}
+
+// Test-only hook: drive a single retry pass synchronously. Production code
+// uses the timer above.
+export async function _retryPendingRevokesNow() {
+  await retryPendingRevokes()
 }
 
 // ── Internals ────────────────────────────────────────────────────────
@@ -419,9 +482,20 @@ async function pollPerIdentifierUsage() {
       markDirty()
     }
     if (actualBytes >= TURN_MAX_BYTES_PER_SESSION) {
-      console.warn(`[turn] abuse: ${cid} used ${actualBytes} bytes (cap ${TURN_MAX_BYTES_PER_SESSION}), revoking`)
-      await revokeCustomIdentifier(cid)
-      delete state.activeCredentials[cid]
+      console.warn(`[turn] abuse: ${redactCustomIdentifier(cid)} used ${actualBytes} bytes (cap ${TURN_MAX_BYTES_PER_SESSION}), revoking`)
+      const ok = await revokeCustomIdentifier(cid)
+      if (ok) {
+        delete state.activeCredentials[cid]
+      } else {
+        // P1-6: do NOT drop the entry on revoke failure. We need to retry
+        // until either CF accepts the revoke or the credential's TTL
+        // elapses (pruneActiveCredentials will reap then). Otherwise we
+        // lose visibility into an outstanding credential that still
+        // counts against our quota.
+        active.revokePending = true
+        active.revokeAttempts = (active.revokeAttempts ?? 0) + 1
+        active.lastRevokeAttemptAt = Date.now()
+      }
       markDirty()
     }
   }

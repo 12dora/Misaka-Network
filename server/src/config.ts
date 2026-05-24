@@ -75,3 +75,43 @@ export const TURN_BAN_DURATION_SEC = parseInt(process.env.TURN_BAN_DURATION_SEC 
 // Persistence.
 export const TURN_PERSIST_DIR = process.env.TURN_PERSIST_DIR ?? './data'
 export const TURN_PERSIST_INTERVAL_SEC = parseInt(process.env.TURN_PERSIST_INTERVAL_SEC ?? '10', 10)
+
+// ── Global brute-force freeze (per-nodeId, IP-rotation defence) ──────
+// Independent of the per-(IP,nodeId) lock: this triggers when many distinct
+// IPs all fail against the same nodeId, which is the classic "rotate proxies
+// to keep guessing" attack. While frozen, every register attempt against
+// that nodeId is rejected — even ones with the correct passcode — until the
+// freeze TTL expires. The owner reconnecting from a known IP would only
+// re-attach to their existing session (already open), so honest users are
+// unaffected.
+export const NODE_FREEZE_THRESHOLD = parseInt(process.env.NODE_FREEZE_THRESHOLD ?? '20', 10)
+export const NODE_FREEZE_WINDOW_MS = parseInt(process.env.NODE_FREEZE_WINDOW_MS ?? String(60 * 60_000), 10)
+export const NODE_FREEZE_DURATION_MS = parseInt(process.env.NODE_FREEZE_DURATION_MS ?? String(60 * 60_000), 10)
+
+// ── qr-redeem dedicated rate limit (per IP) ──────────────────────────
+export const QR_REDEEM_RATE_LIMIT = parseInt(process.env.QR_REDEEM_RATE_LIMIT ?? '10', 10)
+export const QR_REDEEM_RATE_WINDOW_MS = 60_000
+
+// ── customIdentifier secret + WS unauth-grace ────────────────────────
+// Used to make customIdentifier opaque to anyone who only sees CF logs —
+// sessionId no longer leaks through it. If unset we generate a random
+// runtime secret and warn loudly; this means CF entries from before a
+// restart cannot be correlated, which is the correct degraded mode for an
+// unset secret. Production deployments MUST set this.
+import { randomBytes } from 'crypto'
+let _serverSecret = process.env.SERVER_SECRET ?? ''
+if (!_serverSecret) {
+  _serverSecret = randomBytes(32).toString('hex')
+  console.warn('[config] SERVER_SECRET not set; using a random per-process secret. Set SERVER_SECRET in production so customIdentifier is stable across restarts.')
+}
+export const SERVER_SECRET = _serverSecret
+
+// Time a freshly-opened WS has to send AUTH before we close it with 4001.
+// Idle connections were free to sit forever before this, which let an
+// attacker exhaust the WS server's connection limit at zero cost.
+export const WS_AUTH_GRACE_MS = parseInt(process.env.WS_AUTH_GRACE_MS ?? '5000', 10)
+
+// CF revoke retry cadence (P1-6). Failed CF revoke calls are queued; this
+// timer walks the queue and retries each. We keep the entry until the call
+// either succeeds (drop) or the credential naturally expires (drop).
+export const TURN_REVOKE_RETRY_INTERVAL_MS = parseInt(process.env.TURN_REVOKE_RETRY_INTERVAL_MS ?? '60000', 10)

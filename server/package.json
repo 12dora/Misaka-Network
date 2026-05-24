@@ -9,7 +9,7 @@
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
     "test": "npm run build && npm run test:integration && npm run test:turn",
-    "test:integration": "node tests/register-edge.test.mjs && node tests/brute-force.test.mjs && node tests/release-by-ip.test.mjs && node tests/signaling-end.test.mjs && node tests/ws-auth.test.mjs && node tests/cleanup-with-active.test.mjs && node tests/ws-block.test.mjs",
+    "test:integration": "node tests/register-edge.test.mjs && node tests/brute-force.test.mjs && node tests/brute-force-global.test.mjs && node tests/release-by-ip.test.mjs && node tests/signaling-end.test.mjs && node tests/ws-auth.test.mjs && node tests/ws-origin.test.mjs && node tests/csrf-origin.test.mjs && node tests/cleanup-with-active.test.mjs && node tests/ws-block.test.mjs && node tests/signal-peer-offline.test.mjs && node tests/activity-auth-gated.test.mjs && node tests/qr-redeem-ratelimit.test.mjs && node tests/passcode-scrypt.test.mjs && node tests/persist-locks.test.mjs && node tests/turn-revoke-retry.test.mjs",
     "test:turn": "node tests/turn-policy.test.mjs && node tests/turn-lifecycle.test.mjs && node tests/turn-http.test.mjs",
     "test:stress": "node tests/stress-1gb.test.mjs"
   },

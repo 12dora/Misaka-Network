@@ -84,9 +84,48 @@ export function hasAESKey(peerSessionId: string): boolean {
 //   independently — each call gets its own prefix, so the same chunk index
 //   across two peers produces different IVs even when the plaintext is the
 //   same file. See `transfer-iv-multi-peer.test.ts` for the regression.
-export function makeChunkIv(prefix: Uint8Array, index: number): Uint8Array<ArrayBuffer> {
+// Overloads:
+//   - 2-arg (deprecated): legacy callers that pre-date P1-9. Sync,
+//     no domain separation. New code should pass transferId.
+//   - 3-arg (P1-9): async because the per-transfer domain separation is
+//     a SHA-256 of (ivPrefix || transferIdBytes); the first 8 bytes of
+//     the digest replace the raw prefix. Result: two transfers that
+//     accidentally drew the same `randomIvPrefix()` get DIFFERENT IVs
+//     for chunk index N, eliminating the (key, IV) reuse risk entirely.
+export function makeChunkIv(prefix: Uint8Array, index: number): Uint8Array<ArrayBuffer>
+export function makeChunkIv(prefix: Uint8Array, index: number, transferId: string): Promise<Uint8Array<ArrayBuffer>>
+export function makeChunkIv(
+  prefix: Uint8Array,
+  index: number,
+  transferId?: string,
+): Uint8Array<ArrayBuffer> | Promise<Uint8Array<ArrayBuffer>> {
+  if (transferId === undefined) {
+    // Legacy fast path — unchanged from pre-P1-9.
+    const iv = new Uint8Array(12)
+    iv.set(prefix.subarray(0, 8), 0)
+    new DataView(iv.buffer).setUint32(8, index >>> 0, false)
+    return iv as Uint8Array<ArrayBuffer>
+  }
+  return makeChunkIvAsync(prefix, index, transferId)
+}
+
+async function makeChunkIvAsync(
+  prefix: Uint8Array,
+  index: number,
+  transferId: string,
+): Promise<Uint8Array<ArrayBuffer>> {
+  // Hash(prefix || transferId) → take first 8 bytes as the
+  // domain-separated prefix. SHA-256 is overkill cryptographically (we
+  // only need a 64-bit codomain), but it's hardware-accelerated in every
+  // browser and the cost (~5 µs) is amortised across the chunk's full
+  // encrypt + send, which is a few orders of magnitude slower.
+  const transferIdBytes = new TextEncoder().encode(transferId)
+  const input = new Uint8Array(8 + transferIdBytes.length)
+  input.set(prefix.subarray(0, 8), 0)
+  input.set(transferIdBytes, 8)
+  const digest = await crypto.subtle.digest('SHA-256', input)
   const iv = new Uint8Array(12)
-  iv.set(prefix.subarray(0, 8), 0)
+  iv.set(new Uint8Array(digest, 0, 8), 0)
   new DataView(iv.buffer).setUint32(8, index >>> 0, false)
   return iv as Uint8Array<ArrayBuffer>
 }

@@ -6,6 +6,7 @@ import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
 import QRModal from '@/components/features/QRModal'
 import ScanModal from '@/components/features/ScanModal'
+import IpFullPrompt from '@/components/features/IpFullPrompt'
 import { SPECIAL_NODE_HINTS } from '@/data/lore'
 import {
   getPassChars as computePassChars,
@@ -23,19 +24,47 @@ export default function LoginCard() {
     connect, disconnect, releaseAllFromIp, dismissIpFullPrompt,
   } = useAuthStore()
 
-  async function handleReleaseAndRetry() {
-    const released = await releaseAllFromIp()
-    if (released > 0) await connect()
-    if (useAuthStore.getState().isConnected) navigate('/network')
-  }
-
   const passInputs = useRef<(HTMLInputElement | null)[]>([])
   const [showQR, setShowQR] = useState(false)
   const [showScan, setShowScan] = useState(false)
+  const [releasing, setReleasing] = useState(false)
+  // P1-8: track when the user types a node id outside the legal range so we
+  // can surface an inline hint instead of silently no-op'ing setState.
+  const [nodeIdError, setNodeIdError] = useState<string | null>(null)
+
+  async function handleReleaseAndRetry(): Promise<number> {
+    setReleasing(true)
+    try {
+      const released = await releaseAllFromIp()
+      if (released > 0) await connect()
+      if (useAuthStore.getState().isConnected) navigate('/network')
+      return released
+    } finally {
+      setReleasing(false)
+    }
+  }
 
   function handleNodeIdChange(val: string) {
+    if (val === '') {
+      setNodeIdError(null)
+      return
+    }
     const n = parseInt(val, 10)
-    if (!isNaN(n) && n >= 1 && n <= 20001) setNodeId(n)
+    if (isNaN(n)) {
+      setNodeIdError('请输入有效的节点编号')
+      return
+    }
+    if (n < 1 || n > 20001) {
+      // P1-8: previously typing 20002 silently kept the old value with no
+      // hint — users assumed the field accepted it. Clamp into range and
+      // surface a non-blocking inline error so they understand the limit.
+      const clamped = Math.min(20001, Math.max(1, n))
+      setNodeId(clamped)
+      setNodeIdError(`节点编号需在 1–20001 之间（已自动调整为 ${clamped}）`)
+      return
+    }
+    setNodeIdError(null)
+    setNodeId(n)
   }
 
   function getPassChars(): string[] {
@@ -151,31 +180,19 @@ export default function LoginCard() {
     <>
     {showScan && <ScanModal onClose={() => setShowScan(false)} />}
     {ipFullPrompt && (
-      <div
-        className="fixed inset-0 z-[110] flex items-center justify-center p-4"
-        style={{ background: 'rgba(14,42,107,0.75)', backdropFilter: 'blur(8px)' }}
-      >
-        <MisakaCard padding="lg" className="w-full max-w-[380px]">
-          <div className="flex items-center gap-2 mb-1">
-            <MisakaKanjiBlock char="満" size="md" />
-            <span className="font-kanji font-bold text-lg text-[var(--text-on-white)]">本机节点已满</span>
-          </div>
-          <p className="font-kanji text-xs text-[var(--text-on-white-2)] mb-3">当前 IP 已达到节点上限</p>
-          <p className="font-kanji text-sm text-[var(--text-on-white)] mb-5">
-            本机 IP 同时最多允许 10 个节点。是否销毁本机所有已注册节点后重新接入？
-          </p>
-          <div className="flex gap-2">
-            <MisakaButton variant="primary" fullWidth onClick={handleReleaseAndRetry}>
-              全部销毁并重试
-            </MisakaButton>
-            <MisakaButton variant="pill" fullWidth onClick={dismissIpFullPrompt}>
-              取消
-            </MisakaButton>
-          </div>
-        </MisakaCard>
-      </div>
+      <IpFullPrompt
+        busy={releasing}
+        onConfirm={handleReleaseAndRetry}
+        onCancel={dismissIpFullPrompt}
+      />
     )}
-    <MisakaCard padding="lg" className="w-full max-w-[420px] min-w-0 overflow-hidden !p-5 xs:!p-6 sm:!p-8">
+    <MisakaCard
+      padding="lg"
+      className="w-full max-w-[420px] min-w-0 overflow-hidden !p-5 xs:!p-6 sm:!p-8"
+      // P2-15: lets TopNav's "请先接入" nudge scroll this card into view
+      // when the user clicks the disabled 网络 pill from any page.
+      data-login-card
+    >
       {/* Header */}
       <div className="flex items-center gap-2 mb-1">
         <MisakaKanjiBlock char="同" size="md" />
@@ -216,7 +233,7 @@ export default function LoginCard() {
           />
           <span className="font-kanji text-xs xs:text-sm text-[var(--text-on-white-2)] shrink-0">号</span>
           <button
-            onClick={regenerateNodeId}
+            onClick={() => { regenerateNodeId(); setNodeIdError(null) }}
             className="w-8 h-8 rounded-full flex items-center justify-center transition-transform hover:rotate-180 duration-300 cursor-pointer shrink-0"
             style={{ background: 'var(--surface-tint)', color: 'var(--bg-deep)', border: 'none' }}
             title="重新生成"
@@ -225,6 +242,15 @@ export default function LoginCard() {
             ↻
           </button>
         </div>
+        {nodeIdError && (
+          <p
+            className="mt-1 text-[11px] font-kanji"
+            style={{ color: 'var(--state-warn)' }}
+            role="alert"
+          >
+            ⚠ {nodeIdError}
+          </p>
+        )}
       </div>
 
       {specialHint && (
@@ -238,10 +264,13 @@ export default function LoginCard() {
       )}
 
       {/* Pass Code */}
-      <div className="mb-6">
-        <label className="block text-xs font-kanji text-[var(--text-on-white-2)] mb-1.5">
+      <fieldset className="mb-6" style={{ border: 'none', padding: 0, margin: 0 }}>
+        <legend className="block text-xs font-kanji text-[var(--text-on-white-2)] mb-1.5" style={{ padding: 0 }}>
           ◇ 通行码
-        </label>
+        </legend>
+        {/* P1-14: screen-reader-only descriptor so the six digit cells read
+            as a coherent group instead of six anonymous inputs. */}
+        <span className="sr-only">通行码，6 位数字</span>
         <div className="grid items-center gap-1.5" style={{ gridTemplateColumns: 'repeat(6, minmax(0, 1fr)) auto' }}>
           {getPassChars().map((digit, i) => (
             <input
@@ -278,11 +307,13 @@ export default function LoginCard() {
             className="w-8 h-8 rounded-full flex items-center justify-center hover:rotate-180 duration-300 transition-transform cursor-pointer ml-1 shrink-0"
             style={{ background: 'var(--surface-tint)', color: 'var(--bg-deep)', border: 'none' }}
             title="重新生成"
+            type="button"
+            aria-label="重新生成通行码"
           >
             ↻
           </button>
         </div>
-      </div>
+      </fieldset>
 
       {/* Error */}
       {error && (

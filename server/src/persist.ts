@@ -3,10 +3,16 @@
 // Holds only data that MUST survive restart: monthly byte tally,
 // in-flight credentials, recent issuance history. Everything else stays in
 // memory by design (节点 / 会话 / 上报 ephemeral per spec).
+//
+// Brute-force lock persistence (P1-7) is a *separate* file so the two
+// concerns can roll independently and so corrupting one doesn't take out
+// the other. We don't persist session tokens or sessionIds — those reset
+// on restart by design.
 
 import fs from 'fs/promises'
 import path from 'path'
 import { TURN_PERSIST_DIR, TURN_PERSIST_INTERVAL_SEC } from './config.js'
+import { attemptLocks, nodeFreezes, type AttemptLock, type NodeFreeze } from './store.js'
 
 export interface ActiveCredential {
   sessionId: string
@@ -15,6 +21,9 @@ export interface ActiveCredential {
   issuedAt: number
   expiresAt: number
   pessimisticBytes: number   // local upper-bound estimate; CF analytics corrects this
+  revokePending?: boolean    // P1-6: set when a CF revoke call failed; background retry will try again until success or expiry
+  revokeAttempts?: number    // how many retry attempts we've made (for log triage)
+  lastRevokeAttemptAt?: number
 }
 
 export interface IssuanceRecord {
@@ -186,6 +195,7 @@ export function startPersistFlusher() {
   if (flushTimer) return
   flushTimer = setInterval(() => {
     flushTurnState().catch(() => { /* logged inside */ })
+    flushPersistedLocks().catch(() => { /* logged inside */ })
   }, TURN_PERSIST_INTERVAL_SEC * 1000)
   // don't keep process alive solely for the flusher
   flushTimer.unref?.()
@@ -195,5 +205,84 @@ export function stopPersistFlusher() {
   if (flushTimer) {
     clearInterval(flushTimer)
     flushTimer = null
+  }
+}
+
+// ── Brute-force lock persistence (P1-7) ─────────────────────────────
+//
+// Why this is a separate file from the TURN snapshot:
+//   - Different write cadence: locks change on every failed register, TURN
+//     state changes on credential issue / poll. Coalescing into one file
+//     would make every lock event also fsync TURN state.
+//   - Different blast radius: TURN state is large and corrupting it costs
+//     real money; lock state is small and corrupting it costs at most an
+//     hour of brute-force defence.
+//   - Restart attacks: without this file, an attacker who could trigger a
+//     server restart would also instantly clear all active locks. Now the
+//     locks survive restart and the attacker has to wait for the natural
+//     LOCK_DURATION_MS / NODE_FREEZE_DURATION_MS to elapse.
+
+const LOCKS_FILE_NAME = 'auth-locks.json'
+
+interface PersistedLocksV1 {
+  version: 1
+  savedAt: number
+  attemptLocks: Array<{ key: string; lock: AttemptLock }>
+  nodeFreezes: Array<{ nodeId: number; freeze: NodeFreeze }>
+}
+
+function locksPath(): string {
+  return path.join(TURN_PERSIST_DIR, LOCKS_FILE_NAME)
+}
+
+export async function loadPersistedLocks(): Promise<void> {
+  try {
+    await fs.mkdir(TURN_PERSIST_DIR, { recursive: true })
+  } catch { /* ignored — same as turn-state */ }
+
+  let parsed: PersistedLocksV1 | null = null
+  try {
+    const raw = await fs.readFile(locksPath(), 'utf8')
+    const data = JSON.parse(raw) as PersistedLocksV1
+    if (data && typeof data === 'object' && data.version === 1) {
+      parsed = data
+    } else {
+      console.warn('[persist] auth-locks.json shape unrecognised, starting fresh')
+    }
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException
+    if (e.code !== 'ENOENT') console.error('[persist] load locks failed:', e.message)
+    return
+  }
+  if (!parsed) return
+
+  const now = Date.now()
+  for (const { key, lock } of parsed.attemptLocks) {
+    // Drop entries whose lock + idle window has already elapsed — they'd
+    // be pruned on the first cleanup tick anyway.
+    if (lock.lockedUntil === 0 && now - lock.lastAttemptAt > 60 * 60_000) continue
+    attemptLocks.set(key, lock)
+  }
+  for (const { nodeId, freeze } of parsed.nodeFreezes) {
+    if (freeze.frozenUntil === 0 && freeze.recentFailures.length === 0) continue
+    nodeFreezes.set(nodeId, freeze)
+  }
+  console.log(`[persist] loaded auth-locks.json (locks=${attemptLocks.size}, freezes=${nodeFreezes.size})`)
+}
+
+export async function flushPersistedLocks(): Promise<void> {
+  const payload: PersistedLocksV1 = {
+    version: 1,
+    savedAt: Date.now(),
+    attemptLocks: Array.from(attemptLocks.entries()).map(([key, lock]) => ({ key, lock })),
+    nodeFreezes: Array.from(nodeFreezes.entries()).map(([nodeId, freeze]) => ({ nodeId, freeze })),
+  }
+  const target = locksPath()
+  const tmp = target + TMP_SUFFIX
+  try {
+    await fs.writeFile(tmp, JSON.stringify(payload), 'utf8')
+    await fs.rename(tmp, target)
+  } catch (err) {
+    console.error('[persist] flush locks failed:', (err as Error).message)
   }
 }

@@ -4,6 +4,7 @@ import { z } from 'zod'
 import { nodes, channels, clusterChannelId, updatePeakConcurrent } from './store.js'
 import { broadcast } from './activity.js'
 import { authMiddleware } from './http.js'
+import { WS_AUTH_GRACE_MS } from './config.js'
 import type { NodeSession } from './types.js'
 
 const MAX_MESSAGE_SIZE = 64 * 1024
@@ -29,9 +30,24 @@ function send(ws: WebSocket, msg: object) {
   }
 }
 
-function forwardToSession(targetSessionId: string, msg: object, fromSessionId?: string) {
+/**
+ * Forward `msg` to the target's WS. If the target is offline (no session in
+ * the map, or its socket is null/dead), we call `onMissing(targetSessionId)`
+ * so the caller can report PEER_OFFLINE back to the sender. We don't send
+ * anything to the sender from here directly because some forwards are
+ * fire-and-forget broadcasts.
+ */
+function forwardToSession(
+  targetSessionId: string,
+  msg: object,
+  fromSessionId?: string,
+  onMissing?: (targetSessionId: string) => void,
+) {
   const target = nodes.get(targetSessionId)
-  if (!target?.socket) return
+  if (!target?.socket || target.socket.readyState !== WebSocket.OPEN) {
+    if (onMissing) onMissing(targetSessionId)
+    return
+  }
   // Block enforcement: if the target has blocked the sender, drop the message
   // silently. (Server-side guard — the client may also drop, but malicious /
   // older clients would otherwise bypass the block UI entirely.)
@@ -39,9 +55,14 @@ function forwardToSession(targetSessionId: string, msg: object, fromSessionId?: 
   send(target.socket, msg)
 }
 
-function getWSIP(req: IncomingMessage): string {
+// Canonical client-IP extractor for WS — mirrors http.getClientIP semantics
+// but operates on the upgrade request. We trust the first x-forwarded-for
+// hop (matching `app.set('trust proxy', 1)` on the HTTP side); without a
+// proxy we use the raw socket address. Exported so tests can probe it.
+export function getWSIP(req: IncomingMessage): string {
   const xff = req.headers['x-forwarded-for']
   if (typeof xff === 'string') return xff.split(',')[0].trim()
+  if (Array.isArray(xff) && xff.length > 0) return xff[0].split(',')[0].trim()
   return req.socket.remoteAddress ?? 'unknown'
 }
 
@@ -49,6 +70,15 @@ export function setupWS(wss: WebSocketServer) {
   wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
     let session: NodeSession | null = null
     let oversizeViolations = 0
+
+    // AUTH grace timer: a freshly-opened WS has WS_AUTH_GRACE_MS to send a
+    // valid AUTH frame. If it doesn't, we close 4001 AUTH_TIMEOUT. This
+    // prevents an attacker from cheaply holding idle sockets forever.
+    const authTimer = setTimeout(() => {
+      if (session) return  // raced an AUTH right before the timer fired; no-op
+      try { ws.close(4001, 'AUTH_TIMEOUT') } catch { /* already gone */ }
+    }, WS_AUTH_GRACE_MS)
+    authTimer.unref?.()
 
     ws.on('message', (raw) => {
       const rawStr = raw.toString()
@@ -71,14 +101,17 @@ export function setupWS(wss: WebSocketServer) {
 
       if (!session) {
         if (msg.t !== 'AUTH') {
+          clearTimeout(authTimer)
           ws.close(4001, 'AUTH_REQUIRED')
           return
         }
         const s = authMiddleware(msg.token)
         if (!s) {
+          clearTimeout(authTimer)
           ws.close(4002, 'INVALID_TOKEN')
           return
         }
+        clearTimeout(authTimer)
         s.socket = ws
         s.lastSeen = Date.now()
         s.ip = getWSIP(req)
@@ -99,6 +132,7 @@ export function setupWS(wss: WebSocketServer) {
     })
 
     ws.on('close', () => {
+      clearTimeout(authTimer)
       if (!session) return
       session.socket = null
       session.lastSeen = Date.now()
@@ -127,6 +161,13 @@ export function setupWS(wss: WebSocketServer) {
 }
 
 function handleMessage(ws: WebSocket, session: NodeSession, msg: z.infer<typeof wsMessageSchema>) {
+  // Helper that reports back to the SENDER when the target peer was offline.
+  // The client uses this to drop stale entries from its peer list instead
+  // of sitting on a half-open transfer forever waiting for SDP.
+  const replyPeerOffline = (targetSessionId: string) => {
+    send(ws, { t: 'PEER_OFFLINE', targetSessionId })
+  }
+
   switch (msg.t) {
     case 'PING':
       send(ws, { t: 'PONG' })
@@ -142,13 +183,9 @@ function handleMessage(ws: WebSocket, session: NodeSession, msg: z.infer<typeof 
       const ch = channels.get(channelId) ?? new Set<string>()
       channels.set(channelId, ch)
 
-      // Tell each existing peer about the newcomer (they wait for the offer).
-      // Tell the newcomer about each existing peer with shouldInitiate=true
-      // so the newcomer drives offer creation — no glare.
       for (const peerSid of ch) {
         const peer = nodes.get(peerSid)
         if (!peer) continue
-        // Don't introduce blocked peers to each other in either direction.
         if (peer.blockedIds.has(session.sessionId) || session.blockedIds.has(peer.sessionId)) continue
         forwardToSession(peerSid, {
           t: 'PEER_JOINED',
@@ -171,24 +208,36 @@ function handleMessage(ws: WebSocket, session: NodeSession, msg: z.infer<typeof 
       leaveChannel(session)
       break
 
-    case 'SIGNAL_SDP':
+    case 'SIGNAL_SDP': {
+      // Order matters: a target that is offline (no session, no socket)
+      // must surface PEER_OFFLINE so the sender can drop the stale peer
+      // from its UI. If we ran assertSameChannel first, an offline target
+      // would degrade to ERROR NOT_IN_CHANNEL (because their channelId is
+      // null on disconnect), which the client treats as a stay-and-retry
+      // signal — exactly the half-open hang we're trying to fix.
+      if (!isTargetReachable(msg.targetSessionId)) {
+        replyPeerOffline(msg.targetSessionId)
+        return
+      }
       if (!assertSameChannel(session, msg.targetSessionId)) {
         send(ws, { t: 'ERROR', code: 'NOT_IN_CHANNEL', message: '不在同一实验批次' })
         return
       }
-      // Drop if either side has blocked the other. We also check the sender's
-      // own blocklist so a stale UI doesn't keep talking to someone the user
-      // explicitly blocked.
       if (session.blockedIds.has(msg.targetSessionId)) return
       forwardToSession(msg.targetSessionId, {
         t: 'SIGNAL_SDP',
         fromSessionId: session.sessionId,
         fromNodeId: session.nodeId,
         sdp: msg.sdp,
-      }, session.sessionId)
+      }, session.sessionId, replyPeerOffline)
       break
+    }
 
-    case 'SIGNAL_ICE':
+    case 'SIGNAL_ICE': {
+      if (!isTargetReachable(msg.targetSessionId)) {
+        replyPeerOffline(msg.targetSessionId)
+        return
+      }
       if (!assertSameChannel(session, msg.targetSessionId)) return
       if (session.blockedIds.has(msg.targetSessionId)) return
       forwardToSession(msg.targetSessionId, {
@@ -196,24 +245,27 @@ function handleMessage(ws: WebSocket, session: NodeSession, msg: z.infer<typeof 
         fromSessionId: session.sessionId,
         fromNodeId: session.nodeId,
         candidate: msg.candidate,
-      }, session.sessionId)
+      }, session.sessionId, replyPeerOffline)
       break
+    }
 
-    case 'SIGNAL_ICE_END':
+    case 'SIGNAL_ICE_END': {
+      if (!isTargetReachable(msg.targetSessionId)) {
+        replyPeerOffline(msg.targetSessionId)
+        return
+      }
       if (!assertSameChannel(session, msg.targetSessionId)) return
       if (session.blockedIds.has(msg.targetSessionId)) return
       forwardToSession(msg.targetSessionId, {
         t: 'SIGNAL_ICE_END',
         fromSessionId: session.sessionId,
         fromNodeId: session.nodeId,
-      }, session.sessionId)
+      }, session.sessionId, replyPeerOffline)
       break
+    }
 
     case 'BLOCK': {
       session.blockedIds.add(msg.sessionId)
-      // Also tell the blocked peer to drop us — otherwise their UI keeps a
-      // stale entry pointing at us. We send a synthetic PEER_LEFT (this
-      // message type already exists on the client cleanup path).
       forwardToSession(msg.sessionId, {
         t: 'PEER_LEFT',
         sessionId: session.sessionId,
@@ -241,4 +293,14 @@ function assertSameChannel(session: NodeSession, targetSessionId: string): boole
   if (!session.channelId) return false
   const target = nodes.get(targetSessionId)
   return target?.channelId === session.channelId
+}
+
+// "Reachable" = the target session is still in the map AND has an open WS.
+// If either condition is missing the peer is effectively offline and the
+// sender should be told so they can clean up their UI state.
+function isTargetReachable(targetSessionId: string): boolean {
+  const target = nodes.get(targetSessionId)
+  if (!target) return false
+  if (!target.socket) return false
+  return target.socket.readyState === WebSocket.OPEN
 }

@@ -6,15 +6,31 @@ import { router } from './http.js'
 import { setupWS } from './ws.js'
 import { setWSS } from './activity.js'
 import { startCleanupTask, stopCleanupTask } from './cleanup.js'
-import { loadTurnState, startPersistFlusher, stopPersistFlusher, flushTurnState } from './persist.js'
-import { startTurnPollers, stopTurnPollers } from './turn.js'
+import { loadTurnState, startPersistFlusher, stopPersistFlusher, flushTurnState, loadPersistedLocks } from './persist.js'
+import { startTurnPollers, stopTurnPollers, startTurnRevokeRetry, stopTurnRevokeRetry } from './turn.js'
+import { allowedOrigins, isOriginAllowed } from './origin.js'
 import { PORT, SHUTDOWN_TIMEOUT_MS } from './config.js'
 
 const app = express()
 
 app.set('trust proxy', 1)
-app.use(cors())
-app.use(express.json())
+
+// Explicit CORS allow-list — replaces the previous `cors()` (which echoed
+// every Origin). With credentials enabled, `*` would be unsafe anyway. The
+// list is the same one the WS upgrade uses.
+app.use(cors({
+  origin: (origin, cb) => {
+    // No Origin header → server-to-server / curl / native; allow.
+    if (!origin) return cb(null, true)
+    if (allowedOrigins().includes(origin)) return cb(null, true)
+    cb(null, false)
+  },
+  credentials: false,
+}))
+
+// 64kb body cap — same ceiling as the WS frame guard, so a single bad
+// request can't burn a megabyte of buffer.
+app.use(express.json({ limit: '64kb' }))
 app.use('/api', router)
 
 // Catch-all for non-API routes — always return JSON
@@ -23,11 +39,37 @@ app.all('*', (_req, res) => {
 })
 
 const httpServer = createServer(app)
-const wss = new WebSocketServer({ server: httpServer, path: '/ws' })
+
+// WebSocket upgrade verification. We refuse the upgrade if the Origin (which
+// browsers always send on WS) is missing/disallowed. Non-browser callers
+// without an Origin header are still allowed — they cannot be tricked by a
+// malicious page, and the AUTH frame is still required within 5s of connect
+// (enforced in ws.ts).
+const wss = new WebSocketServer({
+  server: httpServer,
+  path: '/ws',
+  verifyClient: (info, done) => {
+    const origin = info.req.headers.origin
+    if (origin && !isOriginAllowed(origin)) {
+      // 403 + machine-readable code; the upgrade fails before the WS handshake
+      // completes so no socket is left dangling.
+      done(false, 403, 'BAD_ORIGIN')
+      return
+    }
+    done(true)
+  },
+})
 
 setWSS(wss)
 setupWS(wss)
 startCleanupTask()
+
+// Load persisted brute-force locks + node freezes BEFORE we accept the first
+// request. Without this an attacker mid-lockout could just wait for the
+// process to restart and resume.
+loadPersistedLocks().catch(err => {
+  console.error('[boot] persist load (locks) failed:', err.message)
+})
 
 // TURN auto-provisioning: persist + pollers. Loaded async at boot so the HTTP
 // server still binds even if the filesystem is slow. Pollers self-start only
@@ -35,6 +77,7 @@ startCleanupTask()
 loadTurnState().then(() => {
   startPersistFlusher()
   startTurnPollers()
+  startTurnRevokeRetry()
 }).catch(err => {
   console.error('[boot] TURN init failed; running without auto TURN:', err.message)
 })
@@ -63,6 +106,7 @@ function gracefulShutdown(signal: string) {
   // 3. Stop TURN pollers and flush persisted state synchronously.
   stopCleanupTask()
   stopTurnPollers()
+  stopTurnRevokeRetry()
   stopPersistFlusher()
   flushTurnState(true).catch(err => console.error('[shutdown] flush error:', err.message))
 

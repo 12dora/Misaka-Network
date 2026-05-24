@@ -148,11 +148,17 @@ assert.match(crypto, /resetCrypto\(peerSessionId\?: string\)/)
 
 // Per-chunk IV is built from an 8-byte per-transfer prefix + 4-byte index
 // (NIST SP 800-38D §8.2.1) instead of a per-chunk getRandomValues call.
-assert.match(transfer, /encryptChunk\(raw, peerSessionId, makeChunkIv\(ivPrefix, i\)\)/)
+// P1-9: the prefix is additionally domain-separated with `transferId`
+// (SHA-256 of prefix||transferId) so two transfers that draw the same
+// random prefix still produce distinct IVs. The hot-path call is now
+// awaited (digest is async) and threads `transferId` through.
+assert.match(transfer, /makeChunkIv\(ivPrefix, i, transferId\)/)
+assert.match(transfer, /encryptChunk\(raw, peerSessionId, ivForChunk\)/)
 assert.match(transfer, /decryptChunk\(iv, encrypted, peerSessionId\)/)
 assert.match(transfer, /const ivPrefix = randomIvPrefix\(\)/)
 
-assert.match(serviceWorker, /misaka-shell-v3/)
+// P0-9: bumped to v4 with asset-discovery prime + skip-waiting handshake.
+assert.match(serviceWorker, /misaka-shell-v4/)
 assert.doesNotMatch(serviceWorker, /const cached = await caches\.match\(req\)\s+if \(cached\) return cached\s+try/s)
 
 console.log('✅ 前端 UI 契约测试通过')

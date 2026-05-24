@@ -17,6 +17,22 @@
 
 ☑ QA bug 修复完成（BUG-1 ~ BUG-8）— 见 docs/archive/bug.md
 
+### 2.6 五轴 QA 整治（2026-05-24）
+
+并行 sub-agent A/B/C/D 修复 + 主 agent 串行收尾。覆盖 ~50 项 P0/P1/P2 + 设计建议。
+
+**A 服务端**：WS `verifyClient` Origin 白名单、5s AUTH grace、scrypt + per-node salt 通行码哈希（兼容老 sha256 迁移）、qr-redeem 限频、qr-token passcode `^\d{6}$`、`/api/register` Origin 校验、per-nodeId 全局暴破冻结（跨 IP）、CF revoke 失败保留+后台重试、attemptLocks 持久化、`PEER_OFFLINE` 反馈、`express.json({limit:'64kb'})`、活动广播订阅化、customIdentifier 不可逆派生+日志脱敏
+
+**B 客户端网络**：移除致命的 `iceCandidatePoolSize=4` + `setConfiguration` 冲突路径（TURN 凭证轮转才真正生效）、TURN 503 指数退避、IPv6-only 分类为 `cone-v6`（不再误报阻断）、`whenSignalingStable` 替代盲跳过、`endOfCandidatesFor` 兼容 Firefox 空 sdpMid、`installIceErrorListener` + `getLastIceError` 诊断、`testTurnServer` listener 清理、`invalidateDetectedNatType` 在 online/visibilitychange 触发
+
+**C 传输/存储**：`prepareReceiveStorage` 三段回退（FSA → OPFS probe → IDB）激活 Chrome FSA 死代码、`cancelReceive` 异步等 in-flight saveChunk、多 lane race 用 sentBitmap 去重（再无重发漏 sent）、dup chunk 短路、`MAX_FILE_SIZE=16GB` sender guard、`QuotaExceededError` 统一捕获、`OPFSReceiveHandle.written` 改 bitmap、OPFS removeEntry 精确匹配、`makeChunkIv` 混入 transferId 哈希、`waitWhilePaused` Promise + signal 替代 200ms 轮询、IDB 范围删替代全表 keys
+
+**D UI/PWA**：离线 peer "立即重连此节点" 按钮、Join 页 IP_LIMITED 内联释放、接收端暂停按钮、群发入口空 drop 区也可达、节点雷达卡键盘可达、单 peer 自动选中 + activeTab guard、ScanModal 失败 toast、LoginCard 通行码 fieldset/legend、MisakaButton disabled 视觉态、SW 预缓存 + UpdateBanner、`formatBytes/Speed` 统一 1024 + 自适应单位、主 toast `role="status" aria-live`
+
+**主 agent 收尾**：types/constants 共享字段、store/network.ts 接 B/C 集成点（NAT invalidate、whenSignalingStable、endOfCandidatesFor、IceErrorListener、prepareReceiveStorage、opfsWrittenCount、PEER_OFFLINE）、store/auth.ts passCode 不入 sessionStorage / BAD_ORIGIN+NODE_FROZEN 文案 / `navigator.locks` 多 tab 互斥、4 store actions（reconnectPeer / pause+resume+cancelReceiveTransfer）、3 新 E2E spec（offline-recovery / qr-invite / receiver-pause）
+
+测试基线：client **176/176** unit + contract 全绿；server **9 个新测试文件 / 25 用例** 全绿；新增 ENV 见 `.env.example`
+
 ### 2.1 真机 / 实网端到端验证
 - ☑ PC ↔ 手机 QR 扫码加入（已测试）
 - ☑ TURN 中继自动下发（Cloudflare Realtime TURN，短时效凭证 + customIdentifier + 防滥用 policy + 1T 熔断 + 持久化）

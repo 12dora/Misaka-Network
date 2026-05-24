@@ -3,6 +3,16 @@ import { authedFetch, AuthRequiredError } from '@/lib/api'
 
 const STORAGE_KEY = 'misaka.turnServers'
 
+// P1-3: Cloudflare's STUN is dual-stack (A + AAAA), so on IPv6-only links
+// (T-Mobile US, residential CGNAT-v6, some carrier-grade China-mobile) it
+// still yields an srflx candidate where the v4-only Google/Tencent entries
+// in DEFAULT_STUN return nothing. Without this, classifyNat() saw zero
+// srflx candidates and falsely reported `blocked`. We expose it as a
+// separate export so we don't have to touch the constants.ts contract.
+export const SUPPLEMENTAL_STUN: RTCIceServer[] = [
+  { urls: 'stun:stun.cloudflare.com:3478' },
+]
+
 export interface TurnServer {
   id: string
   url: string
@@ -59,6 +69,14 @@ let refreshTimer: ReturnType<typeof setTimeout> | null = null
 let lastFailReason: string | null = null
 const REFRESH_LEAD_MS = 60_000   // refetch 60s before expiry
 
+// P1-2: when fetchAutoTurnOnce() fails (503, network blip, parse error),
+// schedule the next retry with exponential backoff capped at 60 s. Without
+// this scheduleNextRefresh() bails (autoTurn === null) and we silently give
+// up until the next manual trigger.
+let failureAttempts = 0
+const FAILURE_BACKOFF_BASE_MS = 5_000
+const FAILURE_BACKOFF_MAX_MS = 60_000
+
 // ── Config-change observers ──────────────────────────────────────────
 // Any consumer that builds an RTCConfiguration from the live TURN state
 // (network.ts owns the live RTCPeerConnections) subscribes here so it can
@@ -76,8 +94,15 @@ export function onTurnConfigChange(fn: TurnConfigChangeListener): () => void {
 
 function emitTurnConfigChange() {
   for (const fn of turnConfigListeners) {
-    try { fn() } catch (err) { console.warn('[turn] listener failed', err) }
+    try { fn() } catch (err) { tlog('listener failed', err) }
   }
+}
+
+// P2-9: scoped + timestamped warn. Kept local (instead of importing from
+// webrtc.ts) so we don't create a cycle — webrtc.ts depends on turn.ts.
+function tlog(...args: unknown[]) {
+  const ts = new Date().toISOString().slice(11, 23)
+  console.warn(`[turn ${ts}]`, ...args)
 }
 
 // ── TURN settings ────────────────────────────────────────────────────
@@ -179,7 +204,16 @@ export async function refreshAutoTurn(): Promise<RTCIceServer[]> {
     const result = await inFlight
     const changed = !sameIceServers(autoTurn?.iceServers ?? [], result?.iceServers ?? [])
     autoTurn = result
-    scheduleNextRefresh()
+    if (result) {
+      // Success: reset failure backoff and schedule the regular lead-time
+      // refetch ahead of expiry.
+      failureAttempts = 0
+      scheduleNextRefresh()
+    } else {
+      // P1-2: failure path — schedule an exponential-backoff retry so we
+      // recover from transient 503/network blips on our own.
+      scheduleFailureRetry()
+    }
     if (changed) emitTurnConfigChange()
     return result?.iceServers ?? []
   } finally {
@@ -205,10 +239,24 @@ function scheduleNextRefresh() {
   }, lead)
 }
 
+function scheduleFailureRetry() {
+  if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null }
+  const delay = Math.min(
+    FAILURE_BACKOFF_BASE_MS * Math.pow(2, failureAttempts),
+    FAILURE_BACKOFF_MAX_MS,
+  )
+  failureAttempts++
+  refreshTimer = setTimeout(() => {
+    refreshTimer = null
+    void refreshAutoTurn()
+  }, delay)
+}
+
 export function clearAutoTurn() {
   const had = autoTurn !== null
   autoTurn = null
   lastFailReason = null
+  failureAttempts = 0
   if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null }
   if (had) emitTurnConfigChange()
 }
@@ -233,12 +281,26 @@ export async function testTurnServer(server: TurnServer): Promise<boolean> {
   await pc.setLocalDescription(offer)
 
   return new Promise(resolve => {
-    const timeout = setTimeout(() => { pc.close(); resolve(false) }, 5000)
+    // P2-7: detach every listener before close() so a late candidate event
+    // doesn't keep the RTCPeerConnection (and its underlying ICE agent)
+    // alive in the GC graph. Without this we were leaking a few hundred KB
+    // per server-test click.
+    const teardown = (verdict: boolean) => {
+      try { pc.onicecandidate = null } catch { /* ignore */ }
+      try { pc.onicecandidateerror = null } catch { /* ignore */ }
+      try { pc.onicegatheringstatechange = null } catch { /* ignore */ }
+      try { pc.oniceconnectionstatechange = null } catch { /* ignore */ }
+      try { pc.onconnectionstatechange = null } catch { /* ignore */ }
+      try { pc.onsignalingstatechange = null } catch { /* ignore */ }
+      try { pc.ondatachannel = null } catch { /* ignore */ }
+      try { pc.close() } catch { /* ignore */ }
+      resolve(verdict)
+    }
+    const timeout = setTimeout(() => teardown(false), 5000)
     pc.onicecandidate = e => {
       if (e.candidate?.candidate.includes(' typ relay ')) {
         clearTimeout(timeout)
-        pc.close()
-        resolve(true)
+        teardown(true)
       }
     }
   })

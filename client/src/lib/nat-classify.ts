@@ -2,7 +2,7 @@
 // Separated from nat.ts so it can be unit-tested without a browser
 // (no DOM globals, no path aliases, no module-level side effects).
 
-export type NatType = 'open' | 'cone' | 'symmetric' | 'blocked' | 'unknown'
+export type NatType = 'open' | 'cone' | 'cone-v6' | 'symmetric' | 'blocked' | 'unknown'
 
 export interface ParsedCandidate {
   type: 'host' | 'srflx' | 'relay' | 'prflx'
@@ -124,6 +124,21 @@ export function classifyNat(candidates: ParsedCandidate[]): NatDetectionResult {
     }
   }
 
+  // P1-3: IPv6-only networks (T-Mobile US, residential CGNAT-v6, some China
+  // mobile carriers) yield only AAAA srflx candidates because the legacy
+  // v4-only STUN entries simply never answer. The mapping itself is fine —
+  // we just have no v4 path. Distinguish this from a plain cone so the UI
+  // can explain "we're on IPv6 only" instead of falling through to the
+  // generic "your firewall blocks UDP" diagnosis.
+  const srflxAllV6 = srflx.every(c => c.address.includes(':'))
+  if (srflxAllV6) {
+    return {
+      type: 'cone-v6',
+      publicEndpoints,
+      hasHostCandidate: !!hostAny,
+      reason: '只观察到 IPv6 srflx 候选，网络为 IPv6-only。',
+    }
+  }
   return {
     type: 'cone',
     publicEndpoints,

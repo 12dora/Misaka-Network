@@ -72,6 +72,10 @@ export interface Transfer {
   status: TransferStatus
   error?: string
   startedAt: number
+  // Where the receiver is materializing this transfer. 'fsa' = user-visible file via
+  // showSaveFilePicker, 'opfs' = origin-private FS, 'idb' = in-memory assembly with
+  // IndexedDB chunk store (size-capped). Affects completion-state UI affordances.
+  storageMode?: 'fsa' | 'opfs' | 'idb'
 }
 
 export interface PendingFileItem {
@@ -114,6 +118,7 @@ export type WSServerMessage =
   | { t: 'SIGNAL_ICE_END'; fromSessionId: string; fromNodeId: number }
   | { t: 'PEER_JOINED'; peer: { sessionId: string; nodeId: number; joinedAt: number }; shouldInitiate: boolean }
   | { t: 'PEER_LEFT'; sessionId: string; nodeId: number }
+  | { t: 'PEER_OFFLINE'; targetSessionId: string }   // signaling forward failed: target absent or socket dead
   | { t: 'ACTIVITY'; event: ActivityEvent }
   | { t: 'PONG' }
   | { t: 'SERVER_SHUTDOWN'; reason: string }

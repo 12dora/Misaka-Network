@@ -1,6 +1,7 @@
 import { lazy, Suspense } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import TopNav from '@/components/layout/TopNav'
+import UpdateBanner from '@/components/features/UpdateBanner'
 import { useAuthStore } from '@/store/auth'
 import { appBasePath } from '@/lib/appBase'
 
@@ -24,6 +25,10 @@ export default function App() {
     <BrowserRouter basename={basename}>
       <TopNav />
       <AnimatedRoutes />
+      {/* P0-9: surfaces "new version available — reload" when sw.js sends
+          a postMessage after activating. Sits outside the route tree so it
+          persists across navigations. */}
+      <UpdateBanner />
     </BrowserRouter>
   )
 }

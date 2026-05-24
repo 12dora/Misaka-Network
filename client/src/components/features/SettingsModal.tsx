@@ -13,11 +13,15 @@ import { ensureNotificationPermission } from '@/lib/notify'
 import { useModalExit } from '@/hooks/useModalExit'
 
 const NAT_TYPE_LABEL: Record<NatDetectionResult['type'], { label: string; color: string }> = {
-  open:      { label: '开放（无 NAT）',     color: 'var(--state-success)' },
-  cone:      { label: '锥型 NAT（可直连）', color: 'var(--state-success)' },
-  symmetric: { label: '对称 NAT（需 TURN）',color: 'var(--state-warn)' },
-  blocked:   { label: 'UDP 受限',          color: 'var(--state-warn)' },
-  unknown:   { label: '未知',              color: 'var(--text-muted)' },
+  open:       { label: '开放（无 NAT）',     color: 'var(--state-success)' },
+  cone:       { label: '锥型 NAT（可直连）', color: 'var(--state-success)' },
+  // P1-3 (other agent): IPv6-only networks deserve their own label so the
+  // user understands the connection mode rather than being told their NAT
+  // is generic-cone.
+  'cone-v6':  { label: '锥型 NAT（IPv6）',   color: 'var(--state-success)' },
+  symmetric:  { label: '对称 NAT（需 TURN）',color: 'var(--state-warn)' },
+  blocked:    { label: 'UDP 受限',          color: 'var(--state-warn)' },
+  unknown:    { label: '未知',              color: 'var(--text-muted)' },
 }
 
 interface Props {

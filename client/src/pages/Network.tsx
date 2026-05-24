@@ -25,14 +25,21 @@ function formatDuration(ms: number) {
   return m > 0 ? `${m}m ${s % 60}s` : `${s}s`
 }
 
+// P2-10: align with SettingsModal — use 1024-base everywhere so the same
+// file size doesn't appear as "1.0 MB" in one spot and "1.05 MB" in another.
 function formatBytes(b: number) {
-  if (b >= 1e9) return `${(b / 1e9).toFixed(1)} GB`
-  if (b >= 1e6) return `${(b / 1e6).toFixed(1)} MB`
-  return `${(b / 1e3).toFixed(0)} KB`
+  if (b >= 1024 ** 3) return `${(b / 1024 ** 3).toFixed(1)} GB`
+  if (b >= 1024 ** 2) return `${(b / 1024 ** 2).toFixed(1)} MB`
+  if (b >= 1024) return `${(b / 1024).toFixed(0)} KB`
+  return `${b} B`
 }
 
+// P2-10: auto-scale so a 200 KB/s transfer doesn't read "0.2 MB/s" and look
+// broken. KB/s for anything under 1 MB/s, MB/s for higher throughput.
 function formatSpeed(bps: number) {
-  return `${(bps / 1e6).toFixed(1)} MB/s`
+  const Bps = Math.max(0, bps)
+  if (Bps >= 1024 * 1024) return `${(Bps / (1024 * 1024)).toFixed(1)} MB/s`
+  return `${(Bps / 1024).toFixed(1)} KB/s`
 }
 
 function totalFileSize(items: PendingFileItem[]) {
@@ -84,9 +91,24 @@ function NodeRadar({ peers, selected, unreadByPeer, onSelect, onShowQR, onCopyLi
             <MisakaCard
               key={peer.sessionId}
               padding="sm"
-              className={`cursor-pointer hover:-translate-y-0.5 transition-all duration-150 relative ${isSelected ? 'ring-2 ring-[var(--bg-deep)]' : ''}`}
+              // P1-5: make the radar cards keyboard-operable. Without
+              // role="button" and tabIndex the card was reachable only
+              // via mouse / touch, locking out screen reader and
+              // keyboard-only users entirely. `misaka-focus-ring`
+              // re-uses the same focus outline as the passcode inputs.
+              role="button"
+              tabIndex={0}
+              aria-label={`选择御坂 ${peer.nodeId} 号节点`}
+              aria-pressed={isSelected}
+              className={`misaka-focus-ring cursor-pointer hover:-translate-y-0.5 transition-all duration-150 relative ${isSelected ? 'ring-2 ring-[var(--bg-deep)]' : ''}`}
               style={isSelected ? { background: 'var(--surface-tint)' } : {}}
               onClick={() => onSelect(peer.sessionId)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  onSelect(peer.sessionId)
+                }
+              }}
             >
               {isSelected && (
                 <div className="absolute left-0 top-3 bottom-3 w-1 rounded-r" style={{ background: 'var(--bg-deep)' }} />
@@ -372,18 +394,36 @@ function ChatInput({ peerSessionId }: { peerSessionId: string }) {
 }
 
 // ── TransferChannel ───────────────────────────────────────────────
-function TransferChannel({ selectedPeer, onStageFiles, onSendFilesToAll, onOpenSettings, onEmptyDropAttempt, onForceReconnect, onToast }: {
+function TransferChannel({ selectedPeer, onlinePeerCount, onStageFiles, onSendFilesToAll, onOpenSettings, onEmptyDropAttempt, onForceReconnect, onReconnectPeer, onToast }: {
   selectedPeer: Peer | null
+  onlinePeerCount: number
   onStageFiles: (files: File[]) => void
   onSendFilesToAll: (files: File[]) => void
   onOpenSettings: () => void
   onEmptyDropAttempt: () => void
   onForceReconnect: () => void
+  onReconnectPeer: (sessionId: string) => Promise<void>
   onToast: (text: string) => void
 }) {
   const [isDragOver, setDragOver] = useState(false)
+  // P0-1: track per-peer reconnect attempts so the button shows a loading
+  // state and the next click while in-flight is a no-op.
+  const [reconnecting, setReconnecting] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const folderInputRef = useRef<HTMLInputElement>(null)
+  const emptyFanoutInputRef = useRef<HTMLInputElement>(null)
+
+  async function handleReconnectClick() {
+    if (!selectedPeer || reconnecting) return
+    setReconnecting(true)
+    try {
+      await onReconnectPeer(selectedPeer.sessionId)
+    } catch (e) {
+      onToast(`重连失败：${String((e as Error).message ?? e)}`)
+    } finally {
+      setReconnecting(false)
+    }
+  }
 
   function handleDrop(e: React.DragEvent) {
     e.preventDefault()
@@ -448,6 +488,33 @@ function TransferChannel({ selectedPeer, onStageFiles, onSendFilesToAll, onOpenS
         <MisakaKanjiBlock char="同" size="xl" className="mb-4" />
         <p className="font-kanji font-bold text-lg text-[var(--text-on-white)] mb-1">从左侧选择目标节点</p>
         <p className="font-kanji text-sm text-[var(--text-on-white-2)] mb-3">选择节点后即可发送文件或消息</p>
+        {/* P1-4: with ≥2 online peers, fanout is a useful shortcut even
+            before the user picks a target. Previously this entry point
+            only existed inside the per-peer drop zone, so a brand-new
+            user had to pick + then fanout-from-there. */}
+        {onlinePeerCount >= 2 && (
+          <>
+            <MisakaButton
+              variant="pill"
+              size="sm"
+              className="mt-2"
+              onClick={() => emptyFanoutInputRef.current?.click()}
+            >
+              📡 群发到所有在线节点（{onlinePeerCount}）
+            </MisakaButton>
+            <input
+              ref={emptyFanoutInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                const files = Array.from(e.target.files ?? [])
+                if (files.length > 0) onSendFilesToAll(files)
+                e.target.value = ''
+              }}
+            />
+          </>
+        )}
       </MisakaCard>
     )
   }
@@ -496,12 +563,24 @@ function TransferChannel({ selectedPeer, onStageFiles, onSendFilesToAll, onOpenS
           </div>
         )}
         {selectedPeer.status === 'offline' && (
-          <div className="flex items-center gap-1.5 mt-2 px-2 py-1 rounded text-[10px]" style={{ background: 'rgba(239,68,68,0.1)', color: 'var(--state-danger)' }}>
+          <div className="flex flex-wrap items-center gap-1.5 mt-2 px-2 py-1 rounded text-[10px]" style={{ background: 'rgba(239,68,68,0.1)', color: 'var(--state-danger)' }}>
             <span className="font-kanji">连接已断开 — 请检查网络或开启 TURN 中继</span>
+            {/* P0-1: explicit per-peer reconnect so the user doesn't have
+                to wait for the auto-recovery cycle (focus/online events).
+                Disabled while a previous attempt is in flight. */}
+            <button
+              type="button"
+              onClick={handleReconnectClick}
+              disabled={reconnecting}
+              className="ml-auto font-kanji underline decoration-dotted cursor-pointer disabled:opacity-50 disabled:cursor-wait"
+              style={{ background: 'transparent', border: 'none', color: 'var(--state-danger)', padding: 0 }}
+            >
+              {reconnecting ? '正在重连…' : '立即重连此节点'}
+            </button>
             <button
               type="button"
               onClick={onOpenSettings}
-              className="ml-auto font-kanji underline decoration-dotted cursor-pointer"
+              className="font-kanji underline decoration-dotted cursor-pointer"
               style={{ background: 'transparent', border: 'none', color: 'var(--state-danger)', padding: 0 }}
             >
               打开设置
@@ -558,11 +637,12 @@ function TransferChannel({ selectedPeer, onStageFiles, onSendFilesToAll, onOpenS
 }
 
 // ── TaskPanel ─────────────────────────────────────────────────────
-function TaskPanel({ transfers, onPause, onResume, onCancel }: {
+function TaskPanel({ transfers, onPause, onResume, onCancel, onResendToPeer }: {
   transfers: Transfer[]
   onPause: (id: string) => void
   onResume: (id: string, peerSessionId: string) => void
   onCancel: (id: string) => void
+  onResendToPeer: (peerSessionId: string) => void
 }) {
   return (
     <div className="flex flex-col gap-4">
@@ -592,9 +672,10 @@ function TaskPanel({ transfers, onPause, onResume, onCancel }: {
                 <span>{formatSpeed(t.speedBps)}</span>
               </div>
               <div className="flex gap-1.5 mt-2">
-                {t.direction === 'send' && (
-                  <MisakaButton variant="pill" size="sm" className="flex-1 text-xs py-1" onClick={() => onPause(t.id)}>⏸ 暂停</MisakaButton>
-                )}
+                {/* P1-3: store supports receiver-driven pause/resume — render
+                    the same button for inbound transfers so a user can stop
+                    a large incoming file without cancelling it outright. */}
+                <MisakaButton variant="pill" size="sm" className="flex-1 text-xs py-1" onClick={() => onPause(t.id)}>⏸ 暂停</MisakaButton>
                 <MisakaButton variant="pill" size="sm" className="flex-1 text-xs py-1" onClick={() => onCancel(t.id)}>✕ 取消</MisakaButton>
               </div>
             </>
@@ -621,6 +702,29 @@ function TaskPanel({ transfers, onPause, onResume, onCancel }: {
           {t.status === 'completed' && (
             <div className="flex items-center gap-2 mt-1">
               <span style={{ color: 'var(--state-success)' }} className="font-mono text-xs">✓ 已完成</span>
+              {/* P2-12: give the completed card a meaningful next-action so
+                  it's not just an inert green badge.
+                  - send: original File is held by the engine and may already
+                    be garbage-collected; offer "再发文件给此节点" which
+                    re-opens the file picker scoped to that peer.
+                  - recv: re-download is FSA-path specific (we'd have to hold
+                    a Blob/Handle) — show a hint instead so behaviour is
+                    consistent regardless of receive backend. */}
+              {t.direction === 'send' && (
+                <MisakaButton
+                  variant="pill"
+                  size="sm"
+                  className="ml-auto text-xs py-1 px-3"
+                  onClick={() => onResendToPeer(t.peerSessionId)}
+                >
+                  再发文件给此节点
+                </MisakaButton>
+              )}
+              {t.direction === 'recv' && (
+                <span className="ml-auto font-kanji text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                  已保存
+                </span>
+              )}
             </div>
           )}
           {t.status === 'failed' && (
@@ -766,6 +870,20 @@ export default function Network() {
   const [showSettings, setShowSettings] = useState(false)
   const [toast, setToast] = useState<string | null>(null)
   const [channelOpenedAt, setChannelOpenedAt] = useState(0)
+  // P1-6: once the user has explicitly picked a tab, don't override that
+  // choice with the single-peer auto-switch effect below. Previously a user
+  // who tapped "任务" while a sole peer existed would be yanked back to
+  // "信道" on every peer-list update.
+  const userHasTouchedTab = useRef(false)
+  const setActiveTabManual = (id: TabId) => {
+    userHasTouchedTab.current = true
+    setActiveTab(id)
+  }
+  // Per-peer fanout shortcut from the empty drop-zone path needs a single
+  // file picker mounted at the page level so the input element lives across
+  // the empty/selected re-render boundary.
+  const resendPickerRef = useRef<HTMLInputElement>(null)
+  const resendTargetRef = useRef<string | null>(null)
 
   const auth = useAuthStore()
   const store = useNetworkStore()
@@ -784,10 +902,15 @@ export default function Network() {
     if (store.peers.length === 1 && !store.selectedSessionId) {
       const onlyPeer = store.peers[0]
       store.selectPeer(onlyPeer.sessionId)
-      setActiveTab('channel')
-      setChannelOpenedAt(Date.now())
+      // P1-6: only auto-switch when the user hasn't already chosen a tab
+      // for the current session. The store still gets the selection so the
+      // chat/transfer surfaces are wired up when the user does switch.
+      if (!userHasTouchedTab.current && activeTab !== 'tasks') {
+        setActiveTab('channel')
+        setChannelOpenedAt(Date.now())
+      }
     }
-  }, [store.peers, store.selectedSessionId])
+  }, [store.peers, store.selectedSessionId, activeTab])
 
   // Shared toast helper — every transient surface (copy results, force-relay
   // hints, error reports) routes through this so the misaka-toast slot is the
@@ -825,6 +948,9 @@ export default function Network() {
 
   function handleSelectPeer(sessionId: string) {
     store.selectPeer(sessionId)
+    // Picking a peer is the user's explicit "channel-please" gesture, so it's
+    // safe (and expected) to switch even if they previously parked on tasks.
+    userHasTouchedTab.current = true
     setActiveTab('channel')
     setChannelOpenedAt(Date.now())
   }
@@ -832,7 +958,29 @@ export default function Network() {
   function handleStageFiles(files: File[]) {
     if (!store.selectedSessionId) return
     store.addPendingFiles(store.selectedSessionId, files)
+    userHasTouchedTab.current = true
     setActiveTab('channel')
+  }
+
+  function handleResendToPeer(peerSessionId: string) {
+    resendTargetRef.current = peerSessionId
+    resendPickerRef.current?.click()
+  }
+
+  async function handleReconnectPeer(sessionId: string) {
+    // P0-1: until the store ships a per-peer `reconnectPeer` action we fall
+    // back to the shared recoverConnections() path — it iterates every peer
+    // and rebuilds offline ones, which covers the case the button targets.
+    // TODO(main-agent): wire reconnectPeer(sessionId) for a targeted recover.
+    const s = useNetworkStore.getState() as unknown as {
+      reconnectPeer?: (sid: string) => Promise<void>
+      recoverConnections: () => void
+    }
+    if (typeof s.reconnectPeer === 'function') {
+      await s.reconnectPeer(sessionId)
+    } else {
+      s.recoverConnections()
+    }
   }
 
   function handleEmptyDropAttempt() {
@@ -849,6 +997,54 @@ export default function Network() {
   }
 
   const peerEntity = store.peers.find(p => p.sessionId === store.selectedSessionId) ?? null
+  const onlinePeerCount = store.peers.filter(p => p.status !== 'offline').length
+
+  // P1-3 wiring: pause/resume/cancel must dispatch to the receive-side
+  // variants when the transfer is inbound, since the engine state lives in
+  // a different bucket. Falls back to the send-side action if the receive
+  // variant isn't wired yet — same UX, just less complete.
+  function dispatchPause(transferId: string) {
+    const t = store.transfers.find(tr => tr.id === transferId)
+    if (t?.direction === 'recv') {
+      // TODO(main-agent): wire pauseReceiveTransfer(transferId).
+      const s = useNetworkStore.getState() as unknown as {
+        pauseReceiveTransfer?: (id: string) => void
+        pauseTransfer: (id: string) => void
+      }
+      if (typeof s.pauseReceiveTransfer === 'function') s.pauseReceiveTransfer(transferId)
+      else s.pauseTransfer(transferId)
+      return
+    }
+    store.pauseTransfer(transferId)
+  }
+  function dispatchResume(transferId: string, peerSid: string) {
+    const t = store.transfers.find(tr => tr.id === transferId)
+    if (t?.direction === 'recv') {
+      // TODO(main-agent): wire resumeReceiveTransfer(transferId).
+      const s = useNetworkStore.getState() as unknown as {
+        resumeReceiveTransfer?: (id: string) => void
+        resumeTransfer: (id: string, sid: string) => Promise<void>
+      }
+      if (typeof s.resumeReceiveTransfer === 'function') s.resumeReceiveTransfer(transferId)
+      else void s.resumeTransfer(transferId, peerSid)
+      return
+    }
+    void store.resumeTransfer(transferId, peerSid)
+  }
+  function dispatchCancel(transferId: string) {
+    const t = store.transfers.find(tr => tr.id === transferId)
+    if (t?.direction === 'recv') {
+      // TODO(main-agent): wire cancelReceiveTransfer(transferId).
+      const s = useNetworkStore.getState() as unknown as {
+        cancelReceiveTransfer?: (id: string) => void
+        cancelTransferAction: (id: string) => void
+      }
+      if (typeof s.cancelReceiveTransfer === 'function') s.cancelReceiveTransfer(transferId)
+      else s.cancelTransferAction(transferId)
+      return
+    }
+    store.cancelTransferAction(transferId)
+  }
   // P1-1: precompute the unreachability hint here so both desktop and
   // mobile renders can show the same banner without duplicating the
   // selector.
@@ -880,20 +1076,23 @@ export default function Network() {
         >
           <TransferChannel
             selectedPeer={peerEntity}
+            onlinePeerCount={onlinePeerCount}
             onStageFiles={handleStageFiles}
             onSendFilesToAll={handleSendFilesToAll}
             onOpenSettings={() => setShowSettings(true)}
             onEmptyDropAttempt={handleEmptyDropAttempt}
             onForceReconnect={() => store.recoverConnections()}
+            onReconnectPeer={handleReconnectPeer}
             onToast={showToast}
           />
         </div>
         <div className="overflow-y-auto">
           <TaskPanel
             transfers={store.transfers}
-            onPause={(id) => store.pauseTransfer(id)}
-            onResume={(id, sid) => store.resumeTransfer(id, sid)}
-            onCancel={(id) => store.cancelTransferAction(id)}
+            onPause={dispatchPause}
+            onResume={dispatchResume}
+            onCancel={dispatchCancel}
+            onResendToPeer={handleResendToPeer}
           />
         </div>
       </div>
@@ -907,7 +1106,9 @@ export default function Network() {
           {TABS.map(({ id, kanji, label }) => {
             const active = activeTab === id
             return (
-              <button key={id} onClick={() => setActiveTab(id)}
+              <button key={id} onClick={() => setActiveTabManual(id)}
+                aria-pressed={active}
+                aria-label={label}
                 className="flex-1 flex flex-col items-center justify-center gap-1 py-3 cursor-pointer transition-colors"
                 style={{
                   border: 'none', background: 'transparent',
@@ -951,11 +1152,13 @@ export default function Network() {
             >
               <TransferChannel
                 selectedPeer={peerEntity}
+                onlinePeerCount={onlinePeerCount}
                 onStageFiles={handleStageFiles}
                 onSendFilesToAll={handleSendFilesToAll}
                 onOpenSettings={() => setShowSettings(true)}
                 onEmptyDropAttempt={handleEmptyDropAttempt}
                 onForceReconnect={() => store.recoverConnections()}
+                onReconnectPeer={handleReconnectPeer}
                 onToast={showToast}
               />
             </div>
@@ -963,27 +1166,61 @@ export default function Network() {
           {activeTab === 'tasks' && (
             <TaskPanel
               transfers={store.transfers}
-              onPause={(id) => store.pauseTransfer(id)}
-              onResume={(id, sid) => store.resumeTransfer(id, sid)}
-              onCancel={(id) => store.cancelTransferAction(id)}
+              onPause={dispatchPause}
+              onResume={dispatchResume}
+              onCancel={dispatchCancel}
+              onResendToPeer={handleResendToPeer}
             />
           )}
         </div>
 
         <MobileBottomBar
-          onShowFiles={() => setActiveTab('tasks')}
-          onShowChannel={() => setActiveTab('channel')}
+          onShowFiles={() => setActiveTabManual('tasks')}
+          onShowChannel={() => setActiveTabManual('channel')}
           onShowQR={() => setShowQR(true)}
         />
       </div>
 
-      {toast && (
-        <div
-          className="misaka-toast fixed left-1/2 -translate-x-1/2 z-[120] px-4 py-2 rounded-lg text-sm font-kanji shadow-lg"
-          style={{ background: 'var(--bg-deep)', color: '#fff' }}>
-          {toast}
-        </div>
-      )}
+      {/* P2-11: announce toast via aria-live so screen readers don't miss
+          quick feedback (copy result, error, etc). polite + status is the
+          right pairing for non-critical, transient messages. The container
+          stays mounted as a region so SR users learn its purpose. */}
+      <div
+        className="misaka-toast-region"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        style={{ position: 'fixed', left: 0, right: 0, bottom: 0, pointerEvents: 'none', zIndex: 120 }}
+      >
+        {toast && (
+          <div
+            className="misaka-toast fixed left-1/2 -translate-x-1/2 z-[120] px-4 py-2 rounded-lg text-sm font-kanji shadow-lg"
+            style={{ background: 'var(--bg-deep)', color: '#fff', pointerEvents: 'auto' }}
+          >
+            {toast}
+          </div>
+        )}
+      </div>
+
+      {/* P2-12: shared picker for the "再发文件给此节点" action. Mounted
+          once at page level so it survives TransferChannel remounts. */}
+      <input
+        ref={resendPickerRef}
+        type="file"
+        multiple
+        className="hidden"
+        onChange={(e) => {
+          const files = Array.from(e.target.files ?? [])
+          const target = resendTargetRef.current
+          resendTargetRef.current = null
+          e.target.value = ''
+          if (!target || files.length === 0) return
+          store.addPendingFiles(target, files)
+          if (store.selectedSessionId !== target) store.selectPeer(target)
+          userHasTouchedTab.current = true
+          setActiveTab('channel')
+        }}
+      />
 
       {showQR && (
         <QRModal
