@@ -138,6 +138,9 @@ vi.mock('@/lib/webrtc', () => ({
   // handleRemoteSDP to pre-warm Cloudflare credentials. In tests we
   // resolve immediately — no real fetch.
   ensureAutoTurnReady: vi.fn(async () => {}),
+  // P0-4 / P1-2: live PCs are re-configured via this helper when TURN
+  // creds rotate or force-relay toggles. No live PCs in test, no-op.
+  applyIceConfigToAll: vi.fn(),
 }))
 
 vi.mock('@/lib/crypto', () => ({
@@ -184,6 +187,10 @@ vi.mock('@/lib/notify', () => ({ notifyIncomingFile: vi.fn() }))
 vi.mock('@/lib/turn', () => ({
   refreshAutoTurn: vi.fn(async () => {}),
   clearAutoTurn: vi.fn(),
+  // network.ts subscribes to TURN config changes so it can re-apply
+  // RTCConfiguration on live PCs (P0-4 / P1-2). The mock returns a no-op
+  // unsubscriber so init() doesn't blow up.
+  onTurnConfigChange: vi.fn(() => () => {}),
 }))
 
 // ── Test helpers ───────────────────────────────────────────────────────

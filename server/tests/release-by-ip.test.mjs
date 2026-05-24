@@ -40,12 +40,15 @@ async function main() {
 
   let failed = 0
   const cases = [
-    ['without bearer → 401, no sessions removed',                       testNoBearerRejected],
+    ['without bearer or identity → 401, no sessions removed',           testNoBearerRejected],
     ['invalid bearer → 401, no sessions removed',                       testInvalidBearerRejected],
     ['malformed Authorization header → 401',                            testMalformedHeader],
     ['valid bearer for A on shared IP → only A removed, B intact',      testSameIpOtherUsersIntact],
     ['valid bearer releases all of A\'s multi-device sessions on IP',   testMultiDeviceSameIdentity],
     ['response shape stays { released: number } for happy path',        testResponseShape],
+    ['body { nodeId, passCode } releases own sessions without bearer',  testBodyIdentityReleases],
+    ['body with wrong passCode → 401, others on IP untouched',          testBodyWrongPasscodeRejected],
+    ['body proof shares brute-force lock with /register',               testBodyShareBruteForceLock],
   ]
 
   for (const [name, fn] of cases) {
@@ -207,6 +210,90 @@ async function testResponseShape() {
   const keys = Object.keys(body).sort()
   assert(keys.includes('released'), `响应须包含 released 字段，实际 ${JSON.stringify(body)}`)
   assert(typeof body.released === 'number', 'released 字段为 number')
+}
+
+async function testBodyIdentityReleases() {
+  // No bearer is available because the client hit IP_LIMITED on register.
+  // The client re-proves identity with the (nodeId, passCode) it just typed.
+  const IP = '203.0.113.60'
+  // First, set up: same identity registered twice (e.g. zombie session from
+  // a previous tab) plus an unrelated user on the same IP.
+  const dev1 = await register(14600, '121212', IP)
+  const dev2 = await register(14600, '121212', IP)
+  const other = await register(14601, '343434', IP)
+  assert(dev1.token && dev2.token && other.token, '初始注册成功')
+
+  const res = await fetch(`${BASE}/release-by-ip`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': IP },
+    body: JSON.stringify({ nodeId: 14600, passCode: '121212' }),
+  })
+  assertEq(res.status, 200, '正确身份证明 → 200')
+  const body = await res.json()
+  assert(body.released >= 2, `应释放两个同身份会话，实际 ${body.released}`)
+
+  // 14600 should be re-registrable cleanly with the same identity.
+  const aAgain = await register(14600, '121212', IP)
+  assert(aAgain.token, '同身份应能重新注册')
+
+  // The unrelated 14601 must still occupy its slot.
+  const collide = await register(14601, '999999', IP, { raw: true })
+  assert(
+    collide.status === 409 || collide.status === 423,
+    `不同身份的同 IP 用户应未受影响，实际 status=${collide.status}`,
+  )
+}
+
+async function testBodyWrongPasscodeRejected() {
+  const IP = '203.0.113.61'
+  const owner = await register(14700, '565656', IP)
+  assert(owner.token, '业主注册成功')
+
+  // Wrong passcode → 401.
+  const wrong = await fetch(`${BASE}/release-by-ip`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': IP },
+    body: JSON.stringify({ nodeId: 14700, passCode: '111111' }),
+  })
+  assertEq(wrong.status, 401, '错误通行码 → 401')
+
+  // Owner's session must still exist — same-identity register should still
+  // succeed (multi-device), but a different-passcode register should still
+  // collide (which is enough to prove the original session is intact).
+  const collide = await register(14700, '999999', IP, { raw: true })
+  assert(
+    collide.status === 409 || collide.status === 423,
+    `业主会话应未被错误释放，实际 status=${collide.status}`,
+  )
+}
+
+async function testBodyShareBruteForceLock() {
+  const IP = '203.0.113.62'
+  // No registration here — we just want to confirm that bodywrong attempts
+  // count toward the existing /register brute-force lock so this endpoint
+  // isn't a parallel oracle.
+  for (let i = 0; i < 3; i++) {
+    const res = await fetch(`${BASE}/release-by-ip`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': IP },
+      body: JSON.stringify({ nodeId: 14800, passCode: '000000' }),
+    })
+    // First two responses are 401; once the lock trips the next one is 423.
+    if (res.status === 423) break
+    assertEq(res.status, 401, `attempt ${i + 1} 应是 401（未触发锁前）`)
+  }
+
+  // 4th attempt should be NODE_LOCKED.
+  const locked = await fetch(`${BASE}/release-by-ip`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': IP },
+    body: JSON.stringify({ nodeId: 14800, passCode: '000000' }),
+  })
+  assertEq(locked.status, 423, '触发暴力破解锁 → 423')
+
+  // /register on the same (ip, nodeId) should also see the lock.
+  const reg = await register(14800, '777777', IP, { raw: true })
+  assertEq(reg.status, 423, '同一 (ip, nodeId) 在 /register 也被锁')
 }
 
 // ── helpers ─────────────────────────────────────────────────────────

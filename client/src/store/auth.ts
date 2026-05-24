@@ -151,11 +151,40 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   async releaseAllFromIp() {
+    // Two proof paths, see server/src/http.ts /api/release-by-ip:
+    //   1. Already logged in → Bearer token.
+    //   2. Hit IP_LIMITED on /register so no token yet → re-supply the
+    //      identity (nodeId + passcode) the user just typed. Server hashes
+    //      the passcode and only releases sessions matching it on this IP.
+    const { session, identity } = get()
+    const headers: Record<string, string> = {}
+    let body: string | undefined
+    if (session?.token) {
+      headers.Authorization = `Bearer ${session.token}`
+    } else {
+      if (!/^\d{6}$/.test(identity.passCode)) {
+        set({ error: '请先输入完整通行码再释放' })
+        return 0
+      }
+      headers['Content-Type'] = 'application/json'
+      body = JSON.stringify({ nodeId: identity.nodeId, passCode: identity.passCode })
+    }
+
     try {
-      const res = await fetch(apiUrl('/api/release-by-ip'), { method: 'POST' })
+      const res = await fetch(apiUrl('/api/release-by-ip'), { method: 'POST', headers, body })
+      if (res.status === 401) {
+        set({ error: '通行码错误，无法释放该节点编号占用' })
+        return 0
+      }
+      if (res.status === 423) {
+        const data = await res.json().catch(() => ({ unlockAt: 0 })) as { unlockAt: number }
+        const mins = Math.max(1, Math.ceil((data.unlockAt - Date.now()) / 60000))
+        set({ error: `尝试次数过多，请 ${mins} 分钟后再试` })
+        return 0
+      }
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json() as { released: number }
-      set({ ipFullPrompt: false })
+      set({ ipFullPrompt: false, error: null })
       return data.released
     } catch {
       set({ error: '释放失败，请重试' })

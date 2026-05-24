@@ -138,6 +138,12 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
           boxShadow: 'var(--shadow-float)',
           minWidth: 300,
           maxWidth: 360,
+          // P1-13: previously had no maxHeight, so on iPhone landscape /
+          // iPad split-view the QR + node info + buttons stack ran off the
+          // viewport and the close / refresh / copy actions became
+          // unreachable. Cap to 90svh with internal scroll.
+          maxHeight: '90svh',
+          overflowY: 'auto',
         }}
         onClick={e => e.stopPropagation()}
       >

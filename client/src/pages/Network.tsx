@@ -173,7 +173,12 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
   return (
     <div
       className="border-t p-4 flex flex-col gap-2"
-      style={{ borderColor: 'var(--border-card)', maxHeight: 200, overflowY: 'auto' }}
+      // P1-12: previously a hard 200px cap on every viewport. On a 1080p
+      // desktop that wastes ~70% of the channel card and forces a tiny
+      // scroll for tall conversations; mobile is fine because the screen is
+      // short anyway. Use min(svh fraction, fallback px) so we get a
+      // reasonable height across sizes without overlapping siblings.
+      style={{ borderColor: 'var(--border-card)', maxHeight: 'min(45svh, 360px)', overflowY: 'auto' }}
     >
       <div className="font-kanji text-xs font-semibold text-[var(--text-on-white-2)] mb-1">会话信道</div>
       {messages.length === 0 && recvTransfers.length === 0 && pendingFiles.length === 0 && (
@@ -480,15 +485,15 @@ function TransferChannel({ selectedPeer, onStageFiles, onSendFilesToAll, onOpenS
         onDragLeave={() => setDragOver(false)}
         onDrop={handleDrop}
       >
-        <MisakaButton variant="pill" size="md" className="w-56"
+        <MisakaButton variant="pill" size="md" className="w-full max-w-[14rem] whitespace-nowrap"
           onClick={() => fileInputRef.current?.click()}>
           📁 选择文件
         </MisakaButton>
-        <MisakaButton variant="pill" size="md" className="w-56"
+        <MisakaButton variant="pill" size="md" className="w-full max-w-[14rem] whitespace-nowrap"
           onClick={() => folderInputRef.current?.click()}>
           🗂 选择文件夹
         </MisakaButton>
-        <MisakaButton variant="pill" size="md" className="w-56"
+        <MisakaButton variant="pill" size="md" className="w-full max-w-[14rem] whitespace-nowrap"
           onClick={() => document.getElementById('fanout-file-input')?.click()}>
           📡 群发文件到全部节点
         </MisakaButton>
@@ -629,7 +634,10 @@ function MobileBottomBar({
     <div
       className="flex items-center justify-around"
       style={{
-        height: 96,
+        // Reserve home-indicator space on notched iPhones; without this the
+        // bar sits on top of the gesture indicator and tap targets clip.
+        height: 'calc(96px + env(safe-area-inset-bottom))',
+        paddingBottom: 'env(safe-area-inset-bottom)',
         background: 'rgba(14,42,107,0.92)',
         backdropFilter: 'blur(12px)',
         borderTop: '1px solid rgba(255,255,255,0.1)',
@@ -746,9 +754,9 @@ export default function Network() {
   const peerEntity = store.peers.find(p => p.sessionId === store.selectedSessionId) ?? null
 
   return (
-    <div className="min-h-screen pt-16 flex flex-col" style={{ background: 'var(--bg-primary)' }}>
+    <div className="pt-16 flex flex-col" style={{ background: 'var(--bg-primary)', minHeight: '100dvh' }}>
       {/* Desktop 3-column */}
-      <div className="hidden md:grid min-h-[calc(100vh-64px-73px)] gap-6 p-6" style={{ gridTemplateColumns: '1fr 2fr 1fr' }}>
+      <div className="hidden md:grid gap-6 p-6" style={{ gridTemplateColumns: 'minmax(220px, 1fr) minmax(0, 2fr) minmax(220px, 1fr)', minHeight: 'calc(100dvh - 64px - 73px)' }}>
         <div className="overflow-y-auto">
           <NodeRadar
             peers={store.peers}
@@ -808,7 +816,16 @@ export default function Network() {
           })}
         </div>
 
-        <div className="flex-1 overflow-y-auto p-4">
+        {/*
+          The scroll area used to clip its last row behind the 96px MobileBottomBar
+          (P0-7): no padding-bottom + no safe-area reservation meant the final
+          peer card / chat bubble / transfer row was permanently invisible on
+          iPhones with a Home Indicator. We pad by bar-height + safe-area inset.
+        */}
+        <div
+          className="flex-1 overflow-y-auto p-4"
+          style={{ paddingBottom: 'calc(96px + env(safe-area-inset-bottom) + 16px)' }}
+        >
           {activeTab === 'radar' && (
             <NodeRadar
             peers={store.peers}
@@ -852,7 +869,8 @@ export default function Network() {
       </div>
 
       {toast && (
-        <div className="fixed bottom-24 md:bottom-8 left-1/2 -translate-x-1/2 z-[120] px-4 py-2 rounded-lg text-sm font-kanji shadow-lg"
+        <div
+          className="misaka-toast fixed left-1/2 -translate-x-1/2 z-[120] px-4 py-2 rounded-lg text-sm font-kanji shadow-lg"
           style={{ background: 'var(--bg-deep)', color: '#fff' }}>
           {toast}
         </div>

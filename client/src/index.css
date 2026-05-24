@@ -51,7 +51,12 @@ body {
   color: var(--text-on-blue);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  /* iOS Safari <17 reports 100vh as the *expanded* viewport — content jumps
+     when the URL bar collapses. 100dvh tracks the dynamic viewport on
+     modern browsers; keep 100vh as the fallback for older Safari (which
+     ignores the dvh rule). */
   min-height: 100vh;
+  min-height: 100dvh;
   overflow-x: hidden;
 }
 
@@ -225,6 +230,9 @@ body {
   }
 
   /* Input field ─── */
+  /* iOS Safari auto-zooms any input whose computed font-size is under 16px.
+     A few specific inputs intentionally render smaller text on desktop, so
+     we use 16px on touch (the default) and scale down on `sm:`-and-up. */
   .misaka-input {
     width: 100%;
     padding: 0.6rem 0.875rem;
@@ -233,9 +241,12 @@ body {
     background: var(--surface);
     color: var(--text-on-white);
     font-family: 'Noto Sans SC', sans-serif;
-    font-size: 0.9rem;
+    font-size: 16px;
     outline: none;
     transition: border-color 0.15s;
+  }
+  @media (min-width: 640px) {
+    .misaka-input { font-size: 0.9rem; }
   }
   .misaka-input:focus { border-color: var(--bg-deep); }
 
@@ -395,3 +406,12 @@ body {
 /* ── Utility overrides ──────────────────────────────────────────── */
 .no-scrollbar::-webkit-scrollbar { display: none; }
 .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+/* Toast positioning. On mobile (<md) we sit above the 96px bottom action bar
+   and the home-indicator safe area. On desktop the bar is hidden, so 2rem
+   from the bottom is enough. Lives in CSS so the inline `style` on the toast
+   element doesn't have to fight Tailwind's `md:bottom-*` rules. */
+.misaka-toast { bottom: calc(96px + env(safe-area-inset-bottom) + 12px); }
+@media (min-width: 768px) {
+  .misaka-toast { bottom: 2rem; }
+}

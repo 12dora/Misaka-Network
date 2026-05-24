@@ -59,6 +59,27 @@ let refreshTimer: ReturnType<typeof setTimeout> | null = null
 let lastFailReason: string | null = null
 const REFRESH_LEAD_MS = 60_000   // refetch 60s before expiry
 
+// ── Config-change observers ──────────────────────────────────────────
+// Any consumer that builds an RTCConfiguration from the live TURN state
+// (network.ts owns the live RTCPeerConnections) subscribes here so it can
+// re-apply via `pc.setConfiguration(...)`. Without this, a refreshed cred
+// or a force-relay toggle never reaches existing connections — a peer
+// connection older than the cred TTL silently runs on dead TURN.
+
+type TurnConfigChangeListener = () => void
+const turnConfigListeners = new Set<TurnConfigChangeListener>()
+
+export function onTurnConfigChange(fn: TurnConfigChangeListener): () => void {
+  turnConfigListeners.add(fn)
+  return () => turnConfigListeners.delete(fn)
+}
+
+function emitTurnConfigChange() {
+  for (const fn of turnConfigListeners) {
+    try { fn() } catch (err) { console.warn('[turn] listener failed', err) }
+  }
+}
+
 // ── TURN settings ────────────────────────────────────────────────────
 
 export function loadTurnSettings(): TurnSettings {
@@ -71,6 +92,9 @@ export function loadTurnSettings(): TurnSettings {
 
 export function saveTurnSettings(settings: TurnSettings) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(settings))
+  // The `enabled` flag, manual server list, and `forceRelay` flag all feed
+  // into RTCConfiguration. Notify so live PCs can rebuild their config.
+  emitTurnConfigChange()
 }
 
 export function getTurnIceServers(): RTCIceServer[] {
@@ -140,12 +164,22 @@ export async function refreshAutoTurn(): Promise<RTCIceServer[]> {
   inFlight = fetchAutoTurnOnce()
   try {
     const result = await inFlight
+    const changed = !sameIceServers(autoTurn?.iceServers ?? [], result?.iceServers ?? [])
     autoTurn = result
     scheduleNextRefresh()
+    if (changed) emitTurnConfigChange()
     return result?.iceServers ?? []
   } finally {
     inFlight = null
   }
+}
+
+function sameIceServers(a: RTCIceServer[], b: RTCIceServer[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    if (JSON.stringify(a[i]) !== JSON.stringify(b[i])) return false
+  }
+  return true
 }
 
 function scheduleNextRefresh() {
@@ -159,9 +193,11 @@ function scheduleNextRefresh() {
 }
 
 export function clearAutoTurn() {
+  const had = autoTurn !== null
   autoTurn = null
   lastFailReason = null
   if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null }
+  if (had) emitTurnConfigChange()
 }
 
 export async function fetchTurnStatus(): Promise<TurnStatusResponse | null> {

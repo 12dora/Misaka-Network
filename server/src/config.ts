@@ -31,8 +31,10 @@ export const REPORT_WARN_COUNT = 3                   // reports on same target �
 export const REPORT_WARN_WINDOW_MS = 60_000          // 1 minute
 
 // ── Cleanup ───────────────────────────────────────────────────────────
-export const CLEANUP_INTERVAL_MS = 2_000
-export const DISCONNECTED_TTL_MS = 10_000            // grace period before clearing stale sessions
+// Env overrides exist so the integration tests can run cleanup at sub-second
+// cadence; production sticks with the defaults below.
+export const CLEANUP_INTERVAL_MS = parseInt(process.env.CLEANUP_INTERVAL_MS ?? '2000', 10)
+export const DISCONNECTED_TTL_MS = parseInt(process.env.DISCONNECTED_TTL_MS ?? '10000', 10)   // grace period before clearing stale sessions
 export const REPORT_TTL_MS = 60 * 60 * 1000         // 1 hour
 
 // ── TURN auto-provisioning (Cloudflare Realtime TURN) ────────────────

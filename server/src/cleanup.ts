@@ -1,8 +1,7 @@
-import { nodes, channels, qrTokens, reports, attemptLocks, getOnlineCount } from './store.js'
+import { nodes, channels, qrTokens, reports, attemptLocks } from './store.js'
 import { cleanupRateLimitWindows } from './ratelimit.js'
 import { CLEANUP_INTERVAL_MS, DISCONNECTED_TTL_MS, LOCK_DURATION_MS, REPORT_TTL_MS } from './config.js'
 
-let zeroActiveSince: number | null = null
 let cleanupTimer: NodeJS.Timeout | null = null
 
 export function startCleanupTask() {
@@ -10,29 +9,22 @@ export function startCleanupTask() {
   cleanupTimer = setInterval(() => {
     const now = Date.now()
 
-    // --- Session cleanup: when all nodes go offline, remove disconnected
-    //     sessions after a short grace period.
-    const activeCount = getOnlineCount()
-    if (activeCount === 0) {
-      if (zeroActiveSince === null) {
-        zeroActiveSince = now
-      } else if (now - zeroActiveSince >= DISCONNECTED_TTL_MS) {
-        for (const [sessionId, session] of nodes) {
-          if (session.socket === null) {
-            nodes.delete(sessionId)
-            if (session.channelId) {
-              const ch = channels.get(session.channelId)
-              if (ch) {
-                ch.delete(sessionId)
-                if (ch.size === 0) channels.delete(session.channelId)
-              }
-            }
-          }
+    // --- Session cleanup: any session whose socket is gone AND has been idle
+    //     past DISCONNECTED_TTL_MS gets purged, regardless of whether other
+    //     users are still online. The old "only when activeCount === 0" gate
+    //     meant a single long-lived user pinned every zombie session in the
+    //     map indefinitely, eating per-IP slots on shared egress IPs.
+    for (const [sessionId, session] of nodes) {
+      if (session.socket !== null) continue
+      if (now - session.lastSeen < DISCONNECTED_TTL_MS) continue
+      nodes.delete(sessionId)
+      if (session.channelId) {
+        const ch = channels.get(session.channelId)
+        if (ch) {
+          ch.delete(sessionId)
+          if (ch.size === 0) channels.delete(session.channelId)
         }
-        zeroActiveSince = null
       }
-    } else {
-      zeroActiveSince = null
     }
 
     // Unlock expired locks

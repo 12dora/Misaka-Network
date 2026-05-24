@@ -154,30 +154,94 @@ router.post('/register', (req, res) => {
 router.post('/release-by-ip', (req, res) => {
   const authHeader = req.headers.authorization
   const ip = getClientIP(req)
+  const now = Date.now()
 
   // Test escape hatch: when the server is launched with
   // E2E_ALLOW_UNAUTH_RELEASE_BY_IP=1, allow anonymous calls to wipe every
   // session on the caller's IP. The e2e suite uses this in beforeEach to
-  // prevent cross-test pollution (zombie sessions from a previous test
-  // accumulating in the same identity cluster). Production never sets this.
+  // prevent cross-test pollution. Production never sets this.
   const testBypass = process.env.E2E_ALLOW_UNAUTH_RELEASE_BY_IP === '1'
 
-  let caller: ReturnType<typeof findSessionByToken> | undefined
+  // Two acceptable identity proofs:
+  //   (a) Bearer <token>  — caller has an existing session.
+  //   (b) Body { nodeId, passCode } — caller has no session yet because the
+  //       IP cap blocked their initial register; they re-prove the identity
+  //       they want to free up. This is the production-realistic path
+  //       triggered by the "释放并重试" button on the IP_LIMITED prompt.
+  //
+  // Path (b) is rate-limited via the existing attemptLocks bucket: if the
+  // (ip, nodeId) is currently locked from prior wrong attempts at /register,
+  // we refuse here too — otherwise this endpoint would be a parallel
+  // passcode-guessing oracle. A wrong passcode here also increments the
+  // same lock so the two surfaces share a budget.
+  let scopeNodeId: number | null = null
+  let scopePassHash: string | null = null
+
   if (authHeader?.startsWith('Bearer ')) {
     const token = authHeader.slice(7)
-    caller = findSessionByToken(token)
-    if (!caller && !testBypass) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
-  } else if (!testBypass) {
-    res.status(401).json({ error: 'UNAUTHORIZED' }); return
+    const caller = findSessionByToken(token)
+    if (!caller) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
+    scopeNodeId = caller.nodeId
+    scopePassHash = caller.passCodeHash
+  } else if (testBypass) {
+    // No scope — wipe everything on the IP.
+  } else {
+    const parsed = z.object({
+      nodeId:   z.number().int().min(NODE_ID_MIN).max(NODE_ID_MAX),
+      passCode: z.string().length(6).regex(/^\d{6}$/),
+    }).safeParse(req.body)
+    if (!parsed.success) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
+
+    const lockKey = attemptKey(ip, parsed.data.nodeId)
+    let lock = attemptLocks.get(lockKey)
+    if (lock && now < lock.lockedUntil) {
+      res.status(423).json({ error: 'NODE_LOCKED', reason: 'WRONG_PASSCODE', unlockAt: lock.lockedUntil })
+      return
+    }
+    if (lock && lock.lockedUntil > 0 && now >= lock.lockedUntil) {
+      attemptLocks.delete(lockKey)
+      lock = undefined
+    }
+
+    const passHash = hashPassCode(parsed.data.passCode)
+    // Find at least one matching session on this IP. If none, treat it
+    // exactly like a wrong-passcode attempt against /register — bump the
+    // shared brute-force counter and return 401 without revealing whether
+    // the nodeId exists at all.
+    let matched = false
+    for (const s of nodes.values()) {
+      if (s.ip !== ip) continue
+      if (s.nodeId !== parsed.data.nodeId) continue
+      if (s.passCodeHash !== passHash) continue
+      matched = true
+      break
+    }
+    if (!matched) {
+      if (!lock) {
+        lock = { attempts: 0, lockedUntil: 0, lastAttemptAt: now }
+        attemptLocks.set(lockKey, lock)
+      }
+      lock.attempts++
+      lock.lastAttemptAt = now
+      if (lock.attempts >= MAX_ATTEMPTS) {
+        lock.lockedUntil = now + LOCK_DURATION_MS
+      }
+      res.status(401).json({ error: 'UNAUTHORIZED' })
+      return
+    }
+    scopeNodeId = parsed.data.nodeId
+    scopePassHash = passHash
+    // Clear any stale brute-force counter — caller proved the passcode.
+    attemptLocks.delete(lockKey)
   }
 
   let released = 0
   for (const [sessionId, session] of nodes) {
     if (session.ip !== ip) continue
-    // In test-bypass mode (no caller) we wipe everything on the IP.
-    // In authenticated mode, only release sessions belonging to the same
-    // identity (same nodeId + passCodeHash as the caller).
-    if (caller && (session.nodeId !== caller.nodeId || session.passCodeHash !== caller.passCodeHash)) continue
+    // Authenticated scopes: only release sessions belonging to the same
+    // identity (same nodeId + passCodeHash). Test-bypass with no scope
+    // releases everything on the IP.
+    if (scopeNodeId !== null && (session.nodeId !== scopeNodeId || session.passCodeHash !== scopePassHash)) continue
     if (session.socket) {
       try { session.socket.close() } catch { /* ignore */ }
       session.socket = null
