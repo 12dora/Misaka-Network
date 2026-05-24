@@ -3,7 +3,7 @@ import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 
 export default function Terms() {
   return (
-    <div className="min-h-screen pt-20 px-4 pb-20" style={{ background: 'var(--bg-primary)' }}>
+    <div className="pt-20 px-4" style={{ background: 'var(--bg-primary)', minHeight: '100dvh', paddingBottom: 'calc(5rem + env(safe-area-inset-bottom))' }}>
       <div className="max-w-2xl mx-auto">
         <div className="flex items-center gap-3 mb-8">
           <MisakaKanjiBlock char="条" size="md" />

@@ -7,7 +7,7 @@ import {
 import {
   createPeerConnection, createDataChannel, createOffer, createAnswer,
   applyAnswer, addIceCandidate, getSelectedChannelType, getSelectedIcePath,
-  ensureAutoTurnReady,
+  ensureAutoTurnReady, applyIceConfigToAll,
 } from '@/lib/webrtc'
 import {
   generateECDHKeyPair, getMyPublicKey, setPeerPublicKey,
@@ -26,7 +26,7 @@ import {
 import { getTransfer, getActiveTransfers } from '@/lib/db'
 import { playSound } from '@/lib/sound'
 import { notifyIncomingFile } from '@/lib/notify'
-import { refreshAutoTurn, clearAutoTurn } from '@/lib/turn'
+import { refreshAutoTurn, clearAutoTurn, onTurnConfigChange } from '@/lib/turn'
 import {
   MAX_ICE_RESTART_ATTEMPTS, ICE_RESTART_BACKOFF_MS, ICE_DISCONNECTED_RESTART_DELAY_MS,
   DC_OPEN_TIMEOUT_MS, ENCRYPTION_TIMEOUT_MS,
@@ -145,6 +145,19 @@ function waitForPrimaryChannel(peerSessionId: string, timeoutMs = 10_000): Promi
 
 let recoveryInstalled = false
 let lastRecoverAt = 0
+let turnConfigUnsubscribe: (() => void) | null = null
+
+function installTurnConfigPropagation() {
+  if (turnConfigUnsubscribe) return
+  turnConfigUnsubscribe = onTurnConfigChange(() => {
+    // Apply current TURN config (new auto creds, toggled force-relay, manual
+    // server changes) to every live RTCPeerConnection. Without this, an
+    // existing connection's ICE config is frozen at the moment of
+    // construction and any later credential rotation or settings change is
+    // ignored until the PC is torn down and re-built.
+    applyIceConfigToAll(peerConnections.values())
+  })
+}
 
 function installForegroundRecovery() {
   if (recoveryInstalled || typeof window === 'undefined') return
@@ -296,9 +309,27 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
 
         case 'PEER_LEFT': {
           const sid = msg.sessionId
-          // Revoke blob URLs before dropping chatMessages — otherwise the
-          // File/Blob each one references stays alive in memory until page
-          // close (a 10-file × 100MB chat → ~1GB leak per peer that leaves).
+          // P1-8: PEER_LEFT can arrive when the peer's WS dropped but the
+          // P2P DataChannel is still alive (via TURN, or just a transient
+          // signaling disconnect). In that case wiping chatMessages and
+          // revoking every downloadUrl mid-flight breaks any in-progress
+          // download click. Only do the cleanup when there's no live DC.
+          const dcAlive = (() => {
+            const dc = dataChannels.get(sid)
+            return dc?.readyState === 'open' || dc?.readyState === 'connecting'
+          })()
+          if (dcAlive) {
+            // Mark the peer offline at the WS level (signaling lost), but
+            // KEEP downloadUrls, chat messages, and DC. The peer card
+            // already reflects whatever the DC/ICE state says.
+            set(s => ({
+              peers: s.peers.map(p =>
+                p.sessionId === sid ? { ...p, status: 'reconnecting' as const } : p,
+              ),
+            }))
+            break
+          }
+
           const droppedMsgs = useNetworkStore.getState().chatMessages[sid] ?? []
           for (const m of droppedMsgs) {
             if (m.downloadUrl) { try { URL.revokeObjectURL(m.downloadUrl) } catch { /* ignore */ } }
@@ -358,6 +389,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
 
     wsConnect(token)
     installForegroundRecovery()
+    installTurnConfigPropagation()
   },
 
   destroy() {
@@ -365,6 +397,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     for (const sid of peerConnections.keys()) cleanupPeerConnection(sid)
     resetCrypto()
     clearAutoTurn()
+    if (turnConfigUnsubscribe) { turnConfigUnsubscribe(); turnConfigUnsubscribe = null }
     initialized = false
     currentToken = ''
     // Revoke every cached download URL — these point at File/Blob objects
@@ -473,8 +506,16 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
   },
 
   sendChatMessage(peerSessionId, text) {
+    // P2-3: enforce a sane chat-message size. The DataChannel SCTP max is
+    // 256 KB; without a cap, `dc.send` threw "Message too large" and the
+    // UI showed "failed" with no explanation. The server-side WS cap is
+    // 64 KB but chat messages go P2P not via WS — still keep symmetric.
+    // 16 KB is well under the SCTP / WS caps and more than any sane human
+    // message; longer payloads belong in a file transfer.
+    const CHAT_MAX_BYTES = 16 * 1024
+    const trimmedText = text.length > CHAT_MAX_BYTES ? text.slice(0, CHAT_MAX_BYTES) : text
     const msg: ChannelMessage = {
-      id: genMsgId(), type: 'text', content: text, timestamp: Date.now(),
+      id: genMsgId(), type: 'text', content: trimmedText, timestamp: Date.now(),
       direction: 'sent', status: 'sending',
     }
     set(s => ({
@@ -538,6 +579,17 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     set(s => ({
       transfers: s.transfers.map(t => t.id === transferId ? { ...t, status: 'paused' as const } : t),
     }))
+    // Receiver-driven pause: tell the sender to stop. The local signal we
+    // just set causes in-flight chunks to be dropped in receiveChunk; this
+    // upstream notice prevents the sender from continuing to encrypt + ship
+    // bytes that the receiver will throw away.
+    const t = get().transfers.find(tr => tr.id === transferId)
+    if (t && t.direction === 'recv') {
+      const dc = dataChannels.get(t.peerSessionId)
+      if (dc?.readyState === 'open') {
+        try { dc.send(JSON.stringify({ type: 'transfer-pause', transferId })) } catch { /* ignore */ }
+      }
+    }
   },
 
   async resumeTransfer(transferId, peerSessionId) {
@@ -545,6 +597,20 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     set(s => ({
       transfers: s.transfers.map(t => t.id === transferId ? { ...t, status: 'transferring' as const } : t),
     }))
+    const t = get().transfers.find(tr => tr.id === transferId)
+    // Receiver-driven resume: tell the sender to start shipping again. The
+    // sender's lane loop is waiting in waitWhilePaused for transferSignals to
+    // flip back, but the sender's local signal only reflects what the SENDER
+    // toggled — when the user paused from the receive side the sender's
+    // signal was set via 'transfer-pause' below. We undo that here.
+    if (t && t.direction === 'recv') {
+      const dc = dataChannels.get(peerSessionId)
+      if (dc?.readyState === 'open') {
+        try { dc.send(JSON.stringify({ type: 'transfer-resume', transferId })) } catch { /* ignore */ }
+      }
+      // Receiver side: nothing else to do — the sender owns the send loop.
+      return
+    }
     const dc = dataChannels.get(peerSessionId)
     const file = sendingFiles.get(transferId)
     if (dc && file && dc.readyState === 'open') {
@@ -561,6 +627,16 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
   },
 
   cancelTransferAction(transferId) {
+    // Tell the other side to stop before we tear our own state down — once we
+    // drop the receive session / sending file, a late notice is a no-op on
+    // our side but the peer still needs to know.
+    const t = get().transfers.find(tr => tr.id === transferId)
+    if (t) {
+      const dc = dataChannels.get(t.peerSessionId)
+      if (dc?.readyState === 'open') {
+        try { dc.send(JSON.stringify({ type: 'transfer-cancel', transferId })) } catch { /* ignore */ }
+      }
+    }
     engineCancelTransfer(transferId)
     cancelReceive(transferId)
     cancelStreamWrite(transferId)
@@ -788,6 +864,25 @@ function isPolite(peerSessionId: string): boolean {
 }
 
 async function handleRemoteSDP(fromSessionId: string, fromNodeId: number, sdp: RTCSessionDescriptionInit) {
+  // P1-3: defer SDP processing until we know our own sessionId. The polite/
+  // impolite tie-break is computed against mySessionId — if an SDP arrives
+  // before WELCOME finishes processing, mySessionId is null and isPolite()
+  // resolves "" < peerSessionId === true, making BOTH sides polite. The
+  // result is that both peers roll back their offers and neither establishes.
+  // Wait up to 3s for WELCOME; any longer and something is structurally
+  // broken (signaling never authed) — let the SDP fall through, which will
+  // be a no-op because there's no PC and the offer-without-pc branch logs.
+  if (useNetworkStore.getState().mySessionId === null) {
+    const start = Date.now()
+    while (useNetworkStore.getState().mySessionId === null && Date.now() - start < 3000) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    if (useNetworkStore.getState().mySessionId === null) {
+      console.warn('[net] handleRemoteSDP gave up waiting for WELCOME — dropping', fromSessionId, sdp.type)
+      return
+    }
+  }
+
   let pc = peerConnections.get(fromSessionId)
   if (sdp.type === 'offer') remoteInitiatingPeers.delete(fromSessionId)
 
@@ -806,8 +901,21 @@ async function handleRemoteSDP(fromSessionId: string, fromNodeId: number, sdp: R
 
     pc.ondatachannel = (e) => {
       if (e.channel.label.startsWith('misaka-transfer-')) {
+        // P2-9: de-duplicate. After an ICE restart the answerer's
+        // ondatachannel fires again for the same labels; without this guard
+        // each label accumulates additional channel entries and the same
+        // chunk could be sent down two lanes.
         const lanes = transferLanes.get(fromSessionId) ?? []
-        lanes.push(e.channel)
+        const existing = lanes.find(l => l.label === e.channel.label)
+        if (existing) {
+          // Replace the prior lane (it might be 'closing'/'closed' after a
+          // restart). Tear down listeners on the old one if still around.
+          const idx = lanes.indexOf(existing)
+          try { existing.close() } catch { /* ignore */ }
+          lanes[idx] = e.channel
+        } else {
+          lanes.push(e.channel)
+        }
         transferLanes.set(fromSessionId, lanes)
       } else {
         dataChannels.set(fromSessionId, e.channel)
@@ -1182,10 +1290,15 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
         }
 
         if (msg.type === 'chat') {
+          // P2-3: cap incoming chat payload defensively. A malicious / buggy
+          // peer should not be able to wedge our chat panel with a megabyte
+          // of text. Match the sender-side cap.
+          const rawContent = String(msg.content ?? msg.text ?? '')
+          const content = rawContent.length > 16 * 1024 ? rawContent.slice(0, 16 * 1024) : rawContent
           const chatMsg: ChannelMessage = {
             id: msg.id || genMsgId(),
             type: 'text',
-            content: msg.content || msg.text || '',
+            content,
             timestamp: msg.timestamp || Date.now(),
             direction: 'recv',
           }
@@ -1209,6 +1322,42 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
           updateMessageStatus(peerSessionId, msg.id, 'delivered')
           return
         }
+
+        // Peer-driven transfer control plane — these arrive when the OTHER
+        // side clicked pause / resume / cancel on the same transfer.
+        // We mirror the local signal so the existing checkSignals / receiveChunk
+        // paths handle it uniformly. Without these, "pause on the receiver"
+        // was a UI lie: the sender kept blasting and the receiver kept saving.
+        if (msg.type === 'transfer-pause' && typeof msg.transferId === 'string') {
+          pauseTransfer(msg.transferId)
+          useNetworkStore.setState(s => ({
+            transfers: s.transfers.map(t =>
+              t.id === msg.transferId ? { ...t, status: 'paused' as const } : t,
+            ),
+          }))
+          return
+        }
+        if (msg.type === 'transfer-resume' && typeof msg.transferId === 'string') {
+          resumeTransfer(msg.transferId)
+          useNetworkStore.setState(s => ({
+            transfers: s.transfers.map(t =>
+              t.id === msg.transferId ? { ...t, status: 'transferring' as const } : t,
+            ),
+          }))
+          return
+        }
+        if (msg.type === 'transfer-cancel' && typeof msg.transferId === 'string') {
+          engineCancelTransfer(msg.transferId)
+          cancelReceive(msg.transferId)
+          cancelStreamWrite(msg.transferId)
+          cleanupOPFS(msg.transferId).catch(() => {})
+          sendingFiles.delete(msg.transferId)
+          transferSpeedSamples.delete(msg.transferId)
+          useNetworkStore.setState(s => ({
+            transfers: s.transfers.filter(t => t.id !== msg.transferId),
+          }))
+          return
+        }
       } catch { /* not JSON */ }
     }
   }
@@ -1229,7 +1378,11 @@ async function attemptIceRestart(peerSessionId: string) {
   }
 
   iceRestarting.add(peerSessionId)
-  iceRestartAttempts.set(peerSessionId, attempts + 1)
+  // P2-5: previously incremented BEFORE the early-out checks below. A
+  // restart that hit `signalingState !== 'stable'` and aborted at line ~1390
+  // still burned an attempt, so 5 fast aborts marked the peer offline
+  // without a single real retry. Defer the +1 until we're past the early
+  // exits.
 
   // Exponential backoff: spread out retries so we don't hammer the signaling
   // server when the network is genuinely down.
@@ -1246,6 +1399,8 @@ async function attemptIceRestart(peerSessionId: string) {
     const pc = peerConnections.get(peerSessionId)
     if (!pc || pc.connectionState === 'closed' || pc.connectionState === 'failed') {
       cleanupPeerConnection(peerSessionId, { failQueuedMessages: false })
+      // initiateWebRTC IS a real restart attempt — count it.
+      iceRestartAttempts.set(peerSessionId, attempts + 1)
       await initiateWebRTC(peerSessionId)
       return
     }
@@ -1253,11 +1408,13 @@ async function attemptIceRestart(peerSessionId: string) {
     // If we're not in 'stable', a restart offer would either collide with our
     // own outstanding offer or step on an inbound one. Skip — the
     // perfect-negotiation rollback in handleRemoteSDP will recover us.
+    // Don't burn an attempt for a no-op.
     if (pc.signalingState !== 'stable') {
       console.warn('[net] skipping iceRestart, signalingState=', pc.signalingState)
       return
     }
 
+    iceRestartAttempts.set(peerSessionId, attempts + 1)
     const offer = await pc.createOffer({ iceRestart: true })
     await pc.setLocalDescription(offer)
     // Trickle — candidates will stream via onicecandidate. (Same fix as
@@ -1350,8 +1507,11 @@ function appendFileChat(peerSessionId: string, fileName: string, fileSize: numbe
         : s.unreadByPeer,
     }
   })
-  const peerNodeId = useNetworkStore.getState().peers.find(p => p.sessionId === peerSessionId)?.nodeId
-  notifyIncomingFile({ peerNodeId, fileName, fileSize })
+  // Nit fix: notifyIncomingFile already fired at transfer start (meta handler
+  // line ~1258). Firing it again on completion produced two OS toasts per
+  // received file. The start-of-transfer toast is the user-actionable one
+  // ("decline before the big upload arrives") — the completion is signalled
+  // visually by the file card itself.
 }
 
 function cleanupTransferRecord(transferId: string) {

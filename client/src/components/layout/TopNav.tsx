@@ -112,10 +112,14 @@ export default function TopNav() {
           })}
         </div>
 
-        {/* Right: QR / scan / status / mobile menu */}
+        {/* Right: QR / scan / status / mobile menu.
+            Install / QR / Scan are duplicated inside the mobile hamburger
+            dropdown below — hiding them on <sm prevents the nav from
+            overflowing on 320–390 px phones and pushing the hamburger
+            off-screen (P0-6). */}
         <div className="flex items-center gap-3 h-8">
           {isConnected && (
-            <>
+            <div className="hidden sm:flex items-center gap-3">
               {installPrompt && (
                 <button className="nav-pill text-sm !px-3" onClick={handleInstallApp}>
                   ⬇ 安装应用
@@ -127,7 +131,7 @@ export default function TopNav() {
               <button className="nav-pill text-sm !px-3" onClick={() => setShowScan(true)}>
                 📷 扫描
               </button>
-            </>
+            </div>
           )}
 
           {/* Settings */}

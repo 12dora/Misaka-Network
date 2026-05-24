@@ -79,34 +79,48 @@ export async function getSelectedIcePath(pc: RTCPeerConnection): Promise<Selecte
   return null
 }
 
-export function createPeerConnection(): RTCPeerConnection {
+// Single source of truth for the RTCConfiguration derived from current TURN
+// state — used both for new PCs and to re-apply via `pc.setConfiguration()`
+// on existing PCs when creds rotate or the user flips force-relay.
+export function buildIceConfig(): RTCConfiguration {
   const turnSettings = loadTurnSettings()
   // Order: STUN → server-issued auto TURN (always injected — server is the
   // canonical gate via budget/killswitch) → manual user TURN (only when
   // user opts in via the Settings toggle).
-  //
-  // The previous gate (both lists behind `turnSettings.enabled`) meant that
-  // symmetric-NAT users behind a default-off install simply could not
-  // connect — the README's headline feature was off by default.
-  // Manual servers stay opt-in so users with broken creds can't break their
-  // own ICE selection.
   const iceServers: RTCIceServer[] = [
     ...DEFAULT_STUN,
     ...getAutoTurnIceServers(),
     ...(turnSettings.enabled ? getTurnIceServers() : []),
   ]
-
-  return new RTCPeerConnection({
+  return {
     iceServers,
     iceTransportPolicy: turnSettings.forceRelay ? 'relay' : 'all',
-    // max-bundle: multiplex all media on a single transport — fewer ports
-    // requested, friendlier to strict firewalls. Required when using DCs.
     bundlePolicy: 'max-bundle',
     rtcpMuxPolicy: 'require',
-    // Pre-gather candidates so the offer/answer ships with srflx ready,
-    // and connectivity checks can start the moment SDP arrives.
     iceCandidatePoolSize: ICE_CANDIDATE_POOL_SIZE,
-  })
+  }
+}
+
+export function createPeerConnection(): RTCPeerConnection {
+  return new RTCPeerConnection(buildIceConfig())
+}
+
+// Re-apply the current TURN config to every live PC. Called when auto-TURN
+// creds refresh, when the user toggles force-relay, when manual servers are
+// added/removed, etc. Without this an existing connection keeps the original
+// (now stale) creds until it's torn down and re-created.
+export function applyIceConfigToAll(pcs: Iterable<RTCPeerConnection>) {
+  const cfg = buildIceConfig()
+  for (const pc of pcs) {
+    if (pc.connectionState === 'closed') continue
+    try {
+      // setConfiguration accepts a partial; we always pass the full one so
+      // toggling forceRelay OFF actually clears the prior 'relay' policy.
+      pc.setConfiguration(cfg)
+    } catch (err) {
+      console.warn('[webrtc] setConfiguration failed', err)
+    }
+  }
 }
 
 export function createDataChannel(pc: RTCPeerConnection, label = 'misaka'): RTCDataChannel {

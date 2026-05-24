@@ -221,6 +221,11 @@ export default function ScanModal({ onClose }: Props) {
           boxShadow: 'var(--shadow-float)',
           maxWidth: 340,
           width: '100%',
+          // P1-13: landscape phone / split-view iPad — without a maxHeight the
+          // aspect-square camera + URL input + buttons overflow and the
+          // "接入" / "取消" actions are off-screen.
+          maxHeight: '90svh',
+          overflowY: 'auto',
         }}
         onClick={e => e.stopPropagation()}
       >

@@ -214,6 +214,7 @@ export default function LoginCard() {
             className="w-8 h-8 rounded-full flex items-center justify-center transition-transform hover:rotate-180 duration-300 cursor-pointer shrink-0"
             style={{ background: 'var(--surface-tint)', color: 'var(--bg-deep)', border: 'none' }}
             title="重新生成"
+            aria-label="重新生成"
           >
             ↻
           </button>

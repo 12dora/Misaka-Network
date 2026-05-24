@@ -281,7 +281,7 @@ export default function ACGN() {
             fetchPriority="high"
             decoding="async"
             style={{
-              maxHeight: 'calc(min(100vh, 820px) - 64px)',
+              maxHeight: 'calc(min(100dvh, 820px) - 64px)',
               width: '100%',
               objectFit: 'contain',
               objectPosition: 'bottom center',

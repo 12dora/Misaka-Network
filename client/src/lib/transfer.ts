@@ -402,6 +402,17 @@ export async function receiveChunk(
   const session = receiveSessions.get(transferId)
   if (!session) return
 
+  // Receiver-side pause: when the user clicks "pause" on the receive side,
+  // network.ts sets this signal AND tells the sender to stop. In-flight
+  // chunks (already buffered in the SCTP queue when the pause hit) keep
+  // arriving briefly — drop them silently so we don't waste CPU on decrypt
+  // and don't grow the on-disk file past the user's pause point. Cancelled
+  // transfers fall through the same path; receiveSessions delete happens in
+  // cancelReceive so the early-return at the top of this function takes over.
+  const signal = transferSignals.get(transferId)
+  if (signal?.paused) return
+  if (signal?.cancelled) return
+
   // AES-GCM authenticates the encrypted payload — no separate per-chunk
   // checksum is needed (and the sender no longer ships one).
   const decrypted = await decryptChunk(iv, encrypted, peerSessionId)
@@ -685,7 +696,11 @@ export async function getOPFSFile(transferId: string): Promise<File> {
 export async function cleanupOPFS(transferId: string) {
   const handle = opfsHandles.get(transferId)
   if (handle) {
-    handle.writable.close().catch(() => {})
+    // Drain queued writes BEFORE closing — otherwise pending write promises
+    // reject with "stream closed" and the OPFS directory entry can briefly
+    // re-appear after `removeEntry` because a late write recreated it.
+    await handle.queue.drain().catch(() => {})
+    await handle.writable.close().catch(() => {})
     opfsHandles.delete(transferId)
   }
   try {
