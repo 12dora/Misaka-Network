@@ -1,6 +1,6 @@
 // Bump CACHE_VERSION on every release; the activate handler nukes any older
 // cache buckets so stale chunked JS doesn't poison the new shell.
-const CACHE_VERSION = 'misaka-shell-v4'
+const CACHE_VERSION = 'misaka-shell-v5'
 const APP_SHELL = [
   './',
   './index.html',
@@ -9,12 +9,14 @@ const APP_SHELL = [
   './assets/misaka-logo.webp',
 ]
 
-// During install we (a) prime the cache with the static shell and (b) parse
-// the freshly-fetched index.html to discover the Vite-hashed bundle URLs
-// (`/assets/index-<hash>.js` etc.) so the very first offline visit has
-// everything it needs. Vite doesn't emit a manifest.json by default at
-// runtime and modifying the build config is out of scope, so we extract the
-// asset list straight from the served HTML.
+// On install we prime ONLY the static shell. The previous version also parsed
+// index.html and aggressively prefetched every chunk-hashed JS/CSS asset; on
+// first visit that doubled the network load (the page is already fetching
+// those same assets to render) and noticeably slowed the very first paint on
+// constrained uplinks. Instead the runtime `fetch` handler populates the
+// cache opportunistically — by the time the user navigates a second time,
+// the same-cache path is hot anyway, without ever competing with the first
+// render.
 self.addEventListener('install', (event) => {
   event.waitUntil((async () => {
     const cache = await caches.open(CACHE_VERSION)
@@ -22,31 +24,6 @@ self.addEventListener('install', (event) => {
       await cache.addAll(APP_SHELL)
     } catch (err) {
       console.warn('[sw] shell prime failed', err)
-    }
-    try {
-      const res = await fetch('./index.html', { cache: 'no-cache' })
-      if (res.ok) {
-        const html = await res.text()
-        // Match both <script src="..."> and <link href="..."> inside the
-        // current document. We intentionally restrict to same-origin (./ or /)
-        // so cross-origin CDNs don't get cached without a CORS path.
-        const urls = new Set()
-        const reSrc = /<script[^>]+src=["']([^"']+)["']/g
-        const reHref = /<link[^>]+href=["']([^"']+)["']/g
-        let m
-        while ((m = reSrc.exec(html))) urls.add(m[1])
-        while ((m = reHref.exec(html))) urls.add(m[1])
-        const sameOrigin = []
-        for (const u of urls) {
-          try {
-            const abs = new URL(u, self.location.href)
-            if (abs.origin === self.location.origin) sameOrigin.push(abs.pathname)
-          } catch { /* ignore malformed */ }
-        }
-        await Promise.allSettled(sameOrigin.map((p) => cache.add(p)))
-      }
-    } catch (err) {
-      console.warn('[sw] asset discovery failed', err)
     }
   })())
   self.skipWaiting()

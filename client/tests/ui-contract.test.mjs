@@ -157,8 +157,9 @@ assert.match(transfer, /encryptChunk\(raw, peerSessionId, ivForChunk\)/)
 assert.match(transfer, /decryptChunk\(iv, encrypted, peerSessionId\)/)
 assert.match(transfer, /const ivPrefix = randomIvPrefix\(\)/)
 
-// P0-9: bumped to v4 with asset-discovery prime + skip-waiting handshake.
-assert.match(serviceWorker, /misaka-shell-v4/)
+// Bumped to v5: shell-only install (no aggressive asset prefetch — that
+// doubled first-paint network load and slowed initial visits on tight uplinks).
+assert.match(serviceWorker, /misaka-shell-v5/)
 assert.doesNotMatch(serviceWorker, /const cached = await caches\.match\(req\)\s+if \(cached\) return cached\s+try/s)
 
 console.log('✅ 前端 UI 契约测试通过')

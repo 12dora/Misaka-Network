@@ -43,14 +43,45 @@ export function _resetAllowedOriginsCache() {
 }
 
 /**
- * `originOrNull` is the value as the request sent it (or null if absent).
- * Returns true if either:
- *   - No Origin header was sent (non-browser caller; not a CSRF vector).
- *   - Origin matches the configured allow-list.
+ * Same-origin auto-allow: if the request's Origin equals the host the request
+ * was sent to (i.e. the browser is hitting our own host with our own page),
+ * it is not a cross-site request by definition and cannot be CSRF. Without
+ * this, single-host deployments (frontend + backend both on misaka.example)
+ * would need to manually echo their own domain in ALLOWED_ORIGINS, which is
+ * a foot-gun that broke production after the Origin check landed.
+ */
+function isSameOrigin(origin: string, req: { headers: Record<string, unknown> | IncomingMessage['headers'] }): boolean {
+  const h = req.headers as Record<string, string | string[] | undefined>
+  const host = typeof h['host'] === 'string' ? h['host'] : undefined
+  if (!host) return false
+  // Behind Caddy/nginx the original scheme is in X-Forwarded-Proto.
+  const xfProto = typeof h['x-forwarded-proto'] === 'string' ? h['x-forwarded-proto'] : undefined
+  const scheme = xfProto || (typeof (h as { encrypted?: unknown }).encrypted !== 'undefined' ? 'https' : 'http')
+  return origin === `${scheme}://${host}` || origin === `https://${host}` || origin === `http://${host}`
+}
+
+/**
+ * Header-less variant kept for callers that only have the Origin string and no
+ * request context. Auto-allow rules can't apply here so it still consults the
+ * static allowlist only.
  */
 export function isOriginAllowed(originOrNull: string | null | undefined): boolean {
   if (!originOrNull) return true
   return allowedOrigins().includes(originOrNull)
+}
+
+/**
+ * Request-aware Origin check. Allows the request when ANY of:
+ *   - No Origin header (non-browser caller — not a CSRF vector).
+ *   - Origin in the configured allow-list.
+ *   - Origin equals the request's own host (same-origin deployment).
+ */
+export function isOriginAllowedForRequest(req: { headers: Record<string, unknown> | IncomingMessage['headers'] }): boolean {
+  const h = req.headers as Record<string, string | string[] | undefined>
+  const origin = typeof h['origin'] === 'string' ? h['origin'] : undefined
+  if (!origin) return true
+  if (allowedOrigins().includes(origin)) return true
+  return isSameOrigin(origin, req)
 }
 
 export function getRequestOrigin(req: { headers: Record<string, unknown> | IncomingMessage['headers'] }): string | null {
@@ -71,11 +102,13 @@ export function getRequestOrigin(req: { headers: Record<string, unknown> | Incom
 /**
  * Stricter variant for HTTP CSRF-sensitive routes (e.g. /api/register):
  * we still allow missing Origin (non-browser caller), but if either Origin
- * OR Referer is present they MUST be in the allow-list. This blocks the
- * classic CSRF where the attacker's page can't suppress Origin.
+ * OR Referer is present they MUST be in the allow-list OR same-origin. This
+ * blocks the classic CSRF where the attacker's page can't suppress Origin,
+ * while still letting same-host production deployments work zero-config.
  */
 export function isHttpOriginAllowed(req: { headers: Record<string, unknown> | IncomingMessage['headers'] }): boolean {
   const origin = getRequestOrigin(req)
   if (!origin) return true
-  return allowedOrigins().includes(origin)
+  if (allowedOrigins().includes(origin)) return true
+  return isSameOrigin(origin, req)
 }

@@ -264,7 +264,10 @@ export default function LoginCard() {
       )}
 
       {/* Pass Code */}
-      <fieldset className="mb-6" style={{ border: 'none', padding: 0, margin: 0 }}>
+      {/* Inline `margin: 0` previously clobbered Tailwind's mb-6 (inline styles
+          beat utility classes), pushing 通行码 grid hard against the 接入网络 button.
+          Keep only the visual resets that don't conflict with the layout class. */}
+      <fieldset className="mb-6" style={{ border: 'none', padding: 0 }}>
         <legend className="block text-xs font-kanji text-[var(--text-on-white-2)] mb-1.5" style={{ padding: 0 }}>
           ◇ 通行码
         </legend>
