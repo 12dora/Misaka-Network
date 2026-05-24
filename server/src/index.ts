@@ -8,7 +8,7 @@ import { setWSS } from './activity.js'
 import { startCleanupTask, stopCleanupTask } from './cleanup.js'
 import { loadTurnState, startPersistFlusher, stopPersistFlusher, flushTurnState, loadPersistedLocks } from './persist.js'
 import { startTurnPollers, stopTurnPollers, startTurnRevokeRetry, stopTurnRevokeRetry } from './turn.js'
-import { allowedOrigins, isOriginAllowed } from './origin.js'
+import { allowedOrigins, isOriginAllowed, isOriginAllowedForRequest } from './origin.js'
 import { PORT, SHUTDOWN_TIMEOUT_MS } from './config.js'
 
 const app = express()
@@ -16,17 +16,17 @@ const app = express()
 app.set('trust proxy', 1)
 
 // Explicit CORS allow-list — replaces the previous `cors()` (which echoed
-// every Origin). With credentials enabled, `*` would be unsafe anyway. The
-// list is the same one the WS upgrade uses.
-app.use(cors({
-  origin: (origin, cb) => {
-    // No Origin header → server-to-server / curl / native; allow.
-    if (!origin) return cb(null, true)
-    if (allowedOrigins().includes(origin)) return cb(null, true)
-    cb(null, false)
-  },
-  credentials: false,
-}))
+// every Origin). With credentials enabled, `*` would be unsafe anyway.
+// Three accept conditions: no Origin (non-browser), Origin in ALLOWED_ORIGINS,
+// or same-origin request (Origin equals the request's own host — covers the
+// common single-domain deployment). Implemented as middleware (not the `cors`
+// option callback) because we need the full Request to compare against Host.
+app.use((req, res, next) => {
+  const origin = req.headers.origin
+  if (!origin) return cors({ origin: false, credentials: false })(req, res, next)
+  const ok = allowedOrigins().includes(origin) || isOriginAllowedForRequest(req)
+  return cors({ origin: ok ? origin : false, credentials: false })(req, res, next)
+})
 
 // 64kb body cap — same ceiling as the WS frame guard, so a single bad
 // request can't burn a megabyte of buffer.
@@ -50,13 +50,14 @@ const wss = new WebSocketServer({
   path: '/ws',
   verifyClient: (info, done) => {
     const origin = info.req.headers.origin
-    if (origin && !isOriginAllowed(origin)) {
-      // 403 + machine-readable code; the upgrade fails before the WS handshake
-      // completes so no socket is left dangling.
-      done(false, 403, 'BAD_ORIGIN')
+    // No Origin (non-browser); allowlist hit; or same-origin (Origin matches
+    // our own Host). Reject otherwise — the upgrade fails before the WS
+    // handshake completes so no socket is left dangling.
+    if (!origin || isOriginAllowed(origin) || isOriginAllowedForRequest(info.req)) {
+      done(true)
       return
     }
-    done(true)
+    done(false, 403, 'BAD_ORIGIN')
   },
 })
 
