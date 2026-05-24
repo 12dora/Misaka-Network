@@ -28,11 +28,36 @@ const DEFAULT_ORIGINS = [
 ]
 
 let cachedList: string[] | null = null
+let cachedWildcard: boolean | null = null
+
+/**
+ * "Public signaling" mode: ALLOWED_ORIGINS=* lets the server accept any
+ * Origin. Intended for the canonical public deployment where the frontend
+ * lives on GitHub Pages (one origin per fork) and the backend serves
+ * everyone. Cross-site CSRF risk is mitigated by the other defences —
+ * scrypt-hashed 6-digit passcode, 5s WS AUTH grace, global per-nodeId
+ * brute-force freeze, per-IP rate limits — so the Origin lock-down is the
+ * appropriate-to-disable layer for a service that's deliberately open.
+ *
+ * Private deployments should leave this unset and list specific origins.
+ */
+export function isWildcardOriginMode(): boolean {
+  if (cachedWildcard !== null) return cachedWildcard
+  cachedWildcard = (process.env.ALLOWED_ORIGINS ?? '').trim() === '*'
+  return cachedWildcard
+}
 
 export function allowedOrigins(): string[] {
   if (cachedList) return cachedList
   const raw = process.env.ALLOWED_ORIGINS ?? ''
-  const fromEnv = raw.split(',').map(s => s.trim()).filter(Boolean)
+  if (raw.trim() === '*') {
+    // Wildcard mode — return the dev defaults only (callers should use
+    // isWildcardOriginMode() to short-circuit, but a non-empty list keeps
+    // legacy paths safe).
+    cachedList = [...DEFAULT_ORIGINS]
+    return cachedList
+  }
+  const fromEnv = raw.split(',').map(s => s.trim()).filter(s => s.length > 0 && s !== '*')
   cachedList = Array.from(new Set([...DEFAULT_ORIGINS, ...fromEnv]))
   return cachedList
 }
@@ -40,6 +65,7 @@ export function allowedOrigins(): string[] {
 // Test hook — production never calls this.
 export function _resetAllowedOriginsCache() {
   cachedList = null
+  cachedWildcard = null
 }
 
 /**
@@ -62,21 +88,24 @@ function isSameOrigin(origin: string, req: { headers: Record<string, unknown> | 
 
 /**
  * Header-less variant kept for callers that only have the Origin string and no
- * request context. Auto-allow rules can't apply here so it still consults the
- * static allowlist only.
+ * request context. Auto-allow rules can't apply here so it consults the static
+ * allowlist (or wildcard mode).
  */
 export function isOriginAllowed(originOrNull: string | null | undefined): boolean {
   if (!originOrNull) return true
+  if (isWildcardOriginMode()) return true
   return allowedOrigins().includes(originOrNull)
 }
 
 /**
  * Request-aware Origin check. Allows the request when ANY of:
+ *   - Wildcard mode (ALLOWED_ORIGINS=*) is on.
  *   - No Origin header (non-browser caller — not a CSRF vector).
  *   - Origin in the configured allow-list.
  *   - Origin equals the request's own host (same-origin deployment).
  */
 export function isOriginAllowedForRequest(req: { headers: Record<string, unknown> | IncomingMessage['headers'] }): boolean {
+  if (isWildcardOriginMode()) return true
   const h = req.headers as Record<string, string | string[] | undefined>
   const origin = typeof h['origin'] === 'string' ? h['origin'] : undefined
   if (!origin) return true
@@ -107,6 +136,7 @@ export function getRequestOrigin(req: { headers: Record<string, unknown> | Incom
  * while still letting same-host production deployments work zero-config.
  */
 export function isHttpOriginAllowed(req: { headers: Record<string, unknown> | IncomingMessage['headers'] }): boolean {
+  if (isWildcardOriginMode()) return true
   const origin = getRequestOrigin(req)
   if (!origin) return true
   if (allowedOrigins().includes(origin)) return true
