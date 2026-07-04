@@ -395,13 +395,19 @@ export async function sendFileParallel(
   // Use allSettled: one lane's hard failure now triggers a re-queue + lane
   // exit (see laneLoop above), but the OTHER lanes must keep draining.
   await Promise.allSettled(activeLanes.map(lane => laneLoop(lane)))
-  // If we exited with anything still un-sent (because all lanes died),
-  // fail loudly. The success path already updates status='completed' below.
-  if (!cancelled && sent < totalChunks) {
+  await flushRecord(true)
+  // Cancelled mid-flight: checkSignals already set status='failed'. Surface it
+  // as a thrown error so the caller takes the abort path instead of reporting a
+  // false "sent" success. Clean up the control signal on the way out.
+  if (cancelled) {
+    transferSignals.delete(transferId)
+    throw new TransferCancelledError()
+  }
+  // If we exited with anything still un-sent (because all lanes died), fail loudly.
+  if (sent < totalChunks) {
     throw new Error(`传输中断：${totalChunks - sent} 个分片未送达`)
   }
-  await flushRecord(true)
-  if (!cancelled) await updateTransfer(transferId, { status: 'completed' })
+  await updateTransfer(transferId, { status: 'completed' })
 }
 
 // ── Receive file ─────────────────────────────────────────────────────
@@ -684,12 +690,20 @@ export async function completeReceive(transferId: string): Promise<File> {
   await deleteChunks(transferId)
   await updateTransfer(transferId, { status: 'completed' })
   receiveSessions.delete(transferId)
+  transferSignals.delete(transferId)
   return file
 }
 
 export function cancelReceive(transferId: string): Promise<void> {
   const session = receiveSessions.get(transferId)
   receiveSessions.delete(transferId)
+  // Only a genuine RECEIVE transfer owns the control signal here. cancelTransferAction
+  // fires cancelReceive for every cancel including SEND transfers (which have no
+  // receive session) — and a SEND still needs its signal so the send loop can
+  // observe the cancel on its next checkSignals. sendFileParallel deletes the
+  // signal itself on exit; deleting it here would re-open the "cancel is ignored,
+  // whole file keeps sending" bug.
+  if (session) transferSignals.delete(transferId)
   // P0-2: drain any in-flight saveChunk promises BEFORE deleteChunks. A
   // slow IDB write that started just before cancel would otherwise
   // resolve AFTER deleteChunks and leave an orphan chunk row that
@@ -781,17 +795,29 @@ function waitWhilePaused(transferId: string): Promise<void> {
   })
 }
 
-function waitForBuffer(dc: RTCDataChannel): Promise<void> {
+export function waitForBuffer(dc: RTCDataChannel): Promise<void> {
   return new Promise(resolve => {
-    if (dc.bufferedAmount <= HIGH_WATER_MARK) {
+    // If the channel is already closing/closed, or below the watermark, resolve
+    // immediately — the caller re-checks readyState right after and re-queues.
+    if (dc.readyState !== 'open' || dc.bufferedAmount <= HIGH_WATER_MARK) {
       resolve()
       return
     }
-    dc.bufferedAmountLowThreshold = LOW_WATER_MARK
-    dc.onbufferedamountlow = () => {
+    // A channel that closes while parked above HIGH_WATER_MARK never fires
+    // `bufferedamountlow`, so without also listening for close/error this promise
+    // would hang forever and wedge the whole send (Promise.allSettled never
+    // resolves). Settle on channel death too; laneLoop's next readyState check
+    // then re-queues the chunk and exits the lane.
+    const cleanup = () => {
       dc.onbufferedamountlow = null
-      resolve()
+      dc.removeEventListener('close', onDead)
+      dc.removeEventListener('error', onDead)
     }
+    const onDead = () => { cleanup(); resolve() }
+    dc.bufferedAmountLowThreshold = LOW_WATER_MARK
+    dc.onbufferedamountlow = () => { cleanup(); resolve() }
+    dc.addEventListener('close', onDead)
+    dc.addEventListener('error', onDead)
   })
 }
 
@@ -842,6 +868,27 @@ export function cancelTransfer(transferId: string) {
   const notify = s.notifyResume
   s.notifyResume = undefined
   notify?.()
+  // Do NOT delete the signal here. The send loop only learns of cancellation
+  // by reading transferSignals.get(id).cancelled on its NEXT async checkSignals;
+  // deleting synchronously (no yield point) meant every subsequent read saw
+  // `undefined` → the loop never aborted, transmitted the whole remaining file,
+  // and reported a false success. Cleanup happens once the owner observes the
+  // cancel: sendFileParallel (send) / cancelReceive+completeReceive (receive).
+}
+
+// Thrown by sendFileParallel when the transfer was cancelled mid-flight, so the
+// caller can distinguish a user/peer abort from a genuine transmission failure.
+export class TransferCancelledError extends Error {
+  constructor() {
+    super('传输已取消')
+    this.name = 'TransferCancelledError'
+  }
+}
+
+// Drop a transfer's control signal. Called by the owning path once the transfer
+// is fully torn down (send completion/abort, receive completion/cancel) so the
+// map doesn't leak an entry per transfer.
+export function clearTransferSignal(transferId: string) {
   transferSignals.delete(transferId)
 }
 

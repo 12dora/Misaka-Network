@@ -68,11 +68,16 @@ export default function ScanModal({ onClose }: Props) {
   const animRef = useRef<number>(0)
 
   useEffect(() => {
-    startCamera()
-    return () => stopCamera()
+    let cancelled = false
+    startCamera(() => cancelled)
+    // Mark cancelled BEFORE stopCamera so a getUserMedia still pending when the
+    // modal unmounts (permission prompt open) is stopped the moment it resolves.
+    return () => { cancelled = true; stopCamera() }
   }, [facingMode])
 
-  async function startCamera() {
+  async function startCamera(isCancelledArg?: () => boolean) {
+    // Guard against being passed a DOM event (retry button onClick).
+    const isCancelled = typeof isCancelledArg === 'function' ? isCancelledArg : () => false
     stopCamera()
 
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -93,6 +98,14 @@ export default function ScanModal({ onClose }: Props) {
         video: { facingMode: { ideal: facingMode }, width: { ideal: 640 }, height: { ideal: 640 } },
         audio: false,
       })
+      // The component may have unmounted (or facingMode changed) while the
+      // permission prompt was open. Without this guard the just-granted stream
+      // is stored on a detached ref that no cleanup will ever stop — the camera
+      // light stays on and an orphaned rAF scan loop runs setState-after-unmount.
+      if (isCancelled()) {
+        stream.getTracks().forEach(t => t.stop())
+        return
+      }
       streamRef.current = stream
       if (videoRef.current) {
         videoRef.current.srcObject = stream
@@ -304,7 +317,7 @@ export default function ScanModal({ onClose }: Props) {
                   {permissionHelpHint()}
                 </p>
               )}
-              <MisakaButton variant="pill" size="sm" onClick={startCamera} className="mt-2">
+              <MisakaButton variant="pill" size="sm" onClick={() => startCamera()} className="mt-2">
                 重试
               </MisakaButton>
             </div>

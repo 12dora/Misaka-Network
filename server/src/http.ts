@@ -1,5 +1,5 @@
 import { Router, type Request, type Response, type NextFunction } from 'express'
-import { randomBytes } from 'crypto'
+import { randomBytes, timingSafeEqual } from 'crypto'
 import { nanoid } from 'nanoid'
 import { z } from 'zod'
 import {
@@ -511,8 +511,28 @@ router.post('/qr-redeem', (req, res) => {
     return
   }
 
+  // Same per-nodeId freeze that guards /register — otherwise qr-redeem is a
+  // parallel passcode-guessing oracle immune to the IP-rotation defence.
+  const now = Date.now()
+  const frozen = isNodeFrozen(record.ownerNodeId, now)
+  if (frozen.frozen) {
+    res.status(423).json({ error: 'NODE_LOCKED', reason: 'NODE_FROZEN', unlockAt: frozen.until })
+    return
+  }
+
   if (record.passCodeHash) {
-    if (hashPassCodeIdentity(parsed.data.myPassCode) !== record.passCodeHash) {
+    // Timing-safe compare of the sha256 identity hashes (equal length → safe).
+    const provided = Buffer.from(hashPassCodeIdentity(parsed.data.myPassCode))
+    const expected = Buffer.from(record.passCodeHash)
+    const match = provided.length === expected.length && timingSafeEqual(provided, expected)
+    if (!match) {
+      // A wrong guess used to neither burn the single-use token nor feed any
+      // lockout, so the same token could be retried across the full 6-digit
+      // keyspace for its 5-min TTL. Now: count the failure into the per-nodeId
+      // freeze AND burn the token after MAX_ATTEMPTS wrong guesses.
+      record.failedAttempts = (record.failedAttempts ?? 0) + 1
+      recordFailedPasscodeAttempt(record.ownerNodeId, ip, now)
+      if (record.failedAttempts >= MAX_ATTEMPTS) record.used = true
       res.status(401).json({ error: 'WRONG_PASSCODE' })
       return
     }
@@ -522,6 +542,7 @@ router.post('/qr-redeem', (req, res) => {
   }
 
   record.used = true
+  clearNodeFreezeOnSuccess(record.ownerNodeId)
   const channelId = record.channelId ?? nanoid(8)
   res.json({ targetNodeId: record.ownerNodeId, channelId })
 })

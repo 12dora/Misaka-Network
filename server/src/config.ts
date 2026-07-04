@@ -6,6 +6,24 @@
 export const PORT = parseInt(process.env.PORT ?? '9080', 10)
 export const SHUTDOWN_TIMEOUT_MS = 5_000
 
+// Whether to trust the `X-Forwarded-For` header when deriving the client IP.
+// SECURITY: this MUST default to off. Every per-IP defence (register IP cap,
+// brute-force lock, qr-redeem/global rate limits, TURN accounting) keys on the
+// client IP; if we blindly trust a client-supplied XFF header on a directly
+// internet-facing (zero-config) deployment, an attacker rotates the header per
+// request and bypasses all of them. Operators running behind exactly one
+// reverse proxy that appends the real client IP set `TRUST_PROXY=1` (the hop
+// count); a CIDR/preset list (e.g. `loopback, 10.0.0.0/8`) is also accepted and
+// passed through to Express verbatim.
+function parseTrustProxy(raw: string | undefined): number | boolean | string {
+  if (raw === undefined || raw === '' || raw.toLowerCase() === 'false' || raw === '0') return false
+  if (raw.toLowerCase() === 'true') return true
+  if (/^\d+$/.test(raw)) return parseInt(raw, 10)
+  return raw
+}
+export const TRUST_PROXY = parseTrustProxy(process.env.TRUST_PROXY)
+export const TRUST_PROXY_ENABLED = TRUST_PROXY !== false
+
 // ── Node limits ───────────────────────────────────────────────────────
 export const MAX_NODES = parseInt(process.env.MAX_NODES ?? '0', 10) || Infinity
 export const MAX_NODES_PER_IP = 10

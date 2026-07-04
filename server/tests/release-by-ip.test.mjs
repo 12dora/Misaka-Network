@@ -328,7 +328,9 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
 function startServer() {
   const proc = spawn('npx', ['tsx', 'src/index.ts'], {
     cwd: SERVER_DIR,
-    env: { ...process.env, PORT: String(PORT), MAX_NODES: '500', TURN_AUTO_ENABLED: 'false' },
+    // TRUST_PROXY=1: this test drives distinct client IPs via X-Forwarded-For;
+    // the server only honours XFF when it trusts a proxy hop.
+    env: { ...process.env, PORT: String(PORT), MAX_NODES: '500', TURN_AUTO_ENABLED: 'false', TRUST_PROXY: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   proc.stderr.on('data', (d) => {

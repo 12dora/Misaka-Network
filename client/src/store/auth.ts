@@ -10,11 +10,16 @@ import { onAuthInvalid } from '@/lib/signaling'
 // message. Browsers without Web Locks (older Safari) silently no-op — degraded
 // behavior matches the pre-existing "last writer wins" anyway.
 let nodeIdLockRelease: (() => void) | null = null
+let lockedNodeId: number | null = null
 
 async function acquireNodeIdLock(nodeId: number): Promise<boolean> {
   if (typeof navigator === 'undefined' || !('locks' in navigator)) return true
+  // Re-entrant: if THIS tab already holds the lock for this same nodeId, don't
+  // issue a second competing `ifAvailable` request (which the browser would
+  // deny with lock===null, falsely reporting a same-tab conflict).
+  if (nodeIdLockRelease && lockedNodeId === nodeId) return true
   // Release any previously held lock (user changed nodeId).
-  if (nodeIdLockRelease) { nodeIdLockRelease(); nodeIdLockRelease = null }
+  if (nodeIdLockRelease) { nodeIdLockRelease(); nodeIdLockRelease = null; lockedNodeId = null }
   return new Promise<boolean>((resolve) => {
     // ifAvailable: true → never block, returns null on contention.
     navigator.locks.request(
@@ -22,6 +27,7 @@ async function acquireNodeIdLock(nodeId: number): Promise<boolean> {
       { ifAvailable: true },
       (lock) => {
         if (!lock) { resolve(false); return undefined }
+        lockedNodeId = nodeId
         resolve(true)
         // Hold for the tab's lifetime via a never-resolving promise; the
         // browser releases the lock automatically on tab close / refresh.
@@ -31,6 +37,90 @@ async function acquireNodeIdLock(nodeId: number): Promise<boolean> {
       },
     ).catch(() => resolve(true))   // unexpected → don't block the user
   })
+}
+
+// Dedupe concurrent connect() calls. After a server restart, multiple in-flight
+// authedFetch calls each 401 and each fires reAuth()->connect(); onAuthInvalid
+// (WS 4001/4002) also calls connect(). Without dedup they race the same Web
+// Lock (only one wins → the losers flash a bogus "another tab" error) and
+// double-register. A shared in-flight promise makes all callers await one run.
+let connectInFlight: Promise<void> | null = null
+
+type AuthGet = () => AuthState
+type AuthSet = (partial: Partial<AuthState>) => void
+
+async function doConnect(get: AuthGet, set: AuthSet): Promise<void> {
+  const current = get().identity
+  set({ isLoading: true, error: null, ipFullPrompt: false })
+
+  const ownsLock = await acquireNodeIdLock(current.nodeId)
+  if (!ownsLock) {
+    set({
+      isLoading: false,
+      error: '该节点编号已在本浏览器的另一个标签页接入。请关闭其他标签页或更换节点编号。',
+    })
+    return
+  }
+
+  try {
+    const res = await fetch(apiUrl('/api/register'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nodeId: current.nodeId, passCode: current.passCode }),
+    })
+
+    if (res.status === 409) {
+      const data = await res.json() as { error: string; message?: string; remaining?: number }
+      const msg = data.remaining != null
+        ? `通行码错误（剩余 ${data.remaining} 次尝试机会）`
+        : (data.message ?? '该节点编号已被他人使用，请换一个')
+      set({ isLoading: false, error: msg })
+      return
+    }
+
+    if (res.status === 423) {
+      const data = await res.json() as { error: string; reason?: string; unlockAt: number }
+      const mins = Math.ceil((data.unlockAt - Date.now()) / 60000)
+      const msg = data.reason === 'WRONG_PASSCODE'
+        ? `通行码错误次数过多，节点已临时锁定（${mins} 分钟后解除）`
+        : data.reason === 'NODE_FROZEN'
+          ? `该节点被多 IP 频繁试探，已全局冻结（${mins} 分钟后解除）。请稍后再试，或更换节点编号。`
+          : `检测到异常接入尝试，节点已临时锁定（${mins} 分钟后解除）`
+      set({ isLoading: false, error: msg })
+      return
+    }
+
+    if (res.status === 403) {
+      const data = await res.json().catch(() => ({ error: 'BAD_ORIGIN' })) as { error: string; message?: string }
+      const msg = data.error === 'BAD_ORIGIN'
+        ? '请求来源不被允许。请确认在官方部署域名下访问，而非直接打开 HTML。'
+        : (data.message ?? '请求被拒绝')
+      set({ isLoading: false, error: msg })
+      return
+    }
+
+    if (res.status === 429) {
+      const data = await res.json().catch(() => ({ error: 'RATE_LIMITED' })) as { error: string; message?: string }
+      if (data.error === 'IP_LIMITED') {
+        set({ isLoading: false, ipFullPrompt: true, error: null })
+        return
+      }
+      set({ isLoading: false, error: data.message ?? '请求过于频繁，请稍后再试' })
+      return
+    }
+
+    if (!res.ok) {
+      set({ isLoading: false, error: '接入失败，请稍后重试' })
+      return
+    }
+
+    const data = await res.json() as { token: string; sessionId: string; expiresAt: number; resumed: boolean }
+    const session: Session = { token: data.token, sessionId: data.sessionId, expiresAt: data.expiresAt }
+    sessionStorage.setItem('misaka.session', JSON.stringify(session))
+    set({ session, isConnected: true, isLoading: false })
+  } catch {
+    set({ isLoading: false, error: '网络连接失败，请检查网络' })
+  }
 }
 
 function randomInt(min: number, max: number) {
@@ -131,77 +221,17 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   async connect() {
-    const current = get().identity
-    set({ isLoading: true, error: null, ipFullPrompt: false })
-
-    const ownsLock = await acquireNodeIdLock(current.nodeId)
-    if (!ownsLock) {
-      set({
-        isLoading: false,
-        error: '该节点编号已在本浏览器的另一个标签页接入。请关闭其他标签页或更换节点编号。',
-      })
-      return
-    }
-
-    try {
-      const res = await fetch(apiUrl('/api/register'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ nodeId: current.nodeId, passCode: current.passCode }),
-      })
-
-      if (res.status === 409) {
-        const data = await res.json() as { error: string; message?: string; remaining?: number }
-        const msg = data.remaining != null
-          ? `通行码错误（剩余 ${data.remaining} 次尝试机会）`
-          : (data.message ?? '该节点编号已被他人使用，请换一个')
-        set({ isLoading: false, error: msg })
-        return
+    // Coalesce concurrent callers (parallel 401 re-auths + onAuthInvalid) onto
+    // one registration so they don't race the node lock or double-register.
+    if (connectInFlight) return connectInFlight
+    connectInFlight = (async () => {
+      try {
+        await doConnect(get, set)
+      } finally {
+        connectInFlight = null
       }
-
-      if (res.status === 423) {
-        const data = await res.json() as { error: string; reason?: string; unlockAt: number }
-        const mins = Math.ceil((data.unlockAt - Date.now()) / 60000)
-        const msg = data.reason === 'WRONG_PASSCODE'
-          ? `通行码错误次数过多，节点已临时锁定（${mins} 分钟后解除）`
-          : data.reason === 'NODE_FROZEN'
-            ? `该节点被多 IP 频繁试探，已全局冻结（${mins} 分钟后解除）。请稍后再试，或更换节点编号。`
-            : `检测到异常接入尝试，节点已临时锁定（${mins} 分钟后解除）`
-        set({ isLoading: false, error: msg })
-        return
-      }
-
-      if (res.status === 403) {
-        const data = await res.json().catch(() => ({ error: 'BAD_ORIGIN' })) as { error: string; message?: string }
-        const msg = data.error === 'BAD_ORIGIN'
-          ? '请求来源不被允许。请确认在官方部署域名下访问，而非直接打开 HTML。'
-          : (data.message ?? '请求被拒绝')
-        set({ isLoading: false, error: msg })
-        return
-      }
-
-      if (res.status === 429) {
-        const data = await res.json().catch(() => ({ error: 'RATE_LIMITED' })) as { error: string; message?: string }
-        if (data.error === 'IP_LIMITED') {
-          set({ isLoading: false, ipFullPrompt: true, error: null })
-          return
-        }
-        set({ isLoading: false, error: data.message ?? '请求过于频繁，请稍后再试' })
-        return
-      }
-
-      if (!res.ok) {
-        set({ isLoading: false, error: '接入失败，请稍后重试' })
-        return
-      }
-
-      const data = await res.json() as { token: string; sessionId: string; expiresAt: number; resumed: boolean }
-      const session: Session = { token: data.token, sessionId: data.sessionId, expiresAt: data.expiresAt }
-      sessionStorage.setItem('misaka.session', JSON.stringify(session))
-      set({ session, isConnected: true, isLoading: false })
-    } catch {
-      set({ isLoading: false, error: '网络连接失败，请检查网络' })
-    }
+    })()
+    return connectInFlight
   },
 
   async releaseAllFromIp() {
@@ -252,7 +282,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   clearSession() {
     sessionStorage.removeItem('misaka.session')
-    if (nodeIdLockRelease) { nodeIdLockRelease(); nodeIdLockRelease = null }
+    if (nodeIdLockRelease) { nodeIdLockRelease(); nodeIdLockRelease = null; lockedNodeId = null }
     set({ session: null, isConnected: false })
   },
 
@@ -266,7 +296,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       }).catch(() => {})
     }
     sessionStorage.removeItem('misaka.session')
-    if (nodeIdLockRelease) { nodeIdLockRelease(); nodeIdLockRelease = null }
+    if (nodeIdLockRelease) { nodeIdLockRelease(); nodeIdLockRelease = null; lockedNodeId = null }
     set({ session: null, isConnected: false, error: null })
   },
 }))

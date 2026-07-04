@@ -6,14 +6,17 @@ import { router } from './http.js'
 import { setupWS } from './ws.js'
 import { setWSS } from './activity.js'
 import { startCleanupTask, stopCleanupTask } from './cleanup.js'
-import { loadTurnState, startPersistFlusher, stopPersistFlusher, flushTurnState, loadPersistedLocks } from './persist.js'
+import { loadTurnState, startPersistFlusher, stopPersistFlusher, flushTurnState, loadPersistedLocks, flushPersistedLocks } from './persist.js'
 import { startTurnPollers, stopTurnPollers, startTurnRevokeRetry, stopTurnRevokeRetry } from './turn.js'
 import { allowedOrigins, isOriginAllowed, isOriginAllowedForRequest, isWildcardOriginMode } from './origin.js'
-import { PORT, SHUTDOWN_TIMEOUT_MS } from './config.js'
+import { PORT, SHUTDOWN_TIMEOUT_MS, TRUST_PROXY } from './config.js'
 
 const app = express()
 
-app.set('trust proxy', 1)
+// Default OFF so a directly internet-facing deployment can't be tricked by a
+// spoofed X-Forwarded-For header (which would defeat every per-IP defence).
+// Operators behind a reverse proxy set TRUST_PROXY (see config.ts).
+app.set('trust proxy', TRUST_PROXY)
 
 // CORS policy:
 //   - ALLOWED_ORIGINS=* → wildcard mode (echo any Origin). Intended for the
@@ -93,8 +96,19 @@ httpServer.listen(PORT, () => {
 })
 
 // Graceful shutdown: notify all connected nodes before exiting
-function gracefulShutdown(signal: string) {
+let shuttingDown = false
+async function gracefulShutdown(signal: string) {
+  if (shuttingDown) return
+  shuttingDown = true
   console.log(`\n收到 ${signal}，正在通知所有节点并关闭...`)
+
+  // Hard backstop: if any await below wedges, still exit. Armed FIRST so the
+  // process can never hang on shutdown. unref so it isn't itself a live handle.
+  const hardExit = setTimeout(() => {
+    console.log('强制退出')
+    process.exit(1)
+  }, SHUTDOWN_TIMEOUT_MS)
+  hardExit.unref?.()
 
   // 1. Broadcast SHUTDOWN to every connected client
   const shutdownMsg = JSON.stringify({ t: 'SERVER_SHUTDOWN', reason: '服务器维护中，请稍后重连' })
@@ -109,24 +123,22 @@ function gracefulShutdown(signal: string) {
     client.close(1001, 'SERVER_SHUTDOWN')
   }
 
-  // 3. Stop TURN pollers and flush persisted state synchronously.
+  // 3. Stop TURN pollers and flush persisted state. AWAIT the flush — the
+  // money-critical monthly byte tally (and the brute-force locks) must hit
+  // disk before we exit. Fire-and-forget here used to lose the final delta
+  // whenever httpServer.close resolved before the async write/rename landed.
   stopCleanupTask()
   stopTurnPollers()
   stopTurnRevokeRetry()
   stopPersistFlusher()
-  flushTurnState(true).catch(err => console.error('[shutdown] flush error:', err.message))
+  await Promise.allSettled([flushTurnState(true), flushPersistedLocks()])
 
   // 4. Stop accepting new connections, then exit
   httpServer.close(() => {
     console.log('信令服务器已安全关闭')
     process.exit(0)
   })
-
-  setTimeout(() => {
-    console.log('强制退出')
-    process.exit(1)
-  }, SHUTDOWN_TIMEOUT_MS)
 }
 
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
-process.on('SIGINT', () => gracefulShutdown('SIGINT'))
+process.on('SIGTERM', () => void gracefulShutdown('SIGTERM').catch(() => process.exit(1)))
+process.on('SIGINT', () => void gracefulShutdown('SIGINT').catch(() => process.exit(1)))

@@ -5,7 +5,7 @@
 
 const POOL_SIZE = Math.max(1, Math.min(4, (typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : 2) || 2))
 
-type PendingEntry = { resolve: (buf: ArrayBuffer) => void; reject: (err: Error) => void }
+type PendingEntry = { resolve: (buf: ArrayBuffer) => void; reject: (err: Error) => void; worker: Worker }
 
 let workers: Worker[] | null = null
 let rrCursor = 0
@@ -27,6 +27,17 @@ function ensurePool(): Worker[] {
     }
     w.onerror = (e) => {
       console.warn('[cryptoPool] worker error', e.message)
+      // A hard worker error (module load/parse failure, uncaught exception, OOM
+      // kill) produces NO `onmessage` reply for ops already dispatched to this
+      // worker. Reject their pending promises now — otherwise encryptChunk /
+      // decryptChunk await forever and the whole transfer hangs with no error
+      // surfaced. Only this worker's entries are settled; other workers are fine.
+      for (const [id, entry] of pending) {
+        if (entry.worker === w) {
+          pending.delete(id)
+          entry.reject(new Error(`crypto worker crashed: ${e.message ?? 'unknown error'}`))
+        }
+      }
     }
     list.push(w)
   }
@@ -52,7 +63,7 @@ function dispatch(op: 'encrypt' | 'decrypt', peerSessionId: string, iv: Uint8Arr
   const worker = pool[rrCursor++ % pool.length]
   const id = ++nextId
   return new Promise<ArrayBuffer>((resolve, reject) => {
-    pending.set(id, { resolve, reject })
+    pending.set(id, { resolve, reject, worker })
     // `data` is transferred (zero copy); caller must not touch it after this.
     worker.postMessage({ type: 'op', id, op, peerSessionId, iv, data }, [data])
   })
