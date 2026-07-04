@@ -22,7 +22,8 @@ import {
   finalizeStreamedFile, cancelStreamWrite, getWriteHandle,
   writeChunkToOPFS, getOPFSFile, getOPFSHandle, cleanupOPFS,
   decodeChunkFrame, decodeResumeRequest, checkMetaOOMGuard,
-  prepareReceiveStorage, opfsWrittenCount,
+  prepareReceiveStorage, opfsWrittenCount, getReceiveSession, clearTransferSignal,
+  TransferCancelledError,
   type MetaMessage, type SendCallbacks, type ResumeRequest,
 } from '@/lib/transfer'
 import { getTransfer, getActiveTransfers } from '@/lib/db'
@@ -988,6 +989,7 @@ async function sendFileToPeer(file: File, peerSessionId: string, displayName = f
     sendingFiles.set(transferId, file)
     await engineSendFileParallel(dcs, file, transferId, peerNodeId, peerSessionId, undefined, callbacks)
     sendingFiles.delete(transferId)
+    clearTransferSignal(transferId)
     useNetworkStore.setState(s => ({
       transfers: s.transfers.map(t =>
         t.id === transferId ? { ...t, progress: 1, status: 'completed' as const } : t,
@@ -998,7 +1000,15 @@ async function sendFileToPeer(file: File, peerSessionId: string, displayName = f
     transferSpeedSamples.delete(transferId)
     return true
   } catch (e) {
+    sendingFiles.delete(transferId)
+    clearTransferSignal(transferId)
     transferSpeedSamples.delete(transferId)
+    // A cancel (local or peer-driven) is not a failure: the transfer card is
+    // already 'failed' via checkSignals; show a neutral notice, no error tone.
+    if (e instanceof TransferCancelledError) {
+      appendSystemChat(peerSessionId, `已取消发送 ${displayName}`, 'sent')
+      return false
+    }
     useNetworkStore.setState(s => ({
       transfers: s.transfers.map(t =>
         t.id === transferId ? { ...t, status: 'failed' as const, error: String(e) } : t,
@@ -1324,7 +1334,10 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
       ),
       connectedPeers: new Set([...s.connectedPeers, peerSessionId]),
     }))
-    if (isReconnect) {
+    // Only the primary channel announces reconnection. setupDataChannel also
+    // runs for all TRANSFER_LANE_COUNT lane channels; without this guard each
+    // of the 5 'open' handlers appended its own '✓ 连接已恢复' on one reconnect.
+    if (isReconnect && !dc.label.startsWith('misaka-transfer-')) {
       appendSystemChat(peerSessionId, '✓ 连接已恢复')
     }
     if (!dc.label.startsWith('misaka-transfer-')) {
@@ -1359,6 +1372,16 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
       // becomes an unhandledrejection and the UI hangs at whatever % the last
       // good chunk left it at. Surface it as a failed transfer + error tone.
       try {
+        // Defer `deliverCompletedFile` until AFTER the stream-mode write
+        // below has actually persisted the final chunk. The progress-throttle
+        // gate inside `receiveChunk` fires with received===total as soon as
+        // the receive bitmap is set, but for OPFS / FSA the matching disk
+        // write happens out here in this handler. If we deliver immediately,
+        // `opfsWrittenCount === totalChunks` is still false for the last
+        // index and `deliverCompletedFile` falls through to the IDB-assemble
+        // branch — which then throws "Missing chunk 0" because nothing was
+        // ever saved to IDB under stream mode.
+        let finalChunkLanded = false
         const result = await receiveChunk(
           transferId, frame.index, frame.iv, frame.ciphertext, peerSessionId,
           {
@@ -1384,7 +1407,7 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
                     : t,
                 ),
               }))
-              if (received === total) deliverCompletedFile(transferId, peerSessionId)
+              if (received === total) finalChunkLanded = true
             },
             onError(error) {
               useNetworkStore.setState(s => ({
@@ -1408,6 +1431,8 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
           // ack is needed. The sender uses the resume bitmap (built from the
           // session's received set) for recovery, not per-chunk acks.
         }
+
+        if (finalChunkLanded) deliverCompletedFile(transferId, peerSessionId)
       } catch (err) {
         const errStr = err instanceof Error ? err.message : String(err)
         console.warn('[net] receiveChunk failed', errStr)
@@ -1702,6 +1727,21 @@ async function attemptIceRestart(peerSessionId: string) {
   }
 }
 
+// Whether every chunk of an OPFS transfer is on disk. Prefer the authoritative
+// receive-completion signal (session.receivedCount): the session-local `written`
+// bitmap only counts chunks written IN THIS session, so after a mid-transfer
+// reload the already-persisted chunks are never re-shipped and their bits never
+// get set — opfsWrittenCount would then stay < totalChunks forever and delivery
+// wrongly fell through to the IDB-assemble branch ("Missing chunk 0"). We fall
+// back to opfsWrittenCount if the receive session is already gone. The final
+// chunk's disk write is awaited before deliver is called (see setupDataChannel),
+// and getOPFSFile drains the write queue, so receivedCount===total is safe.
+function isOpfsFullyReceived(transferId: string, totalChunks: number): boolean {
+  const session = getReceiveSession(transferId)
+  if (session) return session.receivedCount === totalChunks
+  return opfsWrittenCount(transferId) === totalChunks
+}
+
 async function deliverCompletedFile(transferId: string, peerSessionId: string) {
   if (deliveredTransfers.has(transferId)) return
   deliveredTransfers.add(transferId)
@@ -1721,7 +1761,7 @@ async function deliverCompletedFile(transferId: string, peerSessionId: string) {
       deliveredTransfers.delete(transferId)
       playSound('error')
     }
-  } else if (opfsHandle && opfsWrittenCount(transferId) === opfsHandle.totalChunks) {
+  } else if (opfsHandle && isOpfsFullyReceived(transferId, opfsHandle.totalChunks)) {
     try {
       const file = await getOPFSFile(transferId)
       const url = URL.createObjectURL(file)
@@ -1751,8 +1791,10 @@ async function deliverCompletedFile(transferId: string, peerSessionId: string) {
       import('@/lib/db').then(({ deleteChunks }) => deleteChunks(transferId).catch(() => {}))
     }
   }
-  // Common cleanup: drop the demux entry for any peer's map that pointed at
-  // this transferId. Otherwise long sessions accumulate stale entries forever.
+  // Common cleanup: drop the control signal (a receiver pause/resume creates
+  // one) and the demux entry for any peer's map that pointed at this
+  // transferId. Otherwise long sessions accumulate stale entries forever.
+  clearTransferSignal(transferId)
   for (const peerMap of shortIdToTransferId.values()) {
     for (const [shortId, tid] of peerMap) {
       if (tid === transferId) peerMap.delete(shortId)

@@ -80,6 +80,7 @@ export async function issueCredentials(sessionId: string, ip: string): Promise<I
   rollMonthIfNeeded()
   pruneIssuanceHistory(now)
   pruneActiveCredentials(now)
+  pruneIpByteLedger(now)
 
   // Global kill-switch
   if (state.monthlyUsage.killSwitchActive) {
@@ -94,26 +95,28 @@ export async function issueCredentials(sessionId: string, ip: string): Promise<I
     return { ok: false, reason: 'IP_RATE_LIMITED' }
   }
 
-  // Per-IP pessimistic byte cap (fast path; corrected later by CF analytics)
-  const pessimisticIpBytes = sumActivePessimisticBytesForIp(ip, now)
-  if (pessimisticIpBytes >= TURN_MAX_BYTES_PER_HOUR_PER_IP) {
+  // Per-IP hourly byte cap: in-flight pessimistic estimate for still-active
+  // credentials PLUS CF-confirmed actual bytes of expired credentials over the
+  // rolling hour. (The old active-only sum could never accumulate an hour since
+  // credentials are pruned at their 5-min TTL — see sumHourlyBytesForIp.)
+  const hourlyIpBytes = sumHourlyBytesForIp(ip, now)
+  if (hourlyIpBytes >= TURN_MAX_BYTES_PER_HOUR_PER_IP) {
     return { ok: false, reason: 'IP_BYTES_LIMITED' }
   }
 
-  // Call CF. customIdentifier is a one-way derivation of (sessionId,
-  // SERVER_SECRET); CF logs never see the sessionId directly.
+  // customIdentifier is a one-way derivation of (sessionId, SERVER_SECRET);
+  // CF logs never see the sessionId directly.
   const customIdentifier = deriveCustomIdentifier(sessionId)
-  let cfResp: CfCredentialsResponse
-  try {
-    cfResp = await cfGenerateCredentials(customIdentifier, TURN_CREDENTIAL_TTL_SEC)
-  } catch (err) {
-    console.error('[turn] cf issue failed for', redactCustomIdentifier(customIdentifier), '-', (err as Error).message)
-    return { ok: false, reason: 'CF_ERROR' }
-  }
-
   const expiresAt = now + TURN_CREDENTIAL_TTL_SEC * 1000
   const pessimisticBytes = Math.floor((TURN_PESSIMISTIC_RATE_BPS / 8) * TURN_CREDENTIAL_TTL_SEC)
 
+  // RESERVE the slot synchronously BEFORE the CF round-trip. The cap checks
+  // above read state that is only mutated here; `await cfGenerateCredentials`
+  // yields the event loop, so if we mutated only after the await, N concurrent
+  // requests from one IP would all observe pre-mutation state and blow past
+  // both the issuance-rate and per-IP byte caps (TOCTOU). Reserving first makes
+  // check-and-reserve atomic on the single-threaded loop; we roll back on CF
+  // failure below.
   const active: ActiveCredential = {
     sessionId,
     customIdentifier,
@@ -122,16 +125,34 @@ export async function issueCredentials(sessionId: string, ip: string): Promise<I
     expiresAt,
     pessimisticBytes,
   }
+  const issuanceRecord = { ip, issuedAt: now }
   state.activeCredentials[customIdentifier] = active
-  state.ipIssuanceHistory.push({ ip, issuedAt: now })
-  // Pre-add the pessimistic delta to the guardrail counter; CF Analytics
-  // supplies the displayed monthly source-of-truth when it syncs.
+  state.ipIssuanceHistory.push(issuanceRecord)
   state.monthlyUsage.pessimisticBytesObserved += pessimisticBytes
   state.monthlyUsage.bytesObserved = Math.max(
     state.monthlyUsage.cfBytesObserved,
     state.monthlyUsage.pessimisticBytesObserved,
   )
   markDirty()
+
+  let cfResp: CfCredentialsResponse
+  try {
+    cfResp = await cfGenerateCredentials(customIdentifier, TURN_CREDENTIAL_TTL_SEC)
+  } catch (err) {
+    // Roll back the reservation so a failed CF call doesn't permanently consume
+    // quota/rate budget.
+    delete state.activeCredentials[customIdentifier]
+    const idx = state.ipIssuanceHistory.indexOf(issuanceRecord)
+    if (idx >= 0) state.ipIssuanceHistory.splice(idx, 1)
+    state.monthlyUsage.pessimisticBytesObserved = Math.max(0, state.monthlyUsage.pessimisticBytesObserved - pessimisticBytes)
+    state.monthlyUsage.bytesObserved = Math.max(
+      state.monthlyUsage.cfBytesObserved,
+      state.monthlyUsage.pessimisticBytesObserved,
+    )
+    markDirty()
+    console.error('[turn] cf issue failed for', redactCustomIdentifier(customIdentifier), '-', (err as Error).message)
+    return { ok: false, reason: 'CF_ERROR' }
+  }
 
   // Check global kill threshold after pessimistic add
   evaluateGlobalKillSwitch()
@@ -338,21 +359,53 @@ function pruneIssuanceHistory(now: number) {
   if (state.ipIssuanceHistory.length !== before) markDirty()
 }
 
+// Rolling per-IP ledger of CF-CONFIRMED actual relayed bytes, folded from
+// credentials as they expire. In-memory only (a restart resets it, which only
+// briefly loosens this SECONDARY per-IP cap; the persisted global monthly kill
+// switch is the primary money defence). We fold `cfActualBytes` — NOT the
+// pessimistic estimate — so a P2P session that relayed ~0 bytes contributes 0
+// and can never false-positive a legitimate user who reconnects frequently.
+interface IpByteLedgerEntry { ip: string; bytes: number; at: number }
+let ipByteLedger: IpByteLedgerEntry[] = []
+
+// Test-only: reset the in-memory ledger between scenarios.
+export function _resetIpByteLedger() { ipByteLedger = [] }
+
+function pruneIpByteLedger(now: number) {
+  const cutoff = now - 60 * 60 * 1000
+  ipByteLedger = ipByteLedger.filter(e => e.at >= cutoff)
+}
+
 function pruneActiveCredentials(now: number) {
   const state = getTurnState()
   let changed = false
   for (const [k, v] of Object.entries(state.activeCredentials)) {
-    if (v.expiresAt < now) { delete state.activeCredentials[k]; changed = true }
+    if (v.expiresAt < now) {
+      // Fold this credential's confirmed actual usage into the per-IP hourly
+      // ledger before dropping it, so the rolling cap survives TTL expiry.
+      if (v.cfActualBytes && v.cfActualBytes > 0) {
+        ipByteLedger.push({ ip: v.ip, bytes: v.cfActualBytes, at: v.expiresAt })
+      }
+      delete state.activeCredentials[k]
+      changed = true
+    }
   }
   if (changed) markDirty()
 }
 
-function sumActivePessimisticBytesForIp(ip: string, now: number): number {
+// Effective per-IP bytes over the last hour = still-active credentials'
+// pessimistic in-flight estimate (fast guard against a burst) + CF-confirmed
+// actual bytes of already-expired credentials from the rolling ledger. This is
+// what the previous active-only sum could never do: accumulate a full hour.
+function sumHourlyBytesForIp(ip: string, now: number): number {
   const state = getTurnState()
   const cutoff = now - 60 * 60 * 1000
   let total = 0
   for (const c of Object.values(state.activeCredentials)) {
     if (c.ip === ip && c.issuedAt >= cutoff) total += c.pessimisticBytes
+  }
+  for (const e of ipByteLedger) {
+    if (e.ip === ip && e.at >= cutoff) total += e.bytes
   }
   return total
 }
@@ -469,6 +522,9 @@ async function pollPerIdentifierUsage() {
   for (const [cid, actualBytes] of byCid.entries()) {
     const active = state.activeCredentials[cid]
     if (!active) continue
+    // Record CF-confirmed actual usage so it can be folded into the per-IP
+    // rolling-hour ledger when this credential expires (see pruneActiveCredentials).
+    active.cfActualBytes = actualBytes
     // Correct the pessimistic estimate with actual data — only if higher than
     // already-counted pessimistic (analytics is the source of truth from now on).
     if (actualBytes > active.pessimisticBytes) {
@@ -546,11 +602,33 @@ async function pollGlobalUsage() {
     total += (r.sum.egressBytes ?? 0) + (r.sum.ingressBytes ?? 0)
   }
 
+  // Reconcile the pessimistic estimate DOWN to only currently-active
+  // credentials. `pessimisticBytesObserved` is bumped +pessimisticBytes on
+  // every issuance and never decremented mid-month; since most WebRTC sessions
+  // go P2P and relay ~0 bytes, it otherwise grows as (issuances × 375MB) and,
+  // via max(cf, pessimistic), trips the kill switch after only a few thousand
+  // credential fetches regardless of real traffic. CF's `total` already covers
+  // bytes relayed by now-expired credentials, so only still-active credentials
+  // should contribute a short-term lag buffer on top of it.
+  pruneActiveCredentials(Date.now())
+  const activePessimistic = Object.values(state.activeCredentials)
+    .reduce((s, c) => s + c.pessimisticBytes, 0)
   state.monthlyUsage.cfBytesObserved = total
-  state.monthlyUsage.bytesObserved = Math.max(total, state.monthlyUsage.pessimisticBytesObserved)
+  state.monthlyUsage.pessimisticBytesObserved = activePessimistic
+  state.monthlyUsage.bytesObserved = Math.max(total, activePessimistic)
   state.monthlyUsage.usageSource = 'cloudflare'
   state.monthlyUsage.lastCfSyncAt = Date.now()
   delete state.monthlyUsage.lastCfSyncError
+
+  // A fresh authoritative sync can also CLEAR a kill switch that tripped on a
+  // stale pessimistic over-count: if real effective bytes are back below the
+  // threshold, re-enable issuance instead of staying dead until month roll.
+  const limit = TURN_GLOBAL_MONTHLY_BYTES_LIMIT * (TURN_GLOBAL_THRESHOLD_PCT / 100)
+  if (state.monthlyUsage.killSwitchActive && state.monthlyUsage.bytesObserved < limit) {
+    state.monthlyUsage.killSwitchActive = false
+    state.monthlyUsage.killSwitchTriggeredAt = 0
+    console.warn(`[turn] global kill switch CLEARED after CF sync (${state.monthlyUsage.bytesObserved} < ${limit} bytes, month ${state.monthlyUsage.monthKey})`)
+  }
   markDirty()
   evaluateGlobalKillSwitch()
 }

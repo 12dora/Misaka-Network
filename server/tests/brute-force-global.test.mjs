@@ -112,6 +112,9 @@ function startServer() {
     cwd: SERVER_DIR,
     env: {
       ...process.env,
+      // Distinct client IPs are simulated via X-Forwarded-For; only honoured
+      // when the server trusts a proxy hop.
+      TRUST_PROXY: '1',
       PORT: String(PORT),
       MAX_NODES: '200',
       TURN_AUTO_ENABLED: 'false',

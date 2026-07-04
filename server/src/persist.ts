@@ -21,6 +21,7 @@ export interface ActiveCredential {
   issuedAt: number
   expiresAt: number
   pessimisticBytes: number   // local upper-bound estimate; CF analytics corrects this
+  cfActualBytes?: number     // CF-confirmed actual relayed bytes (once analytics reports); folded into the per-IP hourly ledger at expiry
   revokePending?: boolean    // P1-6: set when a CF revoke call failed; background retry will try again until success or expiry
   revokeAttempts?: number    // how many retry attempts we've made (for log triage)
   lastRevokeAttemptAt?: number

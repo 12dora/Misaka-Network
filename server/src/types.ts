@@ -28,6 +28,7 @@ export interface QrTokenRecord {
   createdAt: number
   expiresAt: number
   used: boolean
+  failedAttempts?: number   // wrong-passcode guesses; the single-use token is burned after MAX_ATTEMPTS
 }
 
 export interface ReportRecord {

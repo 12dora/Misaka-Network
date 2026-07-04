@@ -4,10 +4,15 @@ import { z } from 'zod'
 import { nodes, channels, clusterChannelId, updatePeakConcurrent } from './store.js'
 import { broadcast } from './activity.js'
 import { authMiddleware } from './http.js'
-import { WS_AUTH_GRACE_MS } from './config.js'
+import { WS_AUTH_GRACE_MS, TRUST_PROXY_ENABLED } from './config.js'
 import type { NodeSession } from './types.js'
 
 const MAX_MESSAGE_SIZE = 64 * 1024
+// Upper bound on how many peers a single session may block. Without a cap a
+// hostile authenticated client can stream unbounded BLOCK frames each carrying
+// a fresh 64-char id and grow this Set until the process OOMs — there is no
+// per-message WS rate limit. A few thousand is far above any legitimate use.
+const MAX_BLOCKED_IDS = 2000
 // After this many oversize messages, drop the socket — the client is buggy or
 // abusing the connection. The ERROR-only loop used to let an attacker hold a
 // slot forever at zero cost.
@@ -56,13 +61,16 @@ function forwardToSession(
 }
 
 // Canonical client-IP extractor for WS — mirrors http.getClientIP semantics
-// but operates on the upgrade request. We trust the first x-forwarded-for
-// hop (matching `app.set('trust proxy', 1)` on the HTTP side); without a
-// proxy we use the raw socket address. Exported so tests can probe it.
+// but operates on the upgrade request. We only honour X-Forwarded-For when the
+// operator has opted into trusting a proxy (TRUST_PROXY); otherwise a client
+// could spoof its source IP on a directly internet-facing deployment and defeat
+// per-IP defences. Falls back to the raw socket address. Exported for tests.
 export function getWSIP(req: IncomingMessage): string {
-  const xff = req.headers['x-forwarded-for']
-  if (typeof xff === 'string') return xff.split(',')[0].trim()
-  if (Array.isArray(xff) && xff.length > 0) return xff[0].split(',')[0].trim()
+  if (TRUST_PROXY_ENABLED) {
+    const xff = req.headers['x-forwarded-for']
+    if (typeof xff === 'string') return xff.split(',')[0].trim()
+    if (Array.isArray(xff) && xff.length > 0) return xff[0].split(',')[0].trim()
+  }
   return req.socket.remoteAddress ?? 'unknown'
 }
 
@@ -112,6 +120,14 @@ export function setupWS(wss: WebSocketServer) {
           return
         }
         clearTimeout(authTimer)
+        // Reconnect (mobile network handoff, sleep/wake) re-sends AUTH with the
+        // same cached token, so `s` is the SAME shared NodeSession and its old
+        // socket is still half-open. Close it BEFORE re-pointing, otherwise the
+        // old socket lingers until an OS TCP timeout and its late 'close' event
+        // would tear down this now-live session (see the guard in ws.on('close')).
+        if (s.socket && s.socket !== ws) {
+          try { s.socket.close(1000, 'SUPERSEDED') } catch { /* already gone */ }
+        }
         s.socket = ws
         s.lastSeen = Date.now()
         s.ip = getWSIP(req)
@@ -134,6 +150,12 @@ export function setupWS(wss: WebSocketServer) {
     ws.on('close', () => {
       clearTimeout(authTimer)
       if (!session) return
+      // A superseded socket (a reconnect already re-attached a newer ws to this
+      // shared session) must NOT tear the session down. Without this guard the
+      // stale socket's late close nulls session.socket — which now points at the
+      // live reconnected ws — deletes it from its channel, and broadcasts
+      // PEER_LEFT, rendering a fully-connected peer invisible/unreachable.
+      if (session.socket !== ws) return
       session.socket = null
       session.lastSeen = Date.now()
 
@@ -265,6 +287,12 @@ function handleMessage(ws: WebSocket, session: NodeSession, msg: z.infer<typeof 
     }
 
     case 'BLOCK': {
+      // Bound the set so a flood of BLOCK frames with distinct ids can't grow
+      // it without limit (there is no per-message WS rate limit). Re-blocking an
+      // id already present is always allowed.
+      if (session.blockedIds.size >= MAX_BLOCKED_IDS && !session.blockedIds.has(msg.sessionId)) {
+        return
+      }
       session.blockedIds.add(msg.sessionId)
       forwardToSession(msg.sessionId, {
         t: 'PEER_LEFT',

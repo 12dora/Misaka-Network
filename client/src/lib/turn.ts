@@ -202,20 +202,31 @@ export async function refreshAutoTurn(): Promise<RTCIceServer[]> {
   inFlight = fetchAutoTurnOnce()
   try {
     const result = await inFlight
-    const changed = !sameIceServers(autoTurn?.iceServers ?? [], result?.iceServers ?? [])
-    autoTurn = result
     if (result) {
-      // Success: reset failure backoff and schedule the regular lead-time
-      // refetch ahead of expiry.
+      // Success: adopt the new creds, reset backoff, schedule the lead-time
+      // refetch, and notify only if the server set actually changed.
+      const changed = !sameIceServers(autoTurn?.iceServers ?? [], result.iceServers)
+      autoTurn = result
       failureAttempts = 0
       scheduleNextRefresh()
-    } else {
-      // P1-2: failure path — schedule an exponential-backoff retry so we
-      // recover from transient 503/network blips on our own.
-      scheduleFailureRetry()
+      if (changed) emitTurnConfigChange()
+      return result.iceServers
     }
+    // Failure path. The scheduled refresh fires REFRESH_LEAD_MS BEFORE expiry,
+    // so the existing creds are usually still valid. Do NOT clobber them to
+    // null on a transient 503/network blip — that would strip relay servers off
+    // every live PeerConnection (via emitTurnConfigChange) and break new/ICE-
+    // restarted symmetric-NAT peers until the backoff retry lands. Keep the
+    // creds until they actually expire; only then drop and emit.
+    let changed = false
+    if (autoTurn && Date.now() >= autoTurn.expiresAt) {
+      autoTurn = null
+      changed = true
+    }
+    // P1-2: schedule an exponential-backoff retry so we recover on our own.
+    scheduleFailureRetry()
     if (changed) emitTurnConfigChange()
-    return result?.iceServers ?? []
+    return autoTurn?.iceServers ?? []
   } finally {
     inFlight = null
   }
