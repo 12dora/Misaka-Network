@@ -9,7 +9,12 @@
 import { test, expect, type Page, type BrowserContext } from '@playwright/test'
 
 const NODE_A = '11001'
-const NODE_B = '11002'
+// Clusters are identity-scoped on the server (clusterChannelId = nodeId +
+// passcode), so two sessions only appear in each other's radar when they share
+// the SAME nodeId + passcode — i.e. two devices of the same 御坂 node. B is a
+// second device on node A's identity; giving it a different nodeId (the old
+// '11002') puts it in a different cluster where A can never see it.
+const NODE_B = NODE_A
 const PASS_CODE = '424242'
 
 test.beforeEach(async ({ request }) => {

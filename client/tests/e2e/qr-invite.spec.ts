@@ -37,6 +37,11 @@ test('QR modal renders + 复制链接 produces a /join URL', async ({ browser })
     await page.locator('button:has-text("显示我的 QR")').first().click()
     await expect(page.getByText('我的接入 QR')).toBeVisible({ timeout: 10_000 })
 
+    // The radar empty-state ALSO renders a "复制链接" button, so an unscoped
+    // `.first()` resolves to it — and it sits behind the modal backdrop, so the
+    // click is intercepted. Scope to the QR modal panel.
+    const modal = page.locator('.modal-panel-in')
+
     // QR canvas/img is rendered (alt text or canvas presence).
     const qrVisible = await Promise.race([
       page.locator('img[alt*="QR"]').first().isVisible().catch(() => false),
@@ -45,12 +50,15 @@ test('QR modal renders + 复制链接 produces a /join URL', async ({ browser })
     expect(qrVisible).toBe(true)
 
     // Click 复制链接 — modal toast confirms; clipboard content matches /join?token=
-    const copyBtn = page.locator('button:has-text("复制链接")').first()
+    const copyBtn = modal.locator('button:has-text("复制链接")')
     await expect(copyBtn).toBeVisible({ timeout: 5_000 })
     await copyBtn.click()
 
     const clipped = await page.evaluate(() => navigator.clipboard.readText().catch(() => ''))
-    expect(clipped).toMatch(/\/join\?(t|token)=[a-zA-Z0-9_-]{6,}/)
+    // buildURL emits /join?type=node&id=<n>&t=<token> — assert it's a join URL
+    // carrying a token param, without pinning param order.
+    expect(clipped).toMatch(/\/join\?/)
+    expect(clipped).toMatch(/[?&]t=[a-zA-Z0-9_-]{6,}/)
   } finally {
     await ctx.close().catch(() => {})
   }
@@ -62,7 +70,12 @@ test('wrong passcode at /join surfaces inline error', async ({ browser }) => {
   try {
     await loginHost(hostPage)
     await hostPage.locator('button:has-text("显示我的 QR")').first().click()
-    await hostPage.locator('button:has-text("复制链接")').first().click()
+    // Scope to the QR modal — the radar empty-state also has a 复制链接 button
+    // that sits behind the modal backdrop (unscoped `.first()` picks it and the
+    // click is intercepted).
+    const hostModal = hostPage.locator('.modal-panel-in')
+    await expect(hostModal.getByText('我的接入 QR')).toBeVisible({ timeout: 10_000 })
+    await hostModal.locator('button:has-text("复制链接")').click()
     const joinUrl = await hostPage.evaluate(() => navigator.clipboard.readText())
     expect(joinUrl).toBeTruthy()
 
