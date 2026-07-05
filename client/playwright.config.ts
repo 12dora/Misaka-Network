@@ -38,8 +38,16 @@ export default defineConfig({
   webServer: [
     {
       // Build the server once (turn tests reuse dist/) then run it.
+      //
+      // RATE_LIMIT_PER_MIN is raised far above the prod default (60): the whole
+      // suite hammers the API from one IP (127.0.0.1) — every page.goto +
+      // register + qr-token + the per-test release-by-ip counts against the
+      // `api:${ip}` limiter. Once 60/min trips, release-by-ip starts 429ing
+      // (silently, via its .catch), the per-IP node cap then fills, and later
+      // tests (e.g. folder transfer, the 7th) time out at login. A high limit
+      // removes that cross-test coupling without touching prod behaviour.
       command: 'npm --prefix ../server run build && PORT=' + SIGNAL_PORT +
-               ' MAX_NODES=200 TURN_AUTO_ENABLED=false E2E_ALLOW_UNAUTH_RELEASE_BY_IP=1 node ../server/dist/index.js',
+               ' MAX_NODES=200 RATE_LIMIT_PER_MIN=100000 TURN_AUTO_ENABLED=false E2E_ALLOW_UNAUTH_RELEASE_BY_IP=1 node ../server/dist/index.js',
       port: SIGNAL_PORT,
       timeout: 60_000,
       reuseExistingServer: !process.env.CI,
