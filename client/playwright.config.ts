@@ -10,6 +10,7 @@ import { defineConfig, devices } from '@playwright/test'
 
 const PORT = 5174 // separate from dev (5173) so devs can keep coding while CI runs
 const SIGNAL_PORT = 19180
+const E2E_BUILD_NONCE = 'misaka-playwright-v1'
 
 export default defineConfig({
   testDir: './tests/e2e',
@@ -47,7 +48,9 @@ export default defineConfig({
       // tests (e.g. folder transfer, the 7th) time out at login. A high limit
       // removes that cross-test coupling without touching prod behaviour.
       command: 'npm --prefix ../server run build && PORT=' + SIGNAL_PORT +
-               ' MAX_NODES=200 RATE_LIMIT_PER_MIN=100000 TURN_AUTO_ENABLED=false E2E_ALLOW_UNAUTH_RELEASE_BY_IP=1 node ../server/dist/index.js',
+               ' MAX_NODES=200 RATE_LIMIT_PER_MIN=100000 TURN_AUTO_ENABLED=false' +
+               ' TURN_PERSIST_DIR=$(mktemp -d) E2E_ALLOW_UNAUTH_RELEASE_BY_IP=1' +
+               ` E2E_BUILD_NONCE=${E2E_BUILD_NONCE} node ../server/dist/index.js`,
       port: SIGNAL_PORT,
       timeout: 60_000,
       reuseExistingServer: !process.env.CI,
@@ -62,6 +65,8 @@ export default defineConfig({
       env: {
         VITE_API_BASE: `http://localhost:${SIGNAL_PORT}`,
         VITE_WS_URL: `ws://localhost:${SIGNAL_PORT}/ws`,
+        VITE_E2E_BUILD_NONCE: E2E_BUILD_NONCE,
+        VITE_E2E_HOST_ICE_ONLY: '1',
       },
     },
   ],

@@ -8,15 +8,6 @@ import { apiUrl } from '@/config'
 
 type JoinStatus = 'connecting' | 'needs-passcode' | 'error' | 'ip-limited'
 
-function decodePassCode(encoded: string | null): string {
-  if (!encoded) return ''
-  try {
-    return atob(encoded).replace(/\D/g, '').slice(0, 6)
-  } catch {
-    return ''
-  }
-}
-
 function isValidPassCode(passCode: string) {
   return /^\d{6}$/.test(passCode)
 }
@@ -27,7 +18,7 @@ export default function Join() {
   const auth = useAuthStore()
   const [status, setStatus] = useState<JoinStatus>('connecting')
   const [errorMsg, setErrorMsg] = useState('')
-  const [passCode, setPassCode] = useState(() => decodePassCode(params.get('c')))
+  const [passCode, setPassCode] = useState('')
   const [manualPass, setManualPass] = useState('')
   const [attempt, setAttempt] = useState(0)
   // P0-2: gates the IpFullPrompt's busy state while release-by-ip is
@@ -40,12 +31,17 @@ export default function Join() {
     targetNodeId: Number(params.get('id')),
     qrToken: params.get('t') ?? '',
     fileSessionId: params.get('fid'),
-    encodedPass: params.get('c'),
   }), [params])
 
   useEffect(() => {
     if (attempt > 0) return
-    if (!joinInfo.qrToken || !Number.isInteger(joinInfo.targetNodeId) || joinInfo.targetNodeId < 1 || joinInfo.targetNodeId > 20001) {
+    if (
+      params.has('c')
+      || !joinInfo.qrToken
+      || !Number.isInteger(joinInfo.targetNodeId)
+      || joinInfo.targetNodeId < 1
+      || joinInfo.targetNodeId > 20001
+    ) {
       setStatus('error')
       setErrorMsg('无效的 QR 链接')
       return
@@ -55,7 +51,7 @@ export default function Join() {
       return
     }
     setAttempt(1)
-  }, [attempt, joinInfo.qrToken, joinInfo.targetNodeId, passCode])
+  }, [attempt, joinInfo.qrToken, joinInfo.targetNodeId, params, passCode])
 
   useEffect(() => {
     if (attempt === 0) return
@@ -92,17 +88,20 @@ export default function Join() {
           return
         }
 
-        const data = await res.json() as { targetNodeId: number; channelId: string }
+        const data = await res.json() as {
+          targetNodeId: number
+          channelId: string
+          admissionGrant: string
+        }
 
         sessionStorage.setItem('misaka.join', JSON.stringify({
           targetNodeId: data.targetNodeId,
           channelId: data.channelId,
           type: joinInfo.type,
           fileSessionId: joinInfo.fileSessionId,
-          encodedPass: joinInfo.encodedPass,
         }))
 
-        await auth.connect()
+        await auth.connect({ admissionGrant: data.admissionGrant })
         if (cancelled) return
 
         const after = useAuthStore.getState()

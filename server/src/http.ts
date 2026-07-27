@@ -23,10 +23,18 @@ import {
   NODE_FREEZE_THRESHOLD, NODE_FREEZE_WINDOW_MS, NODE_FREEZE_DURATION_MS,
   QR_REDEEM_RATE_LIMIT, QR_REDEEM_RATE_WINDOW_MS,
   MAX_TRANSFER_BYTES, TRANSFER_DONE_RATE_LIMIT, TRANSFER_DONE_RATE_WINDOW_MS,
-  E2E_UNAUTH_RELEASE_ALLOWED,
+  E2E_UNAUTH_RELEASE_ALLOWED, E2E_BUILD_NONCE,
+  TEST_INSTANCE_NONCE,
 } from './config.js'
 
 export const router = Router()
+
+if (TEST_INSTANCE_NONCE) {
+  router.use((_req, res, next) => {
+    res.set('X-Misaka-Test-Instance', TEST_INSTANCE_NONCE)
+    next()
+  })
+}
 
 // Re-export so legacy import sites keep working without touching the new
 // derivation location (which lives in store.js to avoid a circular import
@@ -144,6 +152,7 @@ router.post('/register', asyncRoute(async (req, res) => {
   const parsed = z.object({
     nodeId:   z.number().int().min(NODE_ID_MIN).max(NODE_ID_MAX),
     passCode: z.string().length(6).regex(/^\d{6}$/),
+    admissionGrant: z.string().min(32).max(128).optional(),
   }).safeParse(req.body)
 
   if (!parsed.success) {
@@ -155,6 +164,20 @@ router.post('/register', asyncRoute(async (req, res) => {
   const ip = getClientIP(req)
   const now = Date.now()
   const identityHash = hashPassCodeIdentity(passCode)
+  let admissionRecord: QrTokenRecord | undefined
+  if (parsed.data.admissionGrant) {
+    admissionRecord = Array.from(qrTokens.values()).find(record =>
+      !record.used
+      && record.expiresAt >= now
+      && record.ownerNodeId === nodeId
+      && record.passCodeHash === identityHash
+      && record.admissionGrant === parsed.data.admissionGrant,
+    )
+    if (!admissionRecord) {
+      res.status(400).json({ error: 'INVALID_ADMISSION_GRANT' })
+      return
+    }
+  }
 
   // Per-nodeId global freeze (P1-5). Refuses *every* register from any IP
   // while the freeze is active — even the owner from a new IP. The owner's
@@ -246,6 +269,20 @@ router.post('/register', asyncRoute(async (req, res) => {
   if (countNodesByIp(ip) >= MAX_NODES_PER_IP) {
     res.status(429).json({ error: 'IP_LIMITED', message: '此 IP 地址节点数已达上限' })
     return
+  }
+
+  // BUG-003: this is the commit point. Everything that can reject admission
+  // has completed, including the async scrypt work and the post-await shared
+  // state checks. JavaScript executes the grant check + consume + insert
+  // without another await, so two concurrent registrations cannot both win.
+  if (admissionRecord) {
+    if (admissionRecord.used
+      || admissionRecord.expiresAt < Date.now()
+      || admissionRecord.admissionGrant !== parsed.data.admissionGrant) {
+      res.status(400).json({ error: 'INVALID_ADMISSION_GRANT' })
+      return
+    }
+    admissionRecord.used = true
   }
 
   const session: NodeSession = {
@@ -520,6 +557,7 @@ router.get('/ready', (_req, res) => {
     turnState: readiness.turn,
     locksState: readiness.locks,
     uptimeSeconds: Math.floor((Date.now() - stats.startedAt) / 1000),
+    ...(E2E_BUILD_NONCE ? { e2eBuildNonce: E2E_BUILD_NONCE } : {}),
   })
 })
 
@@ -558,28 +596,21 @@ router.post('/transfer-done', (req, res) => {
   res.status(204).end()
 })
 
-// GET /api/qr-token
-router.get('/qr-token', (req, res) => {
+// POST /api/qr-token
+//
+// SECURITY-011: invitation creation is a state-changing, bearer-authenticated
+// POST. The owner's identity is already bound to the session, so no passcode
+// is accepted in a query string (browser/proxy/access logs) or request body.
+router.post('/qr-token', (req, res) => {
+  if (!enforceOrigin(req, res)) return
+  const emptyBody = z.object({}).strict().safeParse(req.body ?? {})
+  if (!emptyBody.success) { res.status(400).json({ error: 'INVALID_INPUT' }); return }
   const authHeader = req.headers.authorization
   if (!authHeader?.startsWith('Bearer ')) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
   const token = authHeader.slice(7)
 
   const ownerSession = findSessionByToken(token)
   if (!ownerSession) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
-
-  // passCode (if supplied) MUST match the canonical 6-digit shape — same
-  // rule as /register. The previous code accepted any string here, so the
-  // matching qr-redeem check could never trip on the format.
-  const passCodeRaw = req.query.passCode
-  let passCode: string | undefined
-  if (typeof passCodeRaw === 'string' && passCodeRaw.length > 0) {
-    const parsed = z.string().regex(/^\d{6}$/).safeParse(passCodeRaw)
-    if (!parsed.success) {
-      res.status(400).json({ error: 'INVALID_INPUT', message: 'passCode 必须是 6 位数字' })
-      return
-    }
-    passCode = parsed.data
-  }
 
   const qrToken = nanoid(32)
   const channelId = nanoid(8)
@@ -589,12 +620,13 @@ router.get('/qr-token', (req, res) => {
     ownerNodeId: ownerSession.nodeId,
     type: 'node',
     channelId,
-    passCodeHash: passCode ? hashPassCodeIdentity(passCode) : undefined,
+    passCodeHash: ownerSession.passCodeHash,
     createdAt: Date.now(),
     expiresAt,
     used: false,
   }
   qrTokens.set(qrToken, record)
+  res.set('Cache-Control', 'no-store')
   res.json({ qrToken, channelId, expiresAt })
 })
 
@@ -636,7 +668,7 @@ router.post('/qr-redeem', (req, res) => {
   }
 
   if (record.passCodeHash) {
-    // Timing-safe compare of the sha256 identity hashes (equal length → safe).
+    // Timing-safe compare of the keyed identity representations.
     const provided = Buffer.from(hashPassCodeIdentity(parsed.data.myPassCode))
     const expected = Buffer.from(record.passCodeHash)
     const match = provided.length === expected.length && timingSafeEqual(provided, expected)
@@ -656,10 +688,18 @@ router.post('/qr-redeem', (req, res) => {
     return
   }
 
-  record.used = true
   clearNodeFreezeOnSuccess(record.ownerNodeId)
   const channelId = record.channelId ?? nanoid(8)
-  res.json({ targetNodeId: record.ownerNodeId, channelId })
+  // Idempotent until register commits it. A retry after an IP_LIMITED or
+  // NETWORK_FULL response gets the same grant and cannot mint unbounded
+  // capabilities from one invitation.
+  record.admissionGrant ??= randomBytes(32).toString('hex')
+  res.set('Cache-Control', 'no-store')
+  res.json({
+    targetNodeId: record.ownerNodeId,
+    channelId,
+    admissionGrant: record.admissionGrant,
+  })
 })
 
 // POST /api/report

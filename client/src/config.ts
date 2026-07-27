@@ -23,7 +23,6 @@ const CONFIG_FETCH_TIMEOUT_MS = 4_000
 interface AppConfig {
   API_BASE: string
   WS_URL: string
-  APP_BASE?: string
 }
 
 declare global {
@@ -60,11 +59,6 @@ function isWsUrl(v: unknown): v is string {
   }
 }
 
-function isAppBase(v: unknown): v is string {
-  // A path prefix such as `/Misaka-Network`, `/` or `./` — never an origin.
-  return typeof v === 'string' && v !== '' && !/^[a-z][a-z0-9+.-]*:/i.test(v)
-}
-
 /** Keep only well-formed fields; log and drop the rest. */
 export function validateConfig(raw: unknown, source: string): Partial<AppConfig> {
   const out: Partial<AppConfig> = {}
@@ -78,10 +72,6 @@ export function validateConfig(raw: unknown, source: string): Partial<AppConfig>
   if ('WS_URL' in data) {
     if (isWsUrl(data.WS_URL)) out.WS_URL = data.WS_URL
     else console.warn(`[config] ignoring invalid WS_URL from ${source}`, data.WS_URL)
-  }
-  if ('APP_BASE' in data) {
-    if (isAppBase(data.APP_BASE)) out.APP_BASE = data.APP_BASE
-    else console.warn(`[config] ignoring invalid APP_BASE from ${source}`, data.APP_BASE)
   }
   return out
 }
@@ -152,14 +142,12 @@ export async function loadConfig(timeoutMs = CONFIG_FETCH_TIMEOUT_MS): Promise<A
   const fetched = await fetchRuntimeJson(timeoutMs)
   const runtime = mergeRuntimeConfig(injected, fetched)
 
-  // Publish the merged view so later readers (appBase.ts reads APP_BASE off
-  // this object) see the same precedence.
+  // Publish the merged backend configuration for synchronous readers.
   window.__MISAKA_CONFIG__ = runtime
 
   _config = {
     API_BASE: resolveApiBase(runtime),
     WS_URL: resolveWsUrl(runtime),
-    ...(runtime.APP_BASE ? { APP_BASE: runtime.APP_BASE } : {}),
   }
 
   return _config

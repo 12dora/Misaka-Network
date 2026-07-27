@@ -19,10 +19,9 @@
  * Usage:  node tests/release-by-ip.test.mjs
  */
 
-import { spawn } from 'child_process'
 import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
-import { runTest, killChild } from './_harness.mjs'
+import { runTest, killChild, spawn } from './_harness.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const SERVER_DIR = join(__dirname, '..')
@@ -326,7 +325,7 @@ function assertEq(actual, expected, msg) {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
 
 function startServer() {
-  const proc = spawn('npx', ['tsx', 'src/index.ts'], {
+  const proc = spawn('node', ['dist/index.js'], {
     cwd: SERVER_DIR,
     // TRUST_PROXY=1: this test drives distinct client IPs via X-Forwarded-For;
     // the server only honours XFF when it trusts a proxy hop.

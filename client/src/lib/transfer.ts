@@ -597,6 +597,7 @@ export async function sendFileParallel(
   callbacks?: SendCallbacks,
   peerReceivedBitmap?: Uint8Array,
   epoch = 0,
+  wireFileName = file.name,
 ): Promise<SendOutcome> {
   // BUG-014: never run two engines for one transfer id. A resume path that
   // reaches here while the original task is merely PARKED (waitWhilePaused)
@@ -629,13 +630,13 @@ export async function sendFileParallel(
   sendTasks.set(transferId, task)
   registerTransferOwner(transferId, {
     peerSessionId, epoch, direction: 'send',
-    fileName: file.name, fileSize: file.size,
+    fileName: wireFileName, fileSize: file.size,
     totalChunks: expectedChunkCount(file.size),
   })
 
   const promise = runSendEngine(
     task, dcs, file, transferId, peerNodeId, peerSessionId,
-    existingRecord, callbacks, peerReceivedBitmap,
+    existingRecord, callbacks, peerReceivedBitmap, wireFileName,
   )
   task.promise = promise
   promise.then(
@@ -657,6 +658,7 @@ async function runSendEngine(
   existingRecord?: TransferRecord,
   callbacks?: SendCallbacks,
   peerReceivedBitmap?: Uint8Array,
+  wireFileName = file.name,
 ): Promise<SendOutcome> {
   // P1-5: refuse to start an over-cap transfer up-front. Without this
   // guard, a multi-hundred-GB drop would either OOM the sender's
@@ -687,7 +689,7 @@ async function runSendEngine(
     peerNodeId,
     peerSessionId,
     epoch: task.epoch,
-    fileName: file.name,
+    fileName: wireFileName,
     fileSize: file.size,
     fileHash,
     totalChunks,
@@ -763,7 +765,7 @@ async function runSendEngine(
     type: 'meta',
     transferId,
     shortId,
-    fileName: file.name,
+    fileName: existingRecord?.fileName ?? wireFileName,
     fileSize: file.size,
     fileHash,
     totalChunks,
@@ -1601,6 +1603,8 @@ export interface FinalizeResult {
   file: File
   bytes: number
   backend: 'fsa' | 'opfs' | 'idb'
+  /** Release backend storage after the user-facing artefact is no longer needed. */
+  cleanup?: () => Promise<void>
 }
 
 export class TransferIntegrityError extends Error {
@@ -1660,10 +1664,14 @@ export async function finalizeReceive(transferId: string): Promise<FinalizeResul
 
   // ── terminal cleanup, in one place ──
   await deleteChunks(transferId).catch(() => {})
-  if (backend === 'opfs') {
-    await cleanupOPFS(transferId).catch(() => {})
-    if (opfsEntryName) await removeOPFSEntry(transferId, opfsEntryName).catch(() => {})
-  }
+  // OPFS File objects are lazy views over the directory entry. Deleting the
+  // entry here makes the just-created object URL fail with NotFoundError (and
+  // browsers report the download as cancelled). Transfer ownership/session
+  // state can retire now, but the entry itself is released by the UI when the
+  // download URL is consumed, pruned or the network epoch ends.
+  const cleanup = backend === 'opfs' && opfsEntryName
+    ? async () => { await removeOPFSEntry(transferId, opfsEntryName).catch(() => {}) }
+    : undefined
   await updateTransfer(transferId, { status: 'completed' }).catch(() => {})
   receiveSessions.delete(transferId)
   transferSignals.delete(transferId)
@@ -1673,7 +1681,7 @@ export async function finalizeReceive(transferId: string): Promise<FinalizeResul
   // the policy runs without a separate scheduler.
   void pruneTerminalTransfers().catch(() => {})
 
-  return { file: named, bytes: named.size, backend }
+  return { file: named, bytes: named.size, backend, cleanup }
 }
 
 /** Legacy name kept for callers/tests that only want the assembled File. */

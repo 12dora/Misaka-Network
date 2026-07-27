@@ -14,10 +14,9 @@
  * Usage: node tests/qr-redeem-ratelimit.test.mjs
  */
 
-import { spawn } from 'child_process'
 import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
-import { runTest, killChild } from './_harness.mjs'
+import { runTest, killChild, spawn } from './_harness.mjs'
 
 runTest(main, { timeoutMs: 30_000 })
 
@@ -36,7 +35,7 @@ async function main() {
   let failed = 0
   const cases = [
     ['qr-redeem rejects non-numeric passcode → 400', testNonNumericPasscode],
-    ['qr-token rejects non-numeric passcode query → 400', testQrTokenPasscodeShape],
+    ['qr-token rejects passcode material in request body', testQrTokenPasscodeShape],
     ['qr-redeem 429 once over rate cap',             testQrRedeemRateLimit],
   ]
 
@@ -73,11 +72,15 @@ async function testQrTokenPasscodeShape() {
   if (reg.status !== 200) throw new Error('register 失败')
   const ownerToken = reg.body.token
 
-  // Sneak in a non-numeric passCode via the query param.
-  const r = await fetch(`${BASE}/qr-token?passCode=hello1`, {
-    headers: { Authorization: `Bearer ${ownerToken}` },
+  const r = await fetch(`${BASE}/qr-token`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${ownerToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ passCode: '111111' }),
   })
-  if (r.status !== 400) throw new Error(`qr-token 应拒绝非数字 passCode，实际 ${r.status}`)
+  if (r.status !== 400) throw new Error(`qr-token 不应接受 passCode，实际 ${r.status}`)
 }
 
 async function testQrRedeemRateLimit() {
@@ -109,7 +112,7 @@ async function postRaw(path, body) {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
 
 function startServer() {
-  const proc = spawn('npx', ['tsx', 'src/index.ts'], {
+  const proc = spawn('node', ['dist/index.js'], {
     cwd: SERVER_DIR,
     env: {
       ...process.env,

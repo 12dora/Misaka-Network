@@ -19,11 +19,10 @@
  * Usage:  node tests/ws-block.test.mjs
  */
 
-import { spawn } from 'child_process'
 import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
 import WebSocket from 'ws'
-import { runTest, killChild } from './_harness.mjs'
+import { runTest, killChild, spawn } from './_harness.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const SERVER_DIR = join(__dirname, '..')
@@ -42,9 +41,9 @@ async function main() {
   let failed = 0
   const cases = [
     ['BLOCK delivers PEER_LEFT to the blocked peer',           testBlockEmitsPeerLeft],
-    ['blocker → blocked SIGNAL_SDP is dropped',                testBlockerToBlockedDropped],
-    ['blocked → blocker SIGNAL_SDP is dropped',                testBlockedToBlockerDropped],
-    ['PEER_JOINED suppressed when blocked party rejoins',      testPeerJoinedSuppressedAfterBlock],
+    ['blocker → blocked SDP/ICE/ICE_END are dropped',          testBlockerToBlockedDropped],
+    ['blocked → blocker SDP/ICE/ICE_END are dropped',          testBlockedToBlockerDropped],
+    ['old blocked session suppressed; replacement introduced', testPeerJoinedSuppressedAfterBlock],
   ]
 
   for (const [name, fn] of cases) {
@@ -102,18 +101,15 @@ async function testBlockerToBlockedDropped() {
   await collectMessages(aWs, 200)
   await collectMessages(bWs, 200)
 
-  // A blocks B, then tries to send SDP to B.
+  // A blocks B, then tries every signaling frame type.
   aWs.send(JSON.stringify({ t: 'BLOCK', sessionId: bSid }))
   await sleep(150)
   const bRec = recorder(bWs)
-  aWs.send(JSON.stringify({
-    t: 'SIGNAL_SDP', targetSessionId: bSid,
-    sdp: { type: 'offer', sdp: 'v=0\r\n' },
-  }))
+  for (const frame of signalFrames(bSid)) aWs.send(JSON.stringify(frame))
   await sleep(300)
 
-  const leaked = bRec.events.find(m => m.t === 'SIGNAL_SDP' && m.fromSessionId === aSid)
-  assert(!leaked, `B 不应再收到 A 的 SDP，实际收到 ${JSON.stringify(leaked)}`)
+  const leaked = bRec.events.find(m => m.t.startsWith('SIGNAL_') && m.fromSessionId === aSid)
+  assert(!leaked, `B 不应再收到 A 的信令，实际收到 ${JSON.stringify(leaked)}`)
 
   bRec.stop()
   aWs.close()
@@ -129,18 +125,15 @@ async function testBlockedToBlockerDropped() {
   await collectMessages(aWs, 200)
   await collectMessages(bWs, 200)
 
-  // A blocks B. Then B (the blocked party) sends SDP to A. A must not receive it.
+  // A blocks B. Then B sends every signaling frame type to A.
   aWs.send(JSON.stringify({ t: 'BLOCK', sessionId: bSid }))
   await sleep(150)
   const aRec = recorder(aWs)
-  bWs.send(JSON.stringify({
-    t: 'SIGNAL_SDP', targetSessionId: aSid,
-    sdp: { type: 'offer', sdp: 'v=0\r\n' },
-  }))
+  for (const frame of signalFrames(aSid)) bWs.send(JSON.stringify(frame))
   await sleep(300)
 
-  const leaked = aRec.events.find(m => m.t === 'SIGNAL_SDP' && m.fromSessionId === bSid)
-  assert(!leaked, `A 不应收到 B 的 SDP，实际收到 ${JSON.stringify(leaked)}`)
+  const leaked = aRec.events.find(m => m.t.startsWith('SIGNAL_') && m.fromSessionId === bSid)
+  assert(!leaked, `A 不应收到 B 的信令，实际收到 ${JSON.stringify(leaked)}`)
 
   aRec.stop()
   aWs.close()
@@ -242,9 +235,16 @@ async function collectMessages(ws, ms) {
 
 function assert(cond, msg) { if (!cond) throw new Error(msg) }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
+function signalFrames(targetSessionId) {
+  return [
+    { t: 'SIGNAL_SDP', targetSessionId, sdp: { type: 'offer', sdp: 'v=0\r\n' } },
+    { t: 'SIGNAL_ICE', targetSessionId, candidate: { candidate: 'candidate:1 1 udp 1 127.0.0.1 9 typ host' } },
+    { t: 'SIGNAL_ICE_END', targetSessionId },
+  ]
+}
 
 function startServer() {
-  const proc = spawn('npx', ['tsx', 'src/index.ts'], {
+  const proc = spawn('node', ['dist/index.js'], {
     cwd: SERVER_DIR,
     env: { ...process.env, PORT: String(PORT), MAX_NODES: '500', TURN_AUTO_ENABLED: 'false' },
     stdio: ['ignore', 'pipe', 'pipe'],

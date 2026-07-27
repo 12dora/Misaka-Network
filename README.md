@@ -101,18 +101,20 @@ npm run dev
 
 ### A. 信令服务（Docker，快速）
 
-根目录执行，干净检出即可直接跑（根 `.env` 是**可选**的）：
+根目录执行，干净检出即可直接跑（根 `.env` 是**可选**的）。快速栈明确以
+`NODE_ENV=development` 运行，默认 `TURN_AUTO_ENABLED=false`：
 
 ```bash
 docker compose up -d --build
 ```
 
-需要 Cloudflare 自动 TURN、或需要 `SERVER_SECRET` 跨重启保持稳定时，先建密钥文件：
+需要 Cloudflare 自动 TURN、或需要身份派生跨重启保持稳定时，先建密钥文件：
 
 ```bash
 cp .env.example .env
 # 至少填：SERVER_SECRET（openssl rand -hex 32）
 #         TURN_CF_KEY_ID / TURN_CF_API_TOKEN / TURN_CF_ACCOUNT_TAG（启用自动 TURN 时）
+#         TURN_AUTO_ENABLED=true
 docker compose up -d --build
 ```
 
@@ -139,6 +141,9 @@ docker compose -f docker-compose.prod.yml up -d --build
 
 `SERVER_SECRET` 缺失时 `docker compose ... up` 会直接报错退出，而不是静默用随机值启动
 （随机值会让 Cloudflare customIdentifier 每次重启都变，revoke 重试永久失效）。
+密钥必须是 `openssl rand -hex 32` 生成的 64 位十六进制值。轮换会同时改变通行码身份
+HMAC 与 TURN identifier，必须作为协同失效事件执行：先排空活动会话和凭据，所有信令
+实例同时换钥，再统一重启；不能滚动混用新旧密钥。
 
 健康检查：
 
@@ -158,7 +163,8 @@ curl -s https://signal.example.com/api/health
 
 任何一边缺失都会出问题：只设 `TRUST_PROXY` 不清洗头 → 客户端可伪造 IP；只清洗头不设
 `TRUST_PROXY` → 全部用户折叠成 Caddy 容器的 IP，共享 API 限流、节点上限与 TURN 配额。
-在 Caddy 前面再加 CDN / LB 时，必须同步提高跳数**并**让外层也重写转发头。
+在 Caddy 前面增加 CDN 时，Caddy 只信任 CDN 发布的 CIDR，从验证后的 `{client_ip}`
+覆盖上游转发头；signaling 仍保持 `TRUST_PROXY=1`，因为它只接收 Caddy 这一跳。
 
 上线后验证：
 
@@ -200,13 +206,18 @@ per-IP 防护在修好之前都不可信。
 
    ```bash
    curl -s http://localhost:9080/api/turn-status | jq
+   curl -s -H "Authorization: Bearer $TURN_OPERATOR_TOKEN" \
+     http://localhost:9080/api/turn-status | jq
    ```
+
+   第一个响应只给出粗粒度可用性；月度用量、熔断和撤销队列等详细状态仅在配置
+   `TURN_OPERATOR_TOKEN` 并提供对应 Bearer token 时返回。
 
 #### 防滥用策略（全部 env 可配，默认值在 docker-compose.yml）
 
 | 变量 | 默认 | 含义 |
 |---|---|---|
-| `TURN_AUTO_ENABLED` | `true` | 总开关 |
+| `TURN_AUTO_ENABLED` | 根快速栈 `false`；生产栈 `true` | 总开关 |
 | `TURN_CREDENTIAL_TTL_SEC` | `300` | 凭证有效期（短=即使 revoke 失败也兜底） |
 | `TURN_MAX_BYTES_PER_SESSION` | 1 GiB | 单 session 累计字节超额 → revoke |
 | `TURN_MAX_BYTES_PER_HOUR_PER_IP` | 10 GiB | 单 IP 一小时悲观字节上限 |
@@ -217,9 +228,15 @@ per-IP 防护在修好之前都不可信。
 | `TURN_ABUSE_POLL_SEC` | `30` | 按 customIdentifier 查 CF Analytics 周期 |
 | `TURN_GLOBAL_POLL_SEC` | `120` | 全局月度用量查询周期 |
 | `TURN_REVOKE_RETRY_INTERVAL_MS` | `60000` | 失败的 CF revoke 调用重试间隔 |
+| `TURN_CF_TIMEOUT_MS` | `8000` | 单次 Cloudflare API 调用墙钟超时 |
+| `TURN_ANALYTICS_PAGE_LIMIT` | `1000` | Analytics 单页行数 |
+| `TURN_ANALYTICS_MAX_PAGES` | `20` | Analytics 最大页数，触顶时进入 degraded |
+| `TURN_IP_BAN_STRIKES` | `3` | 同 IP 触发多少个滥用 session 后封禁 |
+| `TURN_BAN_DURATION_SEC` | `86400` | IP 封禁秒数；`0` 禁用 |
+| `TURN_OPERATOR_TOKEN` | 空 | 详细 TURN 状态接口的 Bearer token |
 
-`TURN_BAN_DURATION_SEC` 仍存在于 `config.ts`，但当前没有生效的封禁执行路径，
-compose 模板不再设置它；不要依赖它做防护。
+`TURN_AUTO_ENABLED=true` 时，Cloudflare Key ID、API Token 和 Account Tag 均为必填；
+缺少任一项，服务会在绑定端口前失败。
 
 #### 持久化与备份
 
@@ -241,13 +258,18 @@ docker run --rm -v misaka_data:/data -v "$PWD:/backup" \
   alpine sh -c 'cd /data && tar xzf /backup/misaka-data-YYYY-MM-DD.tar.gz'
 ```
 
+从旧版 Dockerfile 的匿名 `/app/data` 卷升级时，先按
+[生产数据卷迁移指南](./docs/DEPLOYMENT_MIGRATION.md) 把旧快照复制到
+`misaka_data`；直接重建会让月度额度、撤销队列和安全锁从空状态开始。
+
 保留策略：这些文件不含任何用户内容，只有计数器、不可逆派生的 TURN identifier 和
 按 IP 归档的滥用状态。**按 IP 的记录属于个人数据**，建议每日快照 + 7~30 天保留，
 存放位置不要对外可读；丢失备份的后果是月度熔断计数与封锁状态归零，不是数据损坏。
 
 #### 用户手工 TURN
 
-设置 → 中继 tab 顶部展示自动 TURN 状态 + 月度用量进度条；下方手工添加的 TURN 始终生效（与自动下发并存）。
+设置 → 中继 tab 展示自动 TURN 的粗粒度可用性；下方经过地址校验的手工 TURN
+在总开关启用时与自动下发并存。运维详细额度只通过带 operator token 的 API 查看。
 
 ### C2. 备选：自托管 coturn
 
@@ -314,7 +336,9 @@ CI 每个 PR 都跑同一套断言（`.github/workflows/test.yml` 的 `client-bu
 }
 ```
 
-可选 `"APP_BASE"` 字段可在不重新构建的前提下覆盖路由 base（优先级高于 `VITE_BASE`）。
+部署 base 只有一个来源：构建时的 Vite `base`（本仓库由 `VITE_BASE` 设置）。
+修改挂载子路径必须重新构建，确保静态资源、router、Service Worker 与 404 回退一致；
+运行时 `config.json` 只覆盖后端 `API_BASE` / `WS_URL`。
 
 ## 测试
 
@@ -382,13 +406,16 @@ PR 必须通过 `.github/workflows/test.yml` 中全部 job 才能合并：
 | Job | 内容 |
 |---|---|
 | `server-tests` | 服务端构建 + 集成 + TURN 脚本 |
-| `client-tests` | `typecheck`（src）+ `typecheck:config`（vite/vitest/playwright 配置）+ 单测/契约 |
+| `client-tests` | `typecheck`（src）+ `typecheck:config`（配置）+ `typecheck:tests`（单测/E2E）+ 单测/契约 |
 | `client-build` | **生产 bundle 构建** + 子路径部署 smoke check（asset / router / 404 base 一致性） |
 | `e2e-tests` | Playwright 双 peer 真实 WebRTC |
 | `tests-touched-guard` | 改了 `src/` 却没改 `tests/` 的 PR 会被拦截（`[skip-test-guard]` 可放行） |
 
 `client-build` 是 2026-07 补上的：此前 PR 只做 typecheck 与单测，Vite/Rollup/PostCSS/Tailwind
 的构建期回归要合并后才在部署工作流暴露。
+
+GitHub Actions job 本身不会自动成为合并门禁。仓库管理员还必须在 `main` 的分支保护或
+ruleset 中把上表显示的检查名称设为 required；修改 job 名称时同步更新 ruleset。
 
 ### 贡献准则
 

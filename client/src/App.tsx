@@ -82,11 +82,8 @@ class RouteErrorBoundary extends Component<{ children: ReactNode; resetKey: stri
             : '这个页面的资源没有载入成功，可能是刚刚发布了新版本。重新载入即可继续。'}
         </p>
         <div className="flex flex-wrap gap-2 justify-center">
-          <button className="nav-pill text-sm" onClick={() => this.setState({ error: null })}>
-            重试
-          </button>
           <button className="nav-pill text-sm" onClick={() => window.location.reload()}>
-            重新载入页面
+            重新载入并重试
           </button>
         </div>
       </div>

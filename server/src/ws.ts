@@ -27,7 +27,22 @@ const wsMessageSchema = z.discriminatedUnion('t', [
   z.object({ t: z.literal('LEAVE_CHANNEL') }),
   z.object({ t: z.literal('SIGNAL_SDP'),   targetSessionId: z.string().min(1).max(64), sdp:       z.object({}).passthrough() }),
   z.object({ t: z.literal('SIGNAL_ICE'),     targetSessionId: z.string().min(1).max(64), candidate: z.object({}).passthrough() }),
-  z.object({ t: z.literal('SIGNAL_ICE_END'), targetSessionId: z.string().min(1).max(64) }),
+  z.object({
+    t: z.literal('SIGNAL_ICE_END'),
+    targetSessionId: z.string().min(1).max(64),
+    candidate: z.object({
+      candidate: z.literal(''),
+      sdpMid: z.string().min(1).max(64).nullable().optional(),
+      sdpMLineIndex: z.number().int().min(0).max(64).nullable().optional(),
+      usernameFragment: z.string().min(1).max(256)
+        .regex(/^[A-Za-z0-9+/]+$/)
+        .nullable()
+        .optional(),
+    }).refine(
+      marker => marker.sdpMid != null || marker.sdpMLineIndex != null,
+      'EOC marker requires a media locator',
+    ).optional(),
+  }),
   z.object({ t: z.literal('PING') }),
   z.object({ t: z.literal('BLOCK'),        sessionId:       z.string().min(1).max(64) }),
 ])
@@ -440,6 +455,7 @@ function handleMessage(ws: WebSocket, session: NodeSession, msg: z.infer<typeof 
         t: 'SIGNAL_ICE_END',
         fromSessionId: session.sessionId,
         fromNodeId: session.nodeId,
+        ...(msg.candidate ? { candidate: msg.candidate } : {}),
       }, session.sessionId, replyPeerOffline)
       break
     }

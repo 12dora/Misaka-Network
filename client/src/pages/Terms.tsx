@@ -21,8 +21,9 @@ export default function Terms() {
 
           <h2 className="font-bold mt-6">1. 服务性质</h2>
           <p className="text-[var(--text-on-white-2)]">
-            本服务不提供可用性保证（SLA），可能随时暂停或终止。信令服务器仅转发 WebRTC 信令消息，
-            文件本体不经服务器传输（除非用户自配置 TURN 中继）。
+            本服务不提供可用性保证（SLA），可能随时暂停或终止。信令服务器协调身份、节点发现和 WebRTC 信令；
+            文件优先由浏览器直接传输。直连失败且 TURN 已启用时，加密文件流量可能经过服务器自动下发的
+            Cloudflare 中继或用户手工配置的中继。
           </p>
 
           <h2 className="font-bold mt-4">2. 用户责任</h2>
@@ -33,8 +34,9 @@ export default function Terms() {
 
           <h2 className="font-bold mt-4">3. 数据保留</h2>
           <p className="text-[var(--text-on-white-2)]">
-            服务端仅短期保留匿名节点元数据（30min 无活动自动清除）。
-            不记录传输内容、文件名、IP 日志。
+            会话令牌的绝对有效期为 30 分钟；节点、邀请等运行状态按服务端生命周期清理。
+            TURN 额度/撤销状态和暴力破解锁会持久化，生产代理也可能保留包含 IP 的访问日志和备份。
+            服务器不存储文件内容。具体范围与第三方中继说明见隐私政策。
           </p>
 
           <h2 className="font-bold mt-4">4. 通行码安全</h2>
@@ -59,7 +61,7 @@ export default function Terms() {
             本服务为独立开发的非营利同人项目，不构成对原作权利的声明。
           </p>
 
-          <p className="text-[var(--text-on-white-2)] mt-6">最后更新：2026-05-13</p>
+          <p className="text-[var(--text-on-white-2)] mt-6">最后更新：2026-07-27</p>
         </div>
 
         <div className="mt-6 flex flex-wrap items-center gap-2">

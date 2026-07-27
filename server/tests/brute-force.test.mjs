@@ -14,10 +14,9 @@
  * Usage: cd server && node tests/brute-force.test.mjs
  */
 
-import { spawn } from 'child_process'
 import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
-import { runTest, killChild } from './_harness.mjs'
+import { runTest, killChild, spawn } from './_harness.mjs'
 
 runTest(main)
 
@@ -254,11 +253,11 @@ function sleep(ms) {
 }
 
 function startServer() {
-  const proc = spawn('npx', ['tsx', 'src/index.ts'], {
+  const proc = spawn('node', ['dist/index.js'], {
     cwd: SERVER_DIR,
     // TRUST_PROXY=1: this test simulates distinct client IPs via X-Forwarded-For
     // (postFrom); the server only honours XFF when it trusts a proxy hop.
-    env: { ...process.env, PORT: '18999', MAX_NODES: '200', TRUST_PROXY: '1' },
+    env: { ...process.env, PORT: '18999', MAX_NODES: '200', TRUST_PROXY: '1', TURN_AUTO_ENABLED: 'false' },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
 

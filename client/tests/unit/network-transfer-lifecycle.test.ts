@@ -298,6 +298,26 @@ describe('BUG-020: chat flush and fanout report structured results', () => {
 
 // ── BUG-021 ────────────────────────────────────────────────────────────
 describe('BUG-021: staged files are never silently destroyed', () => {
+  it('normalises folder entries by relative path while preserving ordinary picker order', async () => {
+    const { useNetworkStore } = await freshStore()
+    const folderC = new File(['c'], 'c.txt')
+    const folderA = new File(['a'], 'a.txt')
+    Object.defineProperty(folderC, 'webkitRelativePath', { value: 'folder/c.txt' })
+    Object.defineProperty(folderA, 'webkitRelativePath', { value: 'folder/a.txt' })
+
+    useNetworkStore.getState().addPendingFiles(PEER, [folderC, folderA])
+    expect(useNetworkStore.getState().pendingFiles[PEER].map(item => item.displayName))
+      .toEqual(['folder/a.txt', 'folder/c.txt'])
+
+    useNetworkStore.getState().clearPendingFiles(PEER)
+    useNetworkStore.getState().addPendingFiles(
+      PEER,
+      [new File(['z'], 'z.txt'), new File(['a'], 'a.txt')],
+    )
+    expect(useNetworkStore.getState().pendingFiles[PEER].map(item => item.displayName))
+      .toEqual(['z.txt', 'a.txt'])
+  })
+
   it('only removes the staged ids that actually sent', async () => {
     const { useNetworkStore } = await freshStore()
     const store = useNetworkStore.getState()

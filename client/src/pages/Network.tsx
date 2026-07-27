@@ -7,9 +7,11 @@ import MisakaProgressBar from '@/components/ui/MisakaProgressBar'
 import AppFooter from '@/components/ui/AppFooter'
 import QRModal from '@/components/features/QRModal'
 import SettingsModal from '@/components/features/SettingsModal'
+import DownloadArtifactActions from '@/components/features/DownloadArtifactActions'
 import {
   useNetworkStore, isLikelyUnreachable,
   deriveNetworkStatus, networkStatusLabel, peerDisplayStatus,
+  getTransferDeliveryState,
 } from '@/store/network'
 import { useAuthStore } from '@/store/auth'
 import { appUrl } from '@/lib/appBase'
@@ -193,23 +195,10 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
   const peerStatus = useNetworkStore(s =>
     s.peers.find(p => p.sessionId === peerSessionId)?.status ?? 'offline')
   const bottomRef = useRef<HTMLDivElement>(null)
-  const [downloadedIds, setDownloadedIds] = useState<Set<string>>(new Set())
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages.length, recvTransfers.length, pendingFiles.length])
-
-  function handleDownload(m: { id: string; fileName?: string; downloadUrl?: string }) {
-    if (!m.downloadUrl) return
-    const a = document.createElement('a')
-    a.href = m.downloadUrl
-    a.download = m.fileName ?? 'download'
-    a.click()
-    // Keep the object URL alive: revoking after a fixed delay used to break the
-    // re-download path when the user dismissed the "已下载" state (e.g. tab
-    // re-mount). The blob is garbage-collected with the page anyway.
-    setDownloadedIds(prev => new Set([...prev, m.id]))
-  }
 
   return (
     <div
@@ -242,7 +231,6 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
         const isSystem = m.type === 'system'
 
         if (m.type === 'file') {
-          const alreadyDownloaded = downloadedIds.has(m.id)
           return (
             <div key={m.id} className="font-kanji text-xs flex justify-start">
               <div
@@ -265,13 +253,12 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
                       <div className="text-[10px]" style={{ color: 'var(--text-muted)' }}>{formatBytes(m.fileSize)}</div>
                     )}
                   </div>
-                  {alreadyDownloaded ? (
-                    <span className="text-[10px] font-mono shrink-0" style={{ color: 'var(--state-success)' }}>✓ 已下载</span>
-                  ) : (
-                    <MisakaButton variant="primary" size="sm" className="text-xs py-0.5 px-2 shrink-0"
-                      onClick={() => handleDownload(m)}>
-                      ↓ 下载
-                    </MisakaButton>
+                  {m.downloadUrl && (
+                    <DownloadArtifactActions
+                      id={m.id}
+                      url={m.downloadUrl}
+                      fileName={m.fileName ?? 'download'}
+                    />
                   )}
                 </div>
               </div>
@@ -511,8 +498,8 @@ function TransferChannel({ selectedPeer, onlinePeerCount, onStageFiles, onSendFi
         }}
       >
         <MisakaKanjiBlock char="同" size="xl" className="mb-4" />
-        <p className="font-kanji font-bold text-lg text-[var(--text-on-white)] mb-1">从左侧选择目标节点</p>
-        <p className="font-kanji text-sm text-[var(--text-on-white-2)] mb-3">选择节点后即可发送文件或消息</p>
+        <p className="font-kanji font-bold text-lg text-[var(--text-on-white)] mb-1">请先在「节点」页选择目标节点</p>
+        <p className="font-kanji text-sm text-[var(--text-on-white-2)] mb-3">选择后即可打开信道并发送文件或消息</p>
         {/* P1-4: with ≥2 online peers, fanout is a useful shortcut even
             before the user picks a target. Previously this entry point
             only existed inside the per-peer drop zone, so a brand-new
@@ -726,7 +713,11 @@ function TaskPanel({ transfers, onPause, onResume, onCancel, onResendToPeer }: {
           )}
           {t.status === 'completed' && (
             <div className="flex items-center gap-2 mt-1">
-              <span style={{ color: 'var(--state-success)' }} className="font-mono text-xs">✓ 已完成</span>
+              <span style={{ color: 'var(--state-success-on-light)' }} className="font-mono text-xs">
+                ✓ {t.direction === 'send'
+                  ? getTransferDeliveryState(t.id) === 'saved' ? '已保存' : '已送达'
+                  : t.storageMode === 'fsa' ? '已保存到所选位置' : '接收完成'}
+              </span>
               {/* P2-12: give the completed card a meaningful next-action so
                   it's not just an inert green badge.
                   - send: original File is held by the engine and may already
@@ -746,8 +737,13 @@ function TaskPanel({ transfers, onPause, onResume, onCancel, onResendToPeer }: {
                 </MisakaButton>
               )}
               {t.direction === 'recv' && (
-                <span className="ml-auto font-kanji text-[10px]" style={{ color: 'var(--text-muted)' }}>
-                  已保存
+                <span className="ml-auto font-kanji text-[10px]" style={{ color: 'var(--text-muted-on-light)' }}>
+                  {t.storageMode === 'fsa' ? '文件已写入所选位置' : '请在消息中下载'}
+                </span>
+              )}
+              {t.direction === 'send' && getTransferDeliveryState(t.id) !== 'saved' && (
+                <span className="ml-auto font-kanji text-[10px]" style={{ color: 'var(--state-warn-on-light)' }}>
+                  等待对方保存确认
                 </span>
               )}
             </div>
@@ -801,8 +797,8 @@ function MobileBottomBar({
   onShowQR: () => void
 }) {
   const items = [
-    { kanji: '件', label: '文件', onClick: onShowFiles },
-    { kanji: '言', label: '消息', onClick: onShowChannel },
+    { kanji: '任', label: '任务', onClick: onShowFiles },
+    { kanji: '道', label: '信道', onClick: onShowChannel },
     { kanji: '码', label: 'QR',   onClick: onShowQR },
   ]
   return (
@@ -958,10 +954,7 @@ export default function Network() {
   async function handleCopyLink() {
     if (!auth.session?.token) return
     try {
-      const path = auth.identity.passCode
-        ? `/api/qr-token?passCode=${encodeURIComponent(auth.identity.passCode)}`
-        : '/api/qr-token'
-      const res = await authedFetch(path)
+      const res = await authedFetch('/api/qr-token', { method: 'POST' })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json() as { qrToken: string }
       const params = new URLSearchParams({
@@ -1003,19 +996,7 @@ export default function Network() {
   }
 
   async function handleReconnectPeer(sessionId: string) {
-    // P0-1: until the store ships a per-peer `reconnectPeer` action we fall
-    // back to the shared recoverConnections() path — it iterates every peer
-    // and rebuilds offline ones, which covers the case the button targets.
-    // TODO(main-agent): wire reconnectPeer(sessionId) for a targeted recover.
-    const s = useNetworkStore.getState() as unknown as {
-      reconnectPeer?: (sid: string) => Promise<void>
-      recoverConnections: () => void
-    }
-    if (typeof s.reconnectPeer === 'function') {
-      await s.reconnectPeer(sessionId)
-    } else {
-      s.recoverConnections()
-    }
+    await useNetworkStore.getState().reconnectPeer(sessionId)
   }
 
   function handleEmptyDropAttempt() {
@@ -1041,13 +1022,7 @@ export default function Network() {
   function dispatchPause(transferId: string) {
     const t = store.transfers.find(tr => tr.id === transferId)
     if (t?.direction === 'recv') {
-      // TODO(main-agent): wire pauseReceiveTransfer(transferId).
-      const s = useNetworkStore.getState() as unknown as {
-        pauseReceiveTransfer?: (id: string) => void
-        pauseTransfer: (id: string) => void
-      }
-      if (typeof s.pauseReceiveTransfer === 'function') s.pauseReceiveTransfer(transferId)
-      else s.pauseTransfer(transferId)
+      useNetworkStore.getState().pauseReceiveTransfer(transferId)
       return
     }
     store.pauseTransfer(transferId)
@@ -1070,13 +1045,7 @@ export default function Network() {
   function dispatchCancel(transferId: string) {
     const t = store.transfers.find(tr => tr.id === transferId)
     if (t?.direction === 'recv') {
-      // TODO(main-agent): wire cancelReceiveTransfer(transferId).
-      const s = useNetworkStore.getState() as unknown as {
-        cancelReceiveTransfer?: (id: string) => void
-        cancelTransferAction: (id: string) => void
-      }
-      if (typeof s.cancelReceiveTransfer === 'function') s.cancelReceiveTransfer(transferId)
-      else s.cancelTransferAction(transferId)
+      useNetworkStore.getState().cancelReceiveTransfer(transferId)
       return
     }
     store.cancelTransferAction(transferId)

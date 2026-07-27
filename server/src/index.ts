@@ -9,7 +9,12 @@ import { startCleanupTask, stopCleanupTask } from './cleanup.js'
 import { loadTurnState, startPersistFlusher, stopPersistFlusher, flushTurnState, loadPersistedLocks, flushPersistedLocks } from './persist.js'
 import { startTurnPollers, stopTurnPollers, startTurnRevokeRetry, stopTurnRevokeRetry } from './turn.js'
 import { allowedOrigins, isOriginAllowed, isOriginAllowedForRequest, isWildcardOriginMode } from './origin.js'
-import { PORT, SHUTDOWN_TIMEOUT_MS, TRUST_PROXY, WS_MAX_PAYLOAD_BYTES } from './config.js'
+import { PORT, SHUTDOWN_TIMEOUT_MS, TRUST_PROXY, WS_MAX_PAYLOAD_BYTES, validateStartupConfig } from './config.js'
+
+// Deployment errors must fail before listeners, cleanup timers or provider
+// pollers are created. In particular, an "enabled" automatic TURN service
+// without provider credentials is not a healthy degraded mode.
+validateStartupConfig()
 
 const app = express()
 

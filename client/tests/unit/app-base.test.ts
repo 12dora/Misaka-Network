@@ -51,12 +51,12 @@ describe('CONFIG-005: appBasePath derives from the deployment base', () => {
     expect(appPath('/join')).toBe('/join')
   })
 
-  it('host-injected APP_BASE overrides the build base', async () => {
+  it('runtime config cannot split routing from the build asset base', async () => {
     vi.stubEnv('BASE_URL', '/repo/')
-    window.__MISAKA_CONFIG__ = { APP_BASE: '/mounted-here' }
+    window.__MISAKA_CONFIG__ = { API_BASE: 'https://api.example' }
     const { appBasePath, appPath } = await loadAppBase()
-    expect(appBasePath()).toBe('/mounted-here')
-    expect(appPath('join')).toBe('/mounted-here/join')
+    expect(appBasePath()).toBe('/repo')
+    expect(appPath('join')).toBe('/repo/join')
   })
 })
 

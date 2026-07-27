@@ -10,12 +10,15 @@
 //      than a dead-end.
 
 import { test, expect, type Page } from '@playwright/test'
+import jsQR from 'jsqr'
+import { PNG } from 'pngjs'
+import { cleanupE2eSessions } from './helpers'
 
 const HOST_NODE = '12001'
 const HOST_PASS = '424242'
 
 test.beforeEach(async ({ request }) => {
-  await request.post('http://localhost:19180/api/release-by-ip').catch(() => {})
+  await cleanupE2eSessions(request)
 })
 
 async function loginHost(page: Page) {
@@ -28,7 +31,16 @@ async function loginHost(page: Page) {
   await page.waitForURL('**/network', { timeout: 30_000 })
 }
 
-test('QR modal renders + 复制链接 produces a /join URL', async ({ browser }) => {
+function decodeQrDataUrl(dataUrl: string): string {
+  const encoded = dataUrl.split(',', 2)[1]
+  if (!encoded) throw new Error('QR image is not a base64 data URL')
+  const image = PNG.sync.read(Buffer.from(encoded, 'base64'))
+  const decoded = jsQR(new Uint8ClampedArray(image.data), image.width, image.height)
+  if (!decoded?.data) throw new Error('rendered QR image could not be decoded')
+  return decoded.data
+}
+
+test('rendered QR image decodes and admits a fresh device', async ({ browser }) => {
   const ctx = await browser.newContext({ permissions: ['clipboard-read', 'clipboard-write'] })
   const page = await ctx.newPage()
   try {
@@ -43,11 +55,14 @@ test('QR modal renders + 复制链接 produces a /join URL', async ({ browser })
     const modal = page.locator('.modal-panel-in')
 
     // QR canvas/img is rendered (alt text or canvas presence).
-    const qrVisible = await Promise.race([
-      page.locator('img[alt*="QR"]').first().isVisible().catch(() => false),
-      page.locator('canvas').first().isVisible().catch(() => false),
-    ])
-    expect(qrVisible).toBe(true)
+    const qrImage = modal.locator('img[alt="接入 QR"]')
+    await expect(qrImage).toBeVisible({ timeout: 10_000 })
+    await expect.poll(async () => qrImage.getAttribute('src')).toMatch(/^data:image\/png;base64,.+/)
+    const imageUrl = await qrImage.getAttribute('src')
+    const scannedUrl = decodeQrDataUrl(imageUrl ?? '')
+    expect(scannedUrl).toMatch(/\/join\?/)
+    expect(scannedUrl).toMatch(/[?&]t=[a-zA-Z0-9_-]{6,}/)
+    expect(scannedUrl).not.toMatch(/[?&]c=/)
 
     // Click 复制链接 — modal toast confirms; clipboard content matches /join?token=
     const copyBtn = modal.locator('button:has-text("复制链接")')
@@ -59,6 +74,23 @@ test('QR modal renders + 复制链接 produces a /join URL', async ({ browser })
     // carrying a token param, without pinning param order.
     expect(clipped).toMatch(/\/join\?/)
     expect(clipped).toMatch(/[?&]t=[a-zA-Z0-9_-]{6,}/)
+    expect(clipped).toBe(scannedUrl)
+    expect(clipped).not.toMatch(/[?&]c=/)
+
+    const guestCtx = await browser.newContext()
+    const guestPage = await guestCtx.newPage()
+    try {
+      await guestPage.goto(scannedUrl, { waitUntil: 'load' })
+      const passInput = guestPage.locator('#join-passcode')
+      await expect(passInput).toBeVisible()
+      await passInput.fill(HOST_PASS)
+      await guestPage.locator('button:has-text("接入")').click()
+      await guestPage.waitForURL('**/network', { timeout: 30_000 })
+      await expect(page.getByText(`御坂 ${HOST_NODE} 号`, { exact: false }).first())
+        .toBeVisible({ timeout: 20_000 })
+    } finally {
+      await guestCtx.close().catch(() => {})
+    }
   } finally {
     await ctx.close().catch(() => {})
   }
@@ -85,23 +117,11 @@ test('wrong passcode at /join surfaces inline error', async ({ browser }) => {
     try {
       await guestPage.goto(joinUrl, { waitUntil: 'load' })
 
-      // Either we land on /network directly (passcode embedded) or we hit
-      // the 6-digit passcode prompt on /join. We exercise the wrong-passcode
-      // branch only in the latter case.
-      const onJoin = guestPage.url().includes('/join')
-      if (!onJoin) {
-        // Embedded-passcode path: nothing to assert here besides reachability.
-        return
-      }
-
-      const passInputs = guestPage.locator('input[maxlength="1"]')
-      const inputCount = await passInputs.count()
-      if (inputCount < 6) {
-        // No prompt rendered (maybe redirect). Skip the wrong-pass assertion.
-        return
-      }
-      for (let i = 0; i < 6; i++) await passInputs.nth(i).fill('0')
-      await guestPage.locator('button:has-text("接入")').first().click()
+      await expect(guestPage).toHaveURL(/\/join/)
+      const passInput = guestPage.locator('#join-passcode')
+      await expect(passInput).toBeVisible()
+      await passInput.fill('000000')
+      await guestPage.locator('button:has-text("接入")').click()
 
       await expect(
         guestPage.locator('text=/通行码不正确|通行码错误|WRONG_PASSCODE/'),

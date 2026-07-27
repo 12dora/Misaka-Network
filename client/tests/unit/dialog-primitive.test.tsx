@@ -12,7 +12,7 @@
 //
 // @vitest-environment jsdom
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { act } from 'react-dom/test-utils'
 import { createRoot, type Root } from 'react-dom/client'
 import MisakaDialog, { __openDialogCount } from '../../src/components/ui/MisakaDialog'
@@ -168,6 +168,19 @@ describe('A11Y-001: background is inert and scroll is locked', () => {
     expect(container.hasAttribute('inert')).toBe(true)
     expect(document.body.getAttribute('data-dialog-open')).toBe('true')
   })
+
+  it('REGRESSION — restores pre-existing inert and aria-hidden values exactly', () => {
+    container.setAttribute('inert', 'locked-by-host')
+    container.setAttribute('aria-hidden', 'false')
+    render(<Basic />)
+
+    expect(container.getAttribute('inert')).toBe('')
+    expect(container.getAttribute('aria-hidden')).toBe('true')
+    act(() => { root.render(null) })
+
+    expect(container.getAttribute('inert')).toBe('locked-by-host')
+    expect(container.getAttribute('aria-hidden')).toBe('false')
+  })
 })
 
 describe('A11Y-001: focus containment and restoration', () => {
@@ -272,5 +285,29 @@ describe('A11Y-001: backdrop dismissal', () => {
     })
 
     expect(closed).toBe(0)
+  })
+})
+
+describe('A11Y-001: Escape belongs to the top dialog only', () => {
+  it('closes only the top of a stacked dialog and never both layers', () => {
+    const outerClose = vi.fn()
+    const innerClose = vi.fn()
+    render(
+      <>
+        <MisakaDialog title="outer" onRequestClose={outerClose}><button>outer</button></MisakaDialog>
+        <MisakaDialog title="inner" onRequestClose={innerClose}><button>inner</button></MisakaDialog>
+      </>,
+    )
+
+    press('Escape')
+    expect(innerClose).toHaveBeenCalledTimes(1)
+    expect(outerClose).not.toHaveBeenCalled()
+  })
+
+  it('gives IpFullPrompt-style direct primitive consumers Escape dismissal', () => {
+    const close = vi.fn()
+    render(<Basic onClose={close} />)
+    press('Escape')
+    expect(close).toHaveBeenCalledTimes(1)
   })
 })

@@ -8,7 +8,7 @@ import {
   createPeerConnection, createDataChannel, createOffer, createAnswer,
   applyAnswer, addIceCandidate, getSelectedChannelType, getSelectedIcePath,
   ensureAutoTurnReady, applyIceConfigToAll, isRelayAllowed,
-  whenSignalingStable, endOfCandidatesFor, installIceErrorListener,
+  whenSignalingStable, endOfCandidateMarkersFor, endOfCandidatesFor, installIceErrorListener,
 } from '@/lib/webrtc'
 import {
   generateECDHKeyPair, getMyPublicKey, setPeerPublicKey,
@@ -52,7 +52,39 @@ const peerConnections = new Map<string, RTCPeerConnection>()
 const dataChannels = new Map<string, RTCDataChannel>()
 const transferLanes = new Map<string, RTCDataChannel[]>()
 const configuredDataChannels = new WeakSet<RTCDataChannel>()
-const pendingIceCandidates = new Map<string, RTCIceCandidateInit[]>()
+interface PendingRemoteIceGroup {
+  epoch: number
+  incarnation: number
+  negotiationToken: number
+  key: string
+  ufrag: string | null
+  localOfferToken: number | null
+  candidates: RTCIceCandidateInit[]
+  endOfCandidates: Array<RTCIceCandidateInit | null>
+  sequence: number
+}
+interface PendingRemoteIceHint {
+  epoch: number
+  incarnation: number
+  negotiationToken: number
+  key: string
+  ufrag: string | null
+}
+export interface PendingRemoteIceOverflowState {
+  groupDrops: number
+  candidateDrops: number
+  lastKind: 'group' | 'candidate'
+}
+const MAX_PENDING_REMOTE_ICE_GROUPS = 8
+const MAX_PENDING_REMOTE_ICE_CANDIDATES_PER_GROUP = 256
+const pendingRemoteIce = new Map<string, Map<string, PendingRemoteIceGroup>>()
+const pendingRemoteNegotiationTokens = new Map<string, number>()
+const pendingRemoteTokenReservations = new Map<string, Map<string, number>>()
+const peerRemoteNegotiationCounters = new Map<string, number>()
+const pendingRemoteIceHints = new Map<string, PendingRemoteIceHint>()
+const installedRemoteNegotiationTokens = new Map<string, number>()
+const pendingRemoteIceOverflow = new Map<string, PendingRemoteIceOverflowState>()
+let pendingRemoteIceSequence = 0
 const ecdhResolvers: Map<string, () => void> = new Map()
 const connectingPeers = new Map<string, Promise<RTCDataChannel>>()
 const remoteInitiatingPeers = new Set<string>()
@@ -66,6 +98,14 @@ const iceRestartAttempts = new Map<string, number>()
 // browser fires 'failed' very lazily (~30s), so we stop waiting and try
 // to recover proactively.
 const disconnectedTimers = new Map<string, ReturnType<typeof setTimeout>>()
+// Chromium can occasionally remain in ICE "checking" forever even after
+// both sides accepted host candidates. No failed/disconnected event means
+// the normal recovery path never runs. Exactly one deterministic side owns
+// a bounded initial ICE restart so both peers cannot create glare.
+const initialIceRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+const initialEncryptedSessionRebuilds = new Set<string>()
+const INITIAL_ICE_RECOVERY_MS = 8_000
+const INITIAL_ICE_REOBSERVE_MS = 8_000
 const sendingFiles = new Map<string, File>()  // transferId → File
 // Per-peer mapping from the compact shortId embedded in binary chunk frames
 // to the full transferId. Registered when a `meta` message arrives and
@@ -79,9 +119,38 @@ const transferSpeedSamples = new Map<string, { bytes: number; at: number }>()
 // coarse UI state; this map carries the durable-delivery truth
 // (queued → delivered → saved) that the ✓ badge must not overstate.
 const transferDelivery = new Map<string, DeliveryState>()
+interface DownloadArtifactLifecycle {
+  cleanup?: () => Promise<void>
+  started: boolean
+}
+const artifactLifecycleByUrl = new Map<string, DownloadArtifactLifecycle>()
 export function getTransferDeliveryState(transferId: string): DeliveryState | undefined {
   return transferDelivery.get(transferId)
 }
+export function markDownloadArtifactStarted(url: string) {
+  const lifecycle = artifactLifecycleByUrl.get(url)
+  if (lifecycle) lifecycle.started = true
+}
+
+/** Explicit acknowledgement that the browser has finished saving the file. */
+export async function releaseDownloadArtifact(url: string) {
+  try { URL.revokeObjectURL(url) } catch { /* ignore */ }
+  const lifecycle = artifactLifecycleByUrl.get(url)
+  artifactLifecycleByUrl.delete(url)
+  await lifecycle?.cleanup?.()
+}
+
+/**
+ * Automatic UI retirement may clean an artefact only if no download started.
+ * Once clicked, browsers expose no completion signal; deleting a lazy OPFS
+ * entry at that point can cancel a legitimate slow download.
+ */
+function retireDownloadArtifact(url: string) {
+  const lifecycle = artifactLifecycleByUrl.get(url)
+  if (lifecycle?.started) return
+  void releaseDownloadArtifact(url)
+}
+
 let currentToken = ''
 
 // ── Bounded terminal retention (QUALITY-001) ─────────────────────────
@@ -124,7 +193,7 @@ export function pruneChatMessages(msgs: ChannelMessage[]): ChannelMessage[] {
   if (msgs.length <= MAX_CHAT_MESSAGES_PER_PEER) return msgs
   const dropped = msgs.slice(0, msgs.length - MAX_CHAT_MESSAGES_PER_PEER)
   for (const m of dropped) {
-    if (m.downloadUrl) { try { URL.revokeObjectURL(m.downloadUrl) } catch { /* ignore */ } }
+    if (m.downloadUrl) retireDownloadArtifact(m.downloadUrl)
   }
   return msgs.slice(msgs.length - MAX_CHAT_MESSAGES_PER_PEER)
 }
@@ -149,6 +218,15 @@ const peerGenerations = new Map<string, number>()
 const initiatingPeers = new Map<string, { gen: number; task: Promise<void> }>()
 // Per-peer serialization chain for inbound signaling (BUG-006).
 const peerTaskQueues = new Map<string, Promise<void>>()
+// Receipt-time incarnation for queued SDP/ICE. Peer generation alone is not
+// enough here: a closure parked behind an old task used to capture generation
+// only when it eventually started, at which point it could mistake a
+// replacement PC for the frame's original target.
+const peerSignalingIncarnations = new Map<string, number>()
+// Token of the most recently published local SDP offer on the current PC.
+// Answers are stamped with this at receipt so an old queued answer cannot be
+// applied to a later ICE-restart offer on the same still-live PC.
+const peerLocalOfferTokens = new Map<string, number>()
 // Unsubscribers for everything init() registered on the signaling module.
 // `signaling.disconnect()` deliberately no longer wipes the global handler
 // sets (the auth store's onAuthInvalid contract lives in the same sets), so
@@ -170,17 +248,359 @@ function isCurrentGeneration(peerSessionId: string, gen: number): boolean {
   return peerGeneration(peerSessionId) === gen
 }
 
+interface PeerGenerationAttempt {
+  peerSessionId: string
+  epoch: number
+  gen: number
+}
+
+interface PeerConnectionAttempt extends PeerGenerationAttempt {
+  pc: RTCPeerConnection
+}
+
+function captureGenerationAttempt(peerSessionId: string, gen = peerGeneration(peerSessionId)): PeerGenerationAttempt {
+  return { peerSessionId, epoch: networkEpoch, gen }
+}
+
+function capturePeerConnectionAttempt(
+  peerSessionId: string,
+  pc: RTCPeerConnection,
+  gen = peerGeneration(peerSessionId),
+): PeerConnectionAttempt {
+  return { ...captureGenerationAttempt(peerSessionId, gen), pc }
+}
+
+function isPeerGenerationAttemptCurrent(attempt: PeerGenerationAttempt): boolean {
+  return attempt.epoch === networkEpoch
+    && isCurrentGeneration(attempt.peerSessionId, attempt.gen)
+    && useNetworkStore.getState().peers.some(peer => peer.sessionId === attempt.peerSessionId)
+}
+
+function isPeerConnectionAttemptCurrent(attempt: PeerConnectionAttempt): boolean {
+  return isPeerGenerationAttemptCurrent(attempt)
+    && peerConnections.get(attempt.peerSessionId) === attempt.pc
+}
+
+interface SignalReceipt {
+  peerSessionId: string
+  epoch: number
+  incarnation: number
+  gen: number
+  originatingPc: RTCPeerConnection | null
+  localOfferToken: number | null
+  pendingRemoteNegotiationToken: number | null
+  remoteIceGroupKey: string | null
+  remoteIceUfrag: string | null
+  remoteIceReservationKey: string | null
+  remoteIceEndCandidate: RTCIceCandidateInit | null
+}
+
+function peerSignalingIncarnation(peerSessionId: string): number {
+  return peerSignalingIncarnations.get(peerSessionId) ?? 0
+}
+
+function invalidatePeerSignalingIncarnation(peerSessionId: string) {
+  peerSignalingIncarnations.set(
+    peerSessionId,
+    peerSignalingIncarnation(peerSessionId) + 1,
+  )
+  peerLocalOfferTokens.delete(peerSessionId)
+  pendingRemoteIce.delete(peerSessionId)
+  pendingRemoteNegotiationTokens.delete(peerSessionId)
+  pendingRemoteTokenReservations.delete(peerSessionId)
+  pendingRemoteIceHints.delete(peerSessionId)
+  installedRemoteNegotiationTokens.delete(peerSessionId)
+  pendingRemoteIceOverflow.delete(peerSessionId)
+  // The active promise cannot be cancelled, but detaching the chain lets the
+  // replacement incarnation process new frames immediately. Every closure
+  // still retained by the old promise carries the invalid receipt stamp.
+  peerTaskQueues.delete(peerSessionId)
+}
+
+function ensurePendingRemoteNegotiationToken(peerSessionId: string): number {
+  const current = pendingRemoteNegotiationTokens.get(peerSessionId)
+  if (current !== undefined) return current
+  const next = (peerRemoteNegotiationCounters.get(peerSessionId) ?? 0) + 1
+  peerRemoteNegotiationCounters.set(peerSessionId, next)
+  pendingRemoteNegotiationTokens.set(peerSessionId, next)
+  return next
+}
+
+function remoteNegotiationIdentityKey(
+  epoch: number,
+  incarnation: number,
+  token: number,
+): string {
+  return `${epoch}:${incarnation}:${token}`
+}
+
+function reservePendingRemoteNegotiationToken(
+  peerSessionId: string,
+  identityKey: string,
+): void {
+  let reservations = pendingRemoteTokenReservations.get(peerSessionId)
+  if (!reservations) {
+    reservations = new Map()
+    pendingRemoteTokenReservations.set(peerSessionId, reservations)
+  }
+  reservations.set(identityKey, (reservations.get(identityKey) ?? 0) + 1)
+}
+
+function releasePendingRemoteNegotiationToken(receipt: SignalReceipt): void {
+  if (receipt.remoteIceReservationKey === null) return
+  const reservations = pendingRemoteTokenReservations.get(receipt.peerSessionId)
+  const count = reservations?.get(receipt.remoteIceReservationKey)
+  if (count === undefined) return
+  if (count > 1) {
+    reservations!.set(receipt.remoteIceReservationKey, count - 1)
+  } else {
+    reservations!.delete(receipt.remoteIceReservationKey)
+    if (reservations!.size === 0) pendingRemoteTokenReservations.delete(receipt.peerSessionId)
+  }
+}
+
+function hasPendingRemoteTokenReservation(receipt: SignalReceipt): boolean {
+  if (receipt.pendingRemoteNegotiationToken === null) return false
+  const identityKey = remoteNegotiationIdentityKey(
+    receipt.epoch,
+    receipt.incarnation,
+    receipt.pendingRemoteNegotiationToken,
+  )
+  return (pendingRemoteTokenReservations.get(receipt.peerSessionId)?.get(identityKey) ?? 0) > 0
+}
+
+function captureSignalReceipt(
+  peerSessionId: string,
+  options: {
+    preparePendingRemoteIce?: boolean
+    candidate?: RTCIceCandidateInit
+    endOfCandidates?: RTCIceCandidateInit | null
+  } = {},
+): SignalReceipt {
+  const pc = peerConnections.get(peerSessionId) ?? null
+  const epoch = networkEpoch
+  const incarnation = peerSignalingIncarnation(peerSessionId)
+  let pendingRemoteNegotiationToken = pendingRemoteNegotiationTokens.get(peerSessionId) ?? null
+  let remoteIceGroupKey: string | null = null
+  let remoteIceUfrag: string | null = null
+
+  if (options.preparePendingRemoteIce) {
+    const currentHint = pendingRemoteIceHints.get(peerSessionId)
+    const hint = currentHint
+      && currentHint.epoch === epoch
+      && currentHint.incarnation === incarnation
+      ? currentHint
+      : null
+    const iceInput = options.candidate ?? options.endOfCandidates ?? undefined
+    const candidateUfrag = options.candidate?.usernameFragment
+      ?? options.endOfCandidates?.usernameFragment
+      ?? null
+    const iceInputMatchesInstalled = Boolean(
+      iceInput
+      && pc?.remoteDescription
+      && candidateCompatibleWithRemoteSdp(iceInput, pc.remoteDescription, {
+        groupUfrag: hint?.ufrag ?? null,
+      }),
+    )
+
+    if (candidateUfrag !== null && !iceInputMatchesInstalled) {
+      const token = ensurePendingRemoteNegotiationToken(peerSessionId)
+      pendingRemoteNegotiationToken = token
+      remoteIceUfrag = candidateUfrag
+      remoteIceGroupKey = `${token}:ufrag:${candidateUfrag}`
+      pendingRemoteIceHints.set(peerSessionId, {
+        epoch, incarnation, negotiationToken: token,
+        key: remoteIceGroupKey, ufrag: candidateUfrag,
+      })
+    } else if (
+      candidateUfrag === null
+      &&
+      (
+        options.endOfCandidates !== undefined
+        || (options.candidate && candidateUfrag === null)
+      )
+      && hint
+    ) {
+      pendingRemoteNegotiationToken = hint.negotiationToken
+      remoteIceGroupKey = hint.key
+      remoteIceUfrag = hint.ufrag
+    } else if (
+      options.endOfCandidates !== undefined
+      && iceInput
+      && pc?.remoteDescription
+      && !iceInputMatchesInstalled
+    ) {
+      const token = ensurePendingRemoteNegotiationToken(peerSessionId)
+      pendingRemoteNegotiationToken = token
+      remoteIceGroupKey = `${token}:negotiation`
+      pendingRemoteIceHints.set(peerSessionId, {
+        epoch, incarnation, negotiationToken: token,
+        key: remoteIceGroupKey, ufrag: null,
+      })
+    } else if (!pc?.remoteDescription) {
+      const token = ensurePendingRemoteNegotiationToken(peerSessionId)
+      pendingRemoteNegotiationToken = token
+      remoteIceGroupKey = `${token}:negotiation`
+      pendingRemoteIceHints.set(peerSessionId, {
+        epoch, incarnation, negotiationToken: token,
+        key: remoteIceGroupKey, ufrag: null,
+      })
+    }
+  }
+  const remoteIceReservationKey = (
+    options.preparePendingRemoteIce
+    && pendingRemoteNegotiationToken !== null
+    && remoteIceGroupKey !== null
+  )
+    ? remoteNegotiationIdentityKey(epoch, incarnation, pendingRemoteNegotiationToken)
+    : null
+  if (remoteIceReservationKey !== null) {
+    reservePendingRemoteNegotiationToken(peerSessionId, remoteIceReservationKey)
+  }
+  return {
+    peerSessionId,
+    epoch,
+    incarnation,
+    gen: peerGeneration(peerSessionId),
+    originatingPc: pc,
+    localOfferToken: peerLocalOfferTokens.get(peerSessionId) ?? null,
+    pendingRemoteNegotiationToken,
+    remoteIceGroupKey,
+    remoteIceUfrag,
+    remoteIceReservationKey,
+    remoteIceEndCandidate: options.endOfCandidates ?? null,
+  }
+}
+
+function hasPendingRemoteIceForReceipt(receipt: SignalReceipt): boolean {
+  if (receipt.pendingRemoteNegotiationToken === null) return false
+  const groups = pendingRemoteIce.get(receipt.peerSessionId)
+  return Boolean(groups && [...groups.values()].some(group => (
+    group.epoch === receipt.epoch
+    && group.incarnation === receipt.incarnation
+    && group.negotiationToken === receipt.pendingRemoteNegotiationToken
+  )))
+}
+
+function retireUnusedPendingRemoteToken(receipt: SignalReceipt) {
+  if (
+    receipt.pendingRemoteNegotiationToken !== null
+    && receipt.epoch === networkEpoch
+    && receipt.incarnation === peerSignalingIncarnation(receipt.peerSessionId)
+    && !hasPendingRemoteIceForReceipt(receipt)
+    && !hasPendingRemoteTokenReservation(receipt)
+    && pendingRemoteNegotiationTokens.get(receipt.peerSessionId) === receipt.pendingRemoteNegotiationToken
+  ) {
+    pendingRemoteNegotiationTokens.delete(receipt.peerSessionId)
+    const hint = pendingRemoteIceHints.get(receipt.peerSessionId)
+    if (hint?.negotiationToken === receipt.pendingRemoteNegotiationToken) {
+      pendingRemoteIceHints.delete(receipt.peerSessionId)
+    }
+  }
+}
+
+function isSignalReceiptCurrent(
+  receipt: SignalReceipt,
+  options: {
+    requireOriginatingPc?: boolean
+    requireLocalOfferToken?: boolean
+    bindLocalOfferToken?: boolean
+    allowMissingPeer?: boolean
+  } = {},
+): boolean {
+  const {
+    requireOriginatingPc = false,
+    requireLocalOfferToken = false,
+    bindLocalOfferToken = false,
+    allowMissingPeer = false,
+  } = options
+  if (
+    receipt.epoch !== networkEpoch
+    || receipt.incarnation !== peerSignalingIncarnation(receipt.peerSessionId)
+    || (
+      !allowMissingPeer
+      && !useNetworkStore.getState().peers.some(peer => peer.sessionId === receipt.peerSessionId)
+    )
+  ) return false
+  if (requireLocalOfferToken && receipt.localOfferToken === null) return false
+  if (
+    (requireLocalOfferToken || bindLocalOfferToken)
+    && receipt.localOfferToken !== null
+    && peerLocalOfferTokens.get(receipt.peerSessionId) !== receipt.localOfferToken
+  ) return false
+  if (!receipt.originatingPc) return !requireOriginatingPc
+  return receipt.gen === peerGeneration(receipt.peerSessionId)
+    && peerConnections.get(receipt.peerSessionId) === receipt.originatingPc
+}
+
+export function getPendingSignalingQueueCount(): number {
+  return peerTaskQueues.size
+}
+
+export function getPendingRemoteIceCount(): number {
+  let count = 0
+  for (const groups of pendingRemoteIce.values()) count += groups.size
+  return count
+}
+
+export function getPendingRemoteIceCandidateCount(): number {
+  let count = 0
+  for (const groups of pendingRemoteIce.values()) {
+    for (const group of groups.values()) count += group.candidates.length
+  }
+  return count
+}
+
+export function getPendingRemoteIceReservationCount(): number {
+  let count = 0
+  for (const reservations of pendingRemoteTokenReservations.values()) {
+    for (const reservationCount of reservations.values()) count += reservationCount
+  }
+  return count
+}
+
+export function getPendingRemoteIceOverflowState(
+  peerSessionId: string,
+): PendingRemoteIceOverflowState | null {
+  const state = pendingRemoteIceOverflow.get(peerSessionId)
+  return state ? { ...state } : null
+}
+
 /**
  * Run `fn` after every previously queued task for this peer. Rejections are
  * logged and contained: they must neither escape as an unhandled rejection
  * nor poison the rest of the queue.
  */
-function enqueuePeerTask(peerSessionId: string, what: string, fn: () => Promise<void>): Promise<void> {
+function enqueuePeerTask(
+  receipt: SignalReceipt,
+  what: string,
+  fn: () => Promise<void>,
+  options: {
+    requireOriginatingPc?: boolean
+    requireLocalOfferToken?: boolean
+    bindLocalOfferToken?: boolean
+    allowMissingPeer?: boolean
+  } = {},
+): Promise<void> {
+  const { peerSessionId } = receipt
   const previous = peerTaskQueues.get(peerSessionId) ?? Promise.resolve()
-  const next = previous.then(fn).catch(err => {
+  const next = previous.then(async () => {
+    try {
+      if (!isSignalReceiptCurrent(receipt, options)) return
+      await fn()
+    } finally {
+      releasePendingRemoteNegotiationToken(receipt)
+      retireUnusedPendingRemoteToken(receipt)
+    }
+  }).catch(err => {
     console.warn(`[net] ${what} failed`, peerSessionId, err)
   })
   peerTaskQueues.set(peerSessionId, next)
+  void next.then(() => {
+    // Delete only our own settled tail. Cleanup may already have detached it,
+    // or a later frame may have extended the current incarnation's chain.
+    if (peerTaskQueues.get(peerSessionId) === next) peerTaskQueues.delete(peerSessionId)
+  })
   return next
 }
 
@@ -398,8 +818,7 @@ function propagateIceConfig() {
 async function migrateIcePath(peerSessionId: string) {
   const pc = peerConnections.get(peerSessionId)
   if (!pc) return
-  const gen = peerGeneration(peerSessionId)
-  const epoch = networkEpoch
+  const attempt = capturePeerConnectionAttempt(peerSessionId, pc)
   // Nothing to migrate on a connection that hasn't picked a path yet — its
   // first gathering round already uses the new config.
   if (pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') return
@@ -408,13 +827,13 @@ async function migrateIcePath(peerSessionId: string) {
       await whenSignalingStable(pc, { timeoutMs: 10_000 })
     }
     // Re-verify everything the awaits could have invalidated.
-    if (epoch !== networkEpoch || !isCurrentGeneration(peerSessionId, gen)) return
-    if (peerConnections.get(peerSessionId) !== pc) return
+    if (!isPeerConnectionAttemptCurrent(attempt)) return
     if (!isSignalingReady()) return
     const offer = await pc.createOffer({ iceRestart: true })
-    if (epoch !== networkEpoch || peerConnections.get(peerSessionId) !== pc) return
+    if (!isPeerConnectionAttemptCurrent(attempt)) return
     await pc.setLocalDescription(offer)
-    wsSend({ t: 'SIGNAL_SDP', targetSessionId: peerSessionId, sdp: pc.localDescription!.toJSON() })
+    if (!isPeerConnectionAttemptCurrent(attempt)) return
+    sendLocalOffer(peerSessionId, pc, pc.localDescription!.toJSON())
   } catch (err) {
     console.warn('[net] ICE path migration failed', peerSessionId, err)
   }
@@ -488,8 +907,7 @@ function startNatAndTurnProbes() {
         useNetworkStore.setState({ autoTurnAvailable: false })
         return
       }
-      const available = status.enabled && status.configured && !status.killSwitchActive
-      useNetworkStore.setState({ autoTurnAvailable: available })
+      useNetworkStore.setState({ autoTurnAvailable: status.available })
     } catch {
       useNetworkStore.setState({ autoTurnAvailable: false })
     }
@@ -756,6 +1174,17 @@ function endNetworkEpoch(reason: string) {
   peerGenerations.clear()
   initiatingPeers.clear()
   peerTaskQueues.clear()
+  peerSignalingIncarnations.clear()
+  peerLocalOfferTokens.clear()
+  pendingRemoteIce.clear()
+  pendingRemoteNegotiationTokens.clear()
+  pendingRemoteTokenReservations.clear()
+  peerRemoteNegotiationCounters.clear()
+  pendingRemoteIceHints.clear()
+  installedRemoteNegotiationTokens.clear()
+  pendingRemoteIceOverflow.clear()
+  pendingRemoteIceSequence = 0
+  initialEncryptedSessionRebuilds.clear()
   pendingIceMigration.clear()
   if (iceMigrationTimer) { clearTimeout(iceMigrationTimer); iceMigrationTimer = null }
 
@@ -768,7 +1197,7 @@ function endNetworkEpoch(reason: string) {
   // in memory for as long as the chatMessages entries live.
   for (const msgs of Object.values(state.chatMessages)) {
     for (const m of msgs) {
-      if (m.downloadUrl) { try { URL.revokeObjectURL(m.downloadUrl) } catch { /* ignore */ } }
+      if (m.downloadUrl) retireDownloadArtifact(m.downloadUrl)
     }
   }
 
@@ -794,7 +1223,7 @@ interface NetworkState {
   transfers: Transfer[]
   chatMessages: Record<string, ChannelMessage[]>   // keyed by peer sessionId
   pendingFiles: Record<string, PendingFileItem[]>  // peer sessionId -> files awaiting send
-  connectedPeers: Set<string>                      // sessionIds with open DC
+  connectedPeers: Set<string>                      // sessionIds with an encrypted-ready primary DC
   unreadByPeer: Record<string, { message: number; file: number }>
   sendingPeers: Set<string>                        // sessionIds currently flushing pendingFiles
   // P1-1: surfaced so the UI can warn ahead of a 30s ICE failure cycle.
@@ -908,7 +1337,11 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
           set(s => {
             const exists = s.peers.find(p => p.sessionId === sessionId)
             if (exists) return s
-            const newPeer: Peer = { sessionId, nodeId, status: 'online', channelType: 'direct', joinedAt }
+            // Discovery is not a usable encrypted channel. Keep the peer in
+            // connecting until the ECDH public-key exchange has installed an
+            // AES key; otherwise UI enables file send and can immediately
+            // fail with "加密协商超时".
+            const newPeer: Peer = { sessionId, nodeId, status: 'connecting', channelType: 'direct', joinedAt }
             return { peers: [...s.peers, newPeer] }
           })
           // We're the newcomer — kick off the WebRTC offer to each existing peer.
@@ -935,6 +1368,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
 
         case 'PEER_LEFT': {
           const sid = msg.sessionId
+          initialEncryptedSessionRebuilds.delete(sid)
           // P1-8: PEER_LEFT can arrive when the peer's WS dropped but the
           // P2P DataChannel is still alive (via TURN, or just a transient
           // signaling disconnect). In that case wiping chatMessages and
@@ -958,7 +1392,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
 
           const droppedMsgs = useNetworkStore.getState().chatMessages[sid] ?? []
           for (const m of droppedMsgs) {
-            if (m.downloadUrl) { try { URL.revokeObjectURL(m.downloadUrl) } catch { /* ignore */ } }
+            if (m.downloadUrl) retireDownloadArtifact(m.downloadUrl)
           }
           set(s => {
             const { [sid]: _omit, ...restChat } = s.chatMessages
@@ -988,20 +1422,39 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
         // let two offers from the same peer overlap (the dispatch loop calls
         // handlers synchronously, so the second message re-entered before the
         // first finished). Queue per peer, and swallow nothing silently.
-        case 'SIGNAL_SDP':
-          void enqueuePeerTask(msg.fromSessionId, 'handleRemoteSDP',
-            () => handleRemoteSDP(msg.fromSessionId, msg.fromNodeId, msg.sdp))
+        case 'SIGNAL_SDP': {
+          const receipt = captureSignalReceipt(msg.fromSessionId)
+          void enqueuePeerTask(receipt, 'handleRemoteSDP',
+            () => handleRemoteSDP(receipt, msg.fromNodeId, msg.sdp),
+            {
+              requireOriginatingPc: msg.sdp.type !== 'offer',
+              requireLocalOfferToken: msg.sdp.type !== 'offer',
+              allowMissingPeer: msg.sdp.type === 'offer',
+            })
           break
+        }
 
-        case 'SIGNAL_ICE':
-          void enqueuePeerTask(msg.fromSessionId, 'handleRemoteICE',
-            () => handleRemoteICE(msg.fromSessionId, msg.candidate))
+        case 'SIGNAL_ICE': {
+          const receipt = captureSignalReceipt(msg.fromSessionId, {
+            preparePendingRemoteIce: true,
+            candidate: msg.candidate,
+          })
+          void enqueuePeerTask(receipt, 'handleRemoteICE',
+            () => handleRemoteICE(receipt, msg.candidate),
+            { bindLocalOfferToken: true })
           break
+        }
 
-        case 'SIGNAL_ICE_END':
-          void enqueuePeerTask(msg.fromSessionId, 'handleRemoteICEEnd',
-            () => handleRemoteICEEnd(msg.fromSessionId))
+        case 'SIGNAL_ICE_END': {
+          const receipt = captureSignalReceipt(msg.fromSessionId, {
+            preparePendingRemoteIce: true,
+            endOfCandidates: msg.candidate ?? null,
+          })
+          void enqueuePeerTask(receipt, 'handleRemoteICEEnd',
+            () => handleRemoteICEEnd(receipt),
+            { bindLocalOfferToken: true })
           break
+        }
 
         case 'PEER_OFFLINE': {
           // Server-side hint that our outbound SIGNAL_SDP / SIGNAL_ICE never
@@ -1112,7 +1565,20 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
   addPendingFiles(sessionId, files) {
     set(s => {
       const current = s.pendingFiles[sessionId] ?? []
-      const incoming = files.map(file => ({
+      // Chromium does not promise a traversal order for webkitdirectory.
+      // Normalise folder batches by relative path so the queue, transfer
+      // cards and receiver artifacts have a stable order. Preserve the
+      // user's picker order for ordinary multi-file batches.
+      const orderedFiles = files.some(file =>
+        Boolean((file as File & { webkitRelativePath?: string }).webkitRelativePath),
+      )
+        ? [...files].sort((a, b) => {
+            const aPath = (a as File & { webkitRelativePath?: string }).webkitRelativePath || a.name
+            const bPath = (b as File & { webkitRelativePath?: string }).webkitRelativePath || b.name
+            return aPath.localeCompare(bPath)
+          })
+        : files
+      const incoming = orderedFiles.map(file => ({
         id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
         file,
         displayName: (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name,
@@ -1197,13 +1663,20 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     // peer succeeded. Keep the per-(peer, file) outcome and surface a partial
     // success to the caller.
     const jobs = targets.flatMap(sid => files.map(file => ({ sid, file })))
-    const settled = await Promise.allSettled(
-      jobs.map(job => sendFileToPeer(job.file, job.sid)),
-    )
-    const failures = jobs.filter((_job, i) => {
-      const r = settled[i]
-      return r.status === 'rejected' || r.value === false
-    })
+    // Recipients may run in parallel, but each recipient observes the file
+    // picker order. A flat Promise.all raced same-recipient files and let a
+    // smaller later file arrive first (or hide a dropped/duplicated sibling).
+    const failures = (await Promise.all(targets.map(async sid => {
+      const peerFailures: Array<{ sid: string; file: File }> = []
+      for (const file of files) {
+        try {
+          if (!await sendFileToPeer(file, sid)) peerFailures.push({ sid, file })
+        } catch {
+          peerFailures.push({ sid, file })
+        }
+      }
+      return peerFailures
+    }))).flat()
     if (failures.length === jobs.length) {
       throw new Error(`群发失败：${jobs.length} 个目标全部未送达`)
     }
@@ -1278,6 +1751,19 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
         selectedSessionId: s.selectedSessionId === sessionId ? null : s.selectedSessionId,
       }
     })
+    // Finding 2 (13th independent review): a local teardown must retire the
+    // one-shot encrypted-session-rebuild guard along with everything else —
+    // `cleanupPeerConnection` bumps the peer generation (which correctly
+    // fails any in-flight rebuild's later checks) but deliberately never
+    // touches this set itself, because the rebuild branch above adds to it
+    // and THEN calls `cleanupPeerConnection` as part of arming its own
+    // one-shot attempt; clearing it inside `cleanupPeerConnection` would
+    // erase that guard the instant it was set. So every OTHER teardown path
+    // (PEER_LEFT, reconnectPeer, and this one) clears it explicitly instead.
+    // Without this, a stale guard survives a block and a later
+    // rejoin/unblock under the same sessionId could never arm recovery
+    // again.
+    initialEncryptedSessionRebuilds.delete(sessionId)
     cleanupPeerConnection(sessionId)
   },
 
@@ -1393,6 +1879,8 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
   },
 
   async reconnectPeer(sessionId) {
+    const epoch = networkEpoch
+    initialEncryptedSessionRebuilds.delete(sessionId)
     // Tear the dead PC down explicitly — recoverConnections() rate-limits to
     // 1.5s and may no-op if the user is mashing the button. This path is
     // explicit user intent, so bypass the throttle for this specific peer.
@@ -1402,15 +1890,25 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
         p.sessionId === sessionId ? { ...p, status: 'connecting' as const } : p,
       ),
     }))
+    const task = initiateWebRTC(sessionId)
+    const attempt: PeerGenerationAttempt = {
+      peerSessionId: sessionId,
+      epoch,
+      gen: peerGeneration(sessionId),
+    }
     try {
-      await initiateWebRTC(sessionId)
+      await task
     } catch (err) {
+      if (!isPeerGenerationAttemptCurrent(attempt)) return
       console.warn('[net] reconnectPeer failed', err)
-      useNetworkStore.setState(s => ({
-        peers: s.peers.map(p =>
-          p.sessionId === sessionId ? { ...p, status: 'offline' as const } : p,
-        ),
-      }))
+      useNetworkStore.setState(s => {
+        if (!isPeerGenerationAttemptCurrent(attempt)) return s
+        return {
+          peers: s.peers.map(p =>
+            p.sessionId === sessionId ? { ...p, status: 'offline' as const } : p,
+          ),
+        }
+      })
     }
   },
 }))
@@ -1548,7 +2046,7 @@ async function sendFileToPeer(file: File, peerSessionId: string, displayName = f
     sendingFiles.set(transferId, file)
     const outcome = await engineSendFileParallel(
       dcs, file, transferId, peerNodeId, peerSessionId, undefined, callbacks,
-      undefined, networkEpoch,
+      undefined, networkEpoch, displayName,
     )
     transferDelivery.set(transferId, outcome.state)
     // BUG-016: hold the source File until the receiver confirms a DURABLE
@@ -1630,13 +2128,64 @@ function initiateWebRTC(peerSessionId: string): Promise<void> {
 
 /** Close a PeerConnection this attempt built but is no longer allowed to use. */
 function abandonPeerConnection(peerSessionId: string, pc: RTCPeerConnection) {
-  if (peerConnections.get(peerSessionId) === pc) peerConnections.delete(peerSessionId)
+  if (peerConnections.get(peerSessionId) === pc) {
+    peerConnections.delete(peerSessionId)
+    invalidatePeerSignalingIncarnation(peerSessionId)
+  }
   try { pc.close() } catch { /* already dead */ }
+}
+
+function installIceCandidateHandler(attempt: PeerConnectionAttempt) {
+  const { pc, peerSessionId } = attempt
+  pc.onicecandidate = (event) => {
+    if (!isPeerConnectionAttemptCurrent(attempt)) return
+    if (event.candidate) {
+      wsSend({
+        t: 'SIGNAL_ICE',
+        targetSessionId: peerSessionId,
+        candidate: event.candidate.toJSON(),
+      })
+    } else {
+      // null marks end-of-candidates — tell peer so its ICE agent can stop
+      // waiting for stragglers and finalize connectivity checks faster. An
+      // empty candidate is scoped to one media description, so preserve every
+      // local m-line locator instead of implicitly selecting the first one.
+      for (const candidate of endOfCandidateMarkersFor(pc)) {
+        wsSend({ t: 'SIGNAL_ICE_END', targetSessionId: peerSessionId, candidate })
+      }
+    }
+  }
+}
+
+function sendLocalOffer(
+  peerSessionId: string,
+  pc: RTCPeerConnection,
+  sdp: RTCSessionDescriptionInit,
+) {
+  if (peerConnections.get(peerSessionId) !== pc) return
+  const localOfferToken = (peerLocalOfferTokens.get(peerSessionId) ?? 0) + 1
+  peerLocalOfferTokens.set(peerSessionId, localOfferToken)
+  const pendingGroups = pendingRemoteIce.get(peerSessionId)
+  if (pendingGroups) {
+    for (const pending of pendingGroups.values()) {
+      if (
+        pending.epoch === networkEpoch
+        && pending.incarnation === peerSignalingIncarnation(peerSessionId)
+        && pending.localOfferToken === null
+      ) {
+        // No-ufrag candidates that preceded a local fallback are bound to its
+        // first published offer. A later restart offer on the same PC cannot
+        // accidentally consume them.
+        pending.localOfferToken = localOfferToken
+      }
+    }
+  }
+  wsSend({ t: 'SIGNAL_SDP', targetSessionId: peerSessionId, sdp })
 }
 
 async function initiateWebRTCInner(peerSessionId: string, gen: number) {
   if (peerConnections.has(peerSessionId)) return
-  const epoch = networkEpoch
+  const generationAttempt = captureGenerationAttempt(peerSessionId, gen)
 
   // BUG-004: never build a PC (and burn an offer) before signaling is
   // authenticated AND joined — `wsSend` drops silently while the socket is
@@ -1644,65 +2193,55 @@ async function initiateWebRTCInner(peerSessionId: string, gen: number) {
   if (!await whenSignalingReady()) {
     throw new Error('信令尚未就绪，暂时无法建立连接')
   }
-  if (epoch !== networkEpoch || !isCurrentGeneration(peerSessionId, gen)) return
+  if (!isPeerGenerationAttemptCurrent(generationAttempt)) return
 
   // Without this, the first PC after WELCOME is built before the auto-TURN
   // credential fetch resolves — symmetric-NAT peers get a non-relay PC,
   // first ICE round fails, only the second restart attempt (~5s later) has
   // TURN. Wait briefly for credentials so the very first handshake has them.
   await ensureAutoTurnReady()
-  if (epoch !== networkEpoch || !isCurrentGeneration(peerSessionId, gen)) return
+  if (!isPeerGenerationAttemptCurrent(generationAttempt)) return
   if (peerConnections.has(peerSessionId)) return
 
   const pc = createPeerConnection()
   installIceErrorListener(pc)
   peerConnections.set(peerSessionId, pc)
+  const attempt = capturePeerConnectionAttempt(peerSessionId, pc, gen)
 
   const dc = createDataChannel(pc)
   dataChannels.set(peerSessionId, dc)
   notifyPrimaryChannel(peerSessionId)
-  setupDataChannel(dc, peerSessionId)
+  setupDataChannel(dc, attempt)
   for (let i = 0; i < TRANSFER_LANE_COUNT; i++) {
     const lane = createDataChannel(pc, `misaka-transfer-${i}`)
     const lanes = transferLanes.get(peerSessionId) ?? []
     lanes.push(lane)
     transferLanes.set(peerSessionId, lanes)
-    setupDataChannel(lane, peerSessionId)
+    setupDataChannel(lane, attempt)
   }
 
+  // Install guarded trickle/state callbacks and the bounded watchdog before
+  // key generation. A slow/failing WebCrypto operation must not leave an
+  // otherwise-created PC outside the same actionable recovery deadline.
+  installIceCandidateHandler(attempt)
+  pc.oniceconnectionstatechange = () => handleIceStateChange(attempt)
+  scheduleInitialIceRecovery(pc, peerSessionId)
+
   await generateECDHKeyPair(peerSessionId)
-  if (epoch !== networkEpoch || peerConnections.get(peerSessionId) !== pc) {
+  if (!isPeerConnectionAttemptCurrent(attempt)) {
     abandonPeerConnection(peerSessionId, pc)
     return
   }
 
-  pc.onicecandidate = (e) => {
-    if (e.candidate) {
-      wsSend({ t: 'SIGNAL_ICE', targetSessionId: peerSessionId, candidate: e.candidate.toJSON() })
-    } else {
-      // null marks end-of-candidates — tell peer so its ICE agent can stop
-      // waiting for stragglers and finalize connectivity checks faster.
-      wsSend({ t: 'SIGNAL_ICE_END', targetSessionId: peerSessionId })
-    }
-  }
-
-  pc.oniceconnectionstatechange = () => handleIceStateChange(pc, peerSessionId)
-
-  const offer = await createOffer(pc)
+  const offer = await createOffer(pc, () => isPeerConnectionAttemptCurrent(attempt))
   // Superseded while the browser was building the offer: the SDP belongs to a
   // connection nobody routes through any more, so publishing it would make
   // the remote answer the wrong PC.
-  if (epoch !== networkEpoch || peerConnections.get(peerSessionId) !== pc) {
+  if (!isPeerConnectionAttemptCurrent(attempt)) {
     abandonPeerConnection(peerSessionId, pc)
     return
   }
-  wsSend({ t: 'SIGNAL_SDP', targetSessionId: peerSessionId, sdp: offer })
-
-  const pending = pendingIceCandidates.get(peerSessionId)
-  if (pending) {
-    pendingIceCandidates.delete(peerSessionId)
-    for (const c of pending) await addIceCandidate(pc, c)
-  }
+  sendLocalOffer(peerSessionId, pc, offer)
 }
 
 // Perfect-negotiation tie-break: when both sides send offers at the same
@@ -1715,7 +2254,380 @@ function isPolite(peerSessionId: string): boolean {
   return my < peerSessionId
 }
 
-async function handleRemoteSDP(fromSessionId: string, fromNodeId: number, sdp: RTCSessionDescriptionInit) {
+interface RemoteIceDescription {
+  ufrags: Set<string>
+  byMid: Map<string, string>
+  byMLineIndex: Map<number, string>
+  indexByMid: Map<string, number>
+  midByMLineIndex: Map<number, string | null>
+}
+
+function remoteIceDescription(sdp: RTCSessionDescriptionInit): RemoteIceDescription {
+  const ufrags = new Set<string>()
+  const byMid = new Map<string, string>()
+  const byMLineIndex = new Map<number, string>()
+  const indexByMid = new Map<string, number>()
+  const midByMLineIndex = new Map<number, string | null>()
+  let sessionUfrag: string | null = null
+  let current: { index: number; mid: string | null; ufrag: string | null } | null = null
+  const media: Array<{ index: number; mid: string | null; ufrag: string | null }> = []
+
+  for (const rawLine of sdp.sdp?.split(/\r?\n/) ?? []) {
+    const line = rawLine.trim()
+    if (line.startsWith('m=')) {
+      current = { index: media.length, mid: null, ufrag: null }
+      media.push(current)
+    } else if (line.startsWith('a=mid:') && current) {
+      current.mid = line.slice('a=mid:'.length).trim() || null
+    } else if (line.startsWith('a=ice-ufrag:')) {
+      const ufrag = line.slice('a=ice-ufrag:'.length).trim()
+      if (!ufrag) continue
+      ufrags.add(ufrag)
+      if (current) current.ufrag = ufrag
+      else sessionUfrag = ufrag
+    }
+  }
+
+  if (sessionUfrag) ufrags.add(sessionUfrag)
+  for (const section of media) {
+    midByMLineIndex.set(section.index, section.mid)
+    if (section.mid !== null) indexByMid.set(section.mid, section.index)
+    const ufrag = section.ufrag ?? sessionUfrag
+    if (!ufrag) continue
+    ufrags.add(ufrag)
+    byMLineIndex.set(section.index, ufrag)
+    if (section.mid !== null) byMid.set(section.mid, ufrag)
+  }
+  return { ufrags, byMid, byMLineIndex, indexByMid, midByMLineIndex }
+}
+
+type CanonicalEndMarker =
+  | { status: 'match'; key: string; marker: RTCIceCandidateInit | null }
+  | { status: 'unknown' | 'conflict' }
+
+function canonicalEndOfCandidatesMarker(
+  marker: RTCIceCandidateInit | null,
+  description: RemoteIceDescription,
+): CanonicalEndMarker {
+  if (marker === null) {
+    return { status: 'match', key: 'legacy', marker: null }
+  }
+  const mid = marker.sdpMid ?? null
+  const suppliedIndex = marker.sdpMLineIndex ?? null
+  const midIndex = mid === null ? null : description.indexByMid.get(mid)
+  const indexKnown = suppliedIndex === null
+    ? false
+    : description.midByMLineIndex.has(suppliedIndex)
+
+  if (mid !== null && midIndex === undefined) return { status: 'unknown' }
+  if (suppliedIndex !== null && !indexKnown) return { status: 'unknown' }
+  if (midIndex != null && suppliedIndex !== null && midIndex !== suppliedIndex) {
+    return { status: 'conflict' }
+  }
+
+  const index = suppliedIndex ?? midIndex
+  if (index == null) return { status: 'unknown' }
+  return {
+    status: 'match',
+    key: `mline:${index}`,
+    marker: {
+      candidate: '',
+      sdpMid: description.midByMLineIndex.get(index) ?? mid,
+      sdpMLineIndex: index,
+      ...(marker.usernameFragment != null
+        ? { usernameFragment: marker.usernameFragment }
+        : {}),
+    },
+  }
+}
+
+function candidateCompatibleWithRemoteSdp(
+  candidate: RTCIceCandidateInit,
+  sdp: RTCSessionDescriptionInit,
+  options: {
+    groupBindingProven?: boolean
+    groupUfrag?: string | null
+  } = {},
+): boolean {
+  const ufrag = candidate.usernameFragment
+  const description = remoteIceDescription(sdp)
+  const locatorUfrags: string[] = []
+  if (candidate.sdpMid != null && candidate.sdpMLineIndex != null) {
+    const locatedIndex = description.indexByMid.get(candidate.sdpMid)
+    if (locatedIndex === undefined || locatedIndex !== candidate.sdpMLineIndex) return false
+  }
+  if (candidate.sdpMid != null) {
+    const expected = description.byMid.get(candidate.sdpMid)
+    if (expected === undefined) return false
+    locatorUfrags.push(expected)
+  }
+  if (candidate.sdpMLineIndex != null) {
+    const expected = description.byMLineIndex.get(candidate.sdpMLineIndex)
+    if (expected === undefined) return false
+    locatorUfrags.push(expected)
+  }
+  if (ufrag != null) {
+    return locatorUfrags.length > 0
+      ? locatorUfrags.every(expected => expected === ufrag)
+      : description.ufrags.has(ufrag)
+  }
+  if (locatorUfrags.length === 0) return options.groupBindingProven === true
+  const locatedUfrag = locatorUfrags[0]
+  if (!locatorUfrags.every(expected => expected === locatedUfrag)) return false
+  return options.groupUfrag == null || options.groupUfrag === locatedUfrag
+}
+
+function recordPendingRemoteIceOverflow(
+  peerSessionId: string,
+  kind: 'group' | 'candidate',
+): void {
+  const previous = pendingRemoteIceOverflow.get(peerSessionId)
+  const next: PendingRemoteIceOverflowState = {
+    groupDrops: (previous?.groupDrops ?? 0) + (kind === 'group' ? 1 : 0),
+    candidateDrops: (previous?.candidateDrops ?? 0) + (kind === 'candidate' ? 1 : 0),
+    lastKind: kind,
+  }
+  pendingRemoteIceOverflow.set(peerSessionId, next)
+  console.warn('[net] pending remote ICE overflow', peerSessionId, {
+    kind,
+    limit: kind === 'group'
+      ? MAX_PENDING_REMOTE_ICE_GROUPS
+      : MAX_PENDING_REMOTE_ICE_CANDIDATES_PER_GROUP,
+  })
+}
+
+function pendingRemoteIceGroup(receipt: SignalReceipt): PendingRemoteIceGroup | null {
+  const negotiationToken = receipt.pendingRemoteNegotiationToken
+  const key = receipt.remoteIceGroupKey
+  if (negotiationToken === null || key === null) return null
+  let groups = pendingRemoteIce.get(receipt.peerSessionId)
+  if (!groups) {
+    groups = new Map()
+    pendingRemoteIce.set(receipt.peerSessionId, groups)
+  }
+  const existing = groups.get(key)
+  if (existing) return existing
+
+  if (groups.size >= MAX_PENDING_REMOTE_ICE_GROUPS) {
+    recordPendingRemoteIceOverflow(receipt.peerSessionId, 'group')
+    return null
+  }
+  const group: PendingRemoteIceGroup = {
+    epoch: receipt.epoch,
+    incarnation: receipt.incarnation,
+    negotiationToken,
+    key,
+    ufrag: receipt.remoteIceUfrag,
+    // Usually null here and bound by sendLocalOffer. If a no-PC receipt was
+    // delayed in the per-peer queue until after fallback published, bind it
+    // to that already-current offer rather than an arbitrary later restart.
+    localOfferToken: receipt.originatingPc === null
+      ? peerLocalOfferTokens.get(receipt.peerSessionId) ?? null
+      : receipt.localOfferToken,
+    candidates: [],
+    endOfCandidates: [],
+    sequence: ++pendingRemoteIceSequence,
+  }
+  groups.set(key, group)
+  return group
+}
+
+function exactPendingRemoteIceGroup(receipt: SignalReceipt): PendingRemoteIceGroup | null {
+  if (
+    receipt.remoteIceGroupKey === null
+    || receipt.pendingRemoteNegotiationToken === null
+  ) return null
+  const group = pendingRemoteIce.get(receipt.peerSessionId)?.get(receipt.remoteIceGroupKey)
+  if (
+    !group
+    || group.epoch !== receipt.epoch
+    || group.incarnation !== receipt.incarnation
+    || group.negotiationToken !== receipt.pendingRemoteNegotiationToken
+  ) return null
+  return group
+}
+
+function recordPendingEndOfCandidates(
+  group: PendingRemoteIceGroup,
+  marker: RTCIceCandidateInit | null,
+): void {
+  if (marker === null) {
+    if (!group.endOfCandidates.includes(null)) group.endOfCandidates.push(null)
+    return
+  }
+
+  let merged = marker
+  const retained: Array<RTCIceCandidateInit | null> = []
+  for (const current of group.endOfCandidates) {
+    if (current === null) {
+      retained.push(current)
+      continue
+    }
+    const sharesMid = merged.sdpMid != null
+      && current.sdpMid != null
+      && merged.sdpMid === current.sdpMid
+    const sharesIndex = merged.sdpMLineIndex != null
+      && current.sdpMLineIndex != null
+      && merged.sdpMLineIndex === current.sdpMLineIndex
+    const midConflict = merged.sdpMid != null
+      && current.sdpMid != null
+      && merged.sdpMid !== current.sdpMid
+    const indexConflict = merged.sdpMLineIndex != null
+      && current.sdpMLineIndex != null
+      && merged.sdpMLineIndex !== current.sdpMLineIndex
+    if ((sharesMid || sharesIndex) && !midConflict && !indexConflict) {
+      merged = {
+        candidate: '',
+        sdpMid: merged.sdpMid ?? current.sdpMid ?? null,
+        sdpMLineIndex: merged.sdpMLineIndex ?? current.sdpMLineIndex ?? null,
+        usernameFragment: merged.usernameFragment ?? current.usernameFragment ?? null,
+      }
+    } else {
+      retained.push(current)
+    }
+  }
+  retained.push(merged)
+  group.endOfCandidates = retained
+}
+
+function receiptGroupMatchesInstalledSdp(
+  receipt: SignalReceipt,
+  pc: RTCPeerConnection,
+): boolean {
+  if (!pc.remoteDescription || receipt.pendingRemoteNegotiationToken === null) return false
+  if (receipt.remoteIceUfrag !== null) {
+    return remoteIceDescription(pc.remoteDescription).ufrags.has(receipt.remoteIceUfrag)
+  }
+  return installedRemoteNegotiationTokens.get(receipt.peerSessionId)
+    === receipt.pendingRemoteNegotiationToken
+}
+
+function rebindPendingRemoteOfferIce(
+  receipt: SignalReceipt,
+  remoteSdp: RTCSessionDescriptionInit,
+): void {
+  if (
+    receipt.pendingRemoteNegotiationToken === null
+    || receipt.localOfferToken === null
+  ) return
+  const groups = pendingRemoteIce.get(receipt.peerSessionId)
+  if (!groups) return
+  const description = remoteIceDescription(remoteSdp)
+  for (const group of groups.values()) {
+    if (
+      group.epoch !== receipt.epoch
+      || group.incarnation !== receipt.incarnation
+      || group.negotiationToken !== receipt.pendingRemoteNegotiationToken
+      || group.ufrag === null
+      || !description.ufrags.has(group.ufrag)
+      || !group.candidates.every(candidate => (
+        candidateCompatibleWithRemoteSdp(candidate, remoteSdp, {
+          groupBindingProven: true,
+          groupUfrag: group.ufrag,
+        })
+      ))
+    ) continue
+    group.localOfferToken = receipt.localOfferToken
+  }
+}
+
+async function drainPendingRemoteIce(
+  receipt: SignalReceipt,
+  remoteSdp: RTCSessionDescriptionInit,
+  attempt: PeerConnectionAttempt,
+) {
+  const groups = pendingRemoteIce.get(receipt.peerSessionId)
+  const negotiationToken = receipt.pendingRemoteNegotiationToken
+  if (negotiationToken !== null) {
+    installedRemoteNegotiationTokens.set(receipt.peerSessionId, negotiationToken)
+  }
+  if (!groups || negotiationToken === null) {
+    retireUnusedPendingRemoteToken(receipt)
+    return
+  }
+  const receiptStillCurrent = () => (
+    receipt.epoch === networkEpoch
+    && receipt.incarnation === peerSignalingIncarnation(receipt.peerSessionId)
+  )
+
+  const description = remoteIceDescription(remoteSdp)
+  const orderedGroups = [...groups.values()].sort((a, b) => a.sequence - b.sequence)
+  for (const group of orderedGroups) {
+    if (
+      group.epoch !== receipt.epoch
+      || group.incarnation !== receipt.incarnation
+      || group.negotiationToken !== negotiationToken
+      || (
+        group.localOfferToken !== null
+        && receipt.localOfferToken !== group.localOfferToken
+      )
+    ) continue
+    const groupMatches = group.ufrag !== null
+      ? description.ufrags.has(group.ufrag)
+      : group.negotiationToken === negotiationToken
+    if (!groupMatches) continue
+    if (!receiptStillCurrent() || !isPeerConnectionAttemptCurrent(attempt)) return
+
+    const matchingCandidates = group.candidates.filter(candidate => (
+      candidateCompatibleWithRemoteSdp(candidate, remoteSdp, {
+        groupBindingProven: true,
+        groupUfrag: group.ufrag,
+      })
+    ))
+    group.candidates = group.candidates.filter(candidate => !matchingCandidates.includes(candidate))
+    for (const candidate of matchingCandidates) {
+      if (!receiptStillCurrent() || !isPeerConnectionAttemptCurrent(attempt)) return
+      try {
+        await addIceCandidate(attempt.pc, candidate)
+      } catch (err) {
+        if (!receiptStillCurrent() || !isPeerConnectionAttemptCurrent(attempt)) return
+        console.warn('[net] addIceCandidate failed', err)
+      }
+    }
+    if (
+      group.endOfCandidates.length > 0
+      && group.candidates.length === 0
+      && receiptStillCurrent()
+      && isPeerConnectionAttemptCurrent(attempt)
+    ) {
+      const matchingMarkers = group.endOfCandidates.filter(marker => (
+        marker === null
+        || candidateCompatibleWithRemoteSdp(marker, remoteSdp, {
+          groupBindingProven: true,
+          groupUfrag: group.ufrag,
+        })
+      ))
+      const conflictingMarkers = group.endOfCandidates.filter(marker => (
+        canonicalEndOfCandidatesMarker(marker, description).status === 'conflict'
+      ))
+      group.endOfCandidates = group.endOfCandidates.filter(marker => (
+        !matchingMarkers.includes(marker) && !conflictingMarkers.includes(marker)
+      ))
+      const canonicalMarkers = new Map<string, RTCIceCandidateInit | null>()
+      for (const marker of matchingMarkers) {
+        const canonical = canonicalEndOfCandidatesMarker(marker, description)
+        if (canonical.status === 'match' && !canonicalMarkers.has(canonical.key)) {
+          canonicalMarkers.set(canonical.key, canonical.marker)
+        }
+      }
+      for (const marker of canonicalMarkers.values()) {
+        if (!receiptStillCurrent() || !isPeerConnectionAttemptCurrent(attempt)) return
+        try {
+          await attempt.pc.addIceCandidate(endOfCandidatesFor(attempt.pc, marker ?? undefined))
+        } catch { /* some browsers reject the marker; harmless */ }
+      }
+    }
+    if (group.candidates.length === 0 && group.endOfCandidates.length === 0) {
+      groups.delete(group.key)
+    }
+  }
+  if (groups.size === 0) pendingRemoteIce.delete(receipt.peerSessionId)
+  retireUnusedPendingRemoteToken(receipt)
+}
+
+async function handleRemoteSDP(receipt: SignalReceipt, fromNodeId: number, sdp: RTCSessionDescriptionInit) {
+  const { peerSessionId: fromSessionId } = receipt
+  const receivedEpoch = networkEpoch
   // P1-3: defer SDP processing until we know our own sessionId. The polite/
   // impolite tie-break is computed against mySessionId — if an SDP arrives
   // before WELCOME finishes processing, mySessionId is null and isPolite()
@@ -1728,15 +2640,58 @@ async function handleRemoteSDP(fromSessionId: string, fromNodeId: number, sdp: R
     const start = Date.now()
     while (useNetworkStore.getState().mySessionId === null && Date.now() - start < 3000) {
       await new Promise(r => setTimeout(r, 20))
+      if (receivedEpoch !== networkEpoch) return
     }
     if (useNetworkStore.getState().mySessionId === null) {
       console.warn('[net] handleRemoteSDP gave up waiting for WELCOME — dropping', fromSessionId, sdp.type)
       return
     }
   }
+  if (receivedEpoch !== networkEpoch) return
+
+  // A valid inbound offer is also authoritative evidence that this session is
+  // in our cluster. Publish the roster row before the TURN/key awaits so every
+  // continuation can use the same peer-attempt predicate.
+  if (sdp.type === 'offer') {
+    useNetworkStore.setState(s => {
+      if (receivedEpoch !== networkEpoch || s.peers.some(p => p.sessionId === fromSessionId)) return s
+      const peer: Peer = {
+        sessionId: fromSessionId,
+        nodeId: fromNodeId,
+        status: 'connecting',
+        channelType: 'direct',
+        joinedAt: Date.now(),
+      }
+      return { peers: [...s.peers, peer] }
+    })
+  }
+  if (!useNetworkStore.getState().peers.some(peer => peer.sessionId === fromSessionId)) return
 
   let pc = peerConnections.get(fromSessionId)
   if (sdp.type === 'offer') remoteInitiatingPeers.delete(fromSessionId)
+
+  if (pc && sdp.type === 'offer' && !hasAESKey(fromSessionId)) {
+    const peerStatus = useNetworkStore.getState().peers
+      .find(peer => peer.sessionId === fromSessionId)?.status
+    const transportReadyButUnencrypted = pc.signalingState === 'stable'
+      && (
+        pc.iceConnectionState === 'connected'
+        || pc.iceConnectionState === 'completed'
+      )
+    if (
+      peerStatus === 'offline'
+      || peerStatus === 'reconnecting'
+      || transportReadyButUnencrypted
+    ) {
+      // A manual reconnect creates a new PC/generation on the initiator. If
+      // this side keeps its earlier ICE-connected-but-unencrypted PC, the new
+      // SDP can restart ICE while retaining the wedged SCTP/ECDH association,
+      // and both UIs fall back to offline again. Treat a fresh offer from an
+      // already failed encrypted channel as a generation boundary here too.
+      cleanupPeerConnection(fromSessionId, { failQueuedMessages: false })
+      pc = undefined
+    }
+  }
 
   if (!pc && sdp.type !== 'offer') {
     console.warn('[net] ignoring SDP without peer connection', fromSessionId, sdp.type)
@@ -1747,12 +2702,22 @@ async function handleRemoteSDP(fromSessionId: string, fromNodeId: number, sdp: R
     // Inbound offer from a peer who joined before us — accept it.
     // Same pre-warm rationale as initiateWebRTC: ensures the answerer
     // also has TURN servers in its first PC.
+    const gen = bumpPeerGeneration(fromSessionId)
+    const generationAttempt: PeerGenerationAttempt = {
+      peerSessionId: fromSessionId,
+      epoch: receivedEpoch,
+      gen,
+    }
     await ensureAutoTurnReady()
+    if (!isPeerGenerationAttemptCurrent(generationAttempt)) return
+    if (peerConnections.has(fromSessionId)) return
     pc = createPeerConnection()
     installIceErrorListener(pc)
     peerConnections.set(fromSessionId, pc)
+    const createdAttempt: PeerConnectionAttempt = { ...generationAttempt, pc }
 
     pc.ondatachannel = (e) => {
+      if (!isPeerConnectionAttemptCurrent(createdAttempt)) return
       if (e.channel.label.startsWith('misaka-transfer-')) {
         // P2-9: de-duplicate. After an ICE restart the answerer's
         // ondatachannel fires again for the same labels; without this guard
@@ -1774,32 +2739,25 @@ async function handleRemoteSDP(fromSessionId: string, fromNodeId: number, sdp: R
         dataChannels.set(fromSessionId, e.channel)
         notifyPrimaryChannel(fromSessionId)
       }
-      setupDataChannel(e.channel, fromSessionId)
+      setupDataChannel(e.channel, createdAttempt)
     }
 
-    pc.onicecandidate = (e) => {
-      if (e.candidate) {
-        wsSend({ t: 'SIGNAL_ICE', targetSessionId: fromSessionId, candidate: e.candidate.toJSON() })
-      } else {
-        wsSend({ t: 'SIGNAL_ICE_END', targetSessionId: fromSessionId })
-      }
-    }
+    installIceCandidateHandler(createdAttempt)
 
-    pc.oniceconnectionstatechange = () => handleIceStateChange(pc!, fromSessionId)
+    pc.oniceconnectionstatechange = () => handleIceStateChange(createdAttempt)
+    // The answerer can wedge before ICE emits `checking` too; cover the whole
+    // initial negotiation window on both sides.
+    scheduleInitialIceRecovery(pc, fromSessionId)
 
     await generateECDHKeyPair(fromSessionId)
-
-    // Make sure the peer is in our radar (PEER_JOINED may have arrived before
-    // the SDP, but on race we surface them here too).
-    useNetworkStore.setState(s => {
-      if (s.peers.some(p => p.sessionId === fromSessionId)) return s
-      const peer: Peer = {
-        sessionId: fromSessionId, nodeId: fromNodeId,
-        status: 'connecting', channelType: 'direct', joinedAt: Date.now(),
-      }
-      return { peers: [...s.peers, peer] }
-    })
+    if (!isPeerConnectionAttemptCurrent(createdAttempt)) {
+      abandonPeerConnection(fromSessionId, pc)
+      return
+    }
   }
+
+  const attempt = capturePeerConnectionAttempt(fromSessionId, pc)
+  if (!isPeerConnectionAttemptCurrent(attempt)) return
 
   if (sdp.type === 'offer') {
     // Glare: an offer arrives while we already have a local offer outstanding
@@ -1811,7 +2769,10 @@ async function handleRemoteSDP(fromSessionId: string, fromNodeId: number, sdp: R
         // Polite: roll back our outstanding offer, then accept theirs.
         try {
           await pc.setLocalDescription({ type: 'rollback' } as RTCSessionDescriptionInit)
+          if (!isPeerConnectionAttemptCurrent(attempt)) return
+          rebindPendingRemoteOfferIce(receipt, sdp)
         } catch (err) {
+          if (!isPeerConnectionAttemptCurrent(attempt)) return
           console.warn('[net] glare rollback failed', err)
           return
         }
@@ -1821,61 +2782,131 @@ async function handleRemoteSDP(fromSessionId: string, fromNodeId: number, sdp: R
         return
       }
     }
-    const answer = await createAnswer(pc, sdp)
+    const answer = await createAnswer(pc, sdp, () => isPeerConnectionAttemptCurrent(attempt))
+    if (!isPeerConnectionAttemptCurrent(attempt)) return
     wsSend({ t: 'SIGNAL_SDP', targetSessionId: fromSessionId, sdp: answer })
   } else {
+    if (!isPeerConnectionAttemptCurrent(attempt)) return
     if (pc.signalingState !== 'have-local-offer') {
       console.warn('[net] ignoring stale SDP answer', fromSessionId, pc.signalingState)
       return
     }
-    await applyAnswer(pc, sdp)
+    await applyAnswer(pc, sdp, () => isPeerConnectionAttemptCurrent(attempt))
+    if (!isPeerConnectionAttemptCurrent(attempt)) return
   }
 
-  const pending = pendingIceCandidates.get(fromSessionId)
-  if (pending) {
-    pendingIceCandidates.delete(fromSessionId)
-    for (const c of pending) await addIceCandidate(pc, c)
-  }
+  if (!isPeerConnectionAttemptCurrent(attempt)) return
+  await drainPendingRemoteIce(receipt, sdp, attempt)
 }
 
-async function handleRemoteICE(fromSessionId: string, candidate: RTCIceCandidateInit) {
+async function handleRemoteICE(receipt: SignalReceipt, candidate: RTCIceCandidateInit) {
+  const { peerSessionId: fromSessionId } = receipt
   const pc = peerConnections.get(fromSessionId)
-  if (pc?.remoteDescription) {
+  const groupMatchesInstalled = Boolean(
+    pc?.remoteDescription && receiptGroupMatchesInstalledSdp(receipt, pc),
+  )
+  const matchesInstalled = Boolean(
+    pc?.remoteDescription
+    && candidateCompatibleWithRemoteSdp(candidate, pc.remoteDescription, {
+      groupBindingProven: groupMatchesInstalled || receipt.remoteIceGroupKey === null,
+      groupUfrag: receipt.remoteIceUfrag,
+    }),
+  )
+  if (pc?.remoteDescription && matchesInstalled) {
+    const attempt = capturePeerConnectionAttempt(fromSessionId, pc)
+    if (!isPeerConnectionAttemptCurrent(attempt)) return
     // Wrap: addIceCandidate throws on closed pc / malformed candidate / unknown
     // sdpMid. Without try/catch the dispatch loop's forEach swallows the
     // rejection (unhandledrejection), and we'd never know one peer's bad IPv6
     // candidate was poisoning the whole session.
     try {
       await addIceCandidate(pc, candidate)
+      if (!isPeerConnectionAttemptCurrent(attempt)) return
     } catch (err) {
+      if (!isPeerConnectionAttemptCurrent(attempt)) return
       console.warn('[net] addIceCandidate failed', err)
     }
+    retireUnusedPendingRemoteToken(receipt)
   } else {
-    const pending = pendingIceCandidates.get(fromSessionId) ?? []
-    pending.push(candidate)
-    pendingIceCandidates.set(fromSessionId, pending)
+    const pending = pendingRemoteIceGroup(receipt)
+    if (!pending) return
+    if (pending.candidates.length >= MAX_PENDING_REMOTE_ICE_CANDIDATES_PER_GROUP) {
+      recordPendingRemoteIceOverflow(fromSessionId, 'candidate')
+      return
+    }
+    pending.candidates.push(candidate)
   }
 }
 
-async function handleRemoteICEEnd(fromSessionId: string) {
+async function handleRemoteICEEnd(receipt: SignalReceipt) {
+  const { peerSessionId: fromSessionId } = receipt
   const pc = peerConnections.get(fromSessionId)
-  if (!pc) return
+  if (!pc?.remoteDescription) {
+    const pending = pendingRemoteIceGroup(receipt)
+    if (pending) recordPendingEndOfCandidates(pending, receipt.remoteIceEndCandidate)
+    return
+  }
+
+  const pending = exactPendingRemoteIceGroup(receipt)
+  if (pending) {
+    recordPendingEndOfCandidates(pending, receipt.remoteIceEndCandidate)
+    const groupMatchesInstalled = receiptGroupMatchesInstalledSdp(receipt, pc)
+    const candidatesMatchInstalled = pending.candidates.every(candidate => (
+      candidateCompatibleWithRemoteSdp(candidate, pc.remoteDescription!, {
+        groupBindingProven: true,
+        groupUfrag: pending.ufrag,
+      })
+    ))
+    if (!groupMatchesInstalled || !candidatesMatchInstalled) return
+
+    const attempt = capturePeerConnectionAttempt(fromSessionId, pc)
+    if (!isPeerConnectionAttemptCurrent(attempt)) return
+    await drainPendingRemoteIce(receipt, pc.remoteDescription, attempt)
+    return
+  }
+
+  if (
+    receipt.remoteIceGroupKey !== null
+    && !receiptGroupMatchesInstalledSdp(receipt, pc)
+  ) {
+    const deferred = pendingRemoteIceGroup(receipt)
+    if (deferred) recordPendingEndOfCandidates(deferred, receipt.remoteIceEndCandidate)
+    return
+  }
+
+  const attempt = capturePeerConnectionAttempt(fromSessionId, pc)
+  if (!isPeerConnectionAttemptCurrent(attempt)) return
   // Empty-candidate marker per RFC 8445 §8.1.2 — signals the peer has
   // finished gathering. Browsers accept this to short-circuit waits.
-  if (!pc.remoteDescription) return // marker before SDP is meaningless
   // Firefox rejects sdpMid:'' — endOfCandidatesFor reads a real mid from
   // the PC's first transceiver so both Chrome and FF accept the marker.
-  try { await pc.addIceCandidate(endOfCandidatesFor(pc)) }
+  try {
+    await pc.addIceCandidate(endOfCandidatesFor(pc, receipt.remoteIceEndCandidate ?? undefined))
+    if (!isPeerConnectionAttemptCurrent(attempt)) return
+  }
   catch { /* some browsers still reject the marker; harmless */ }
+  retireUnusedPendingRemoteToken(receipt)
 }
 
-function handleIceStateChange(pc: RTCPeerConnection, peerSessionId: string) {
+function handleIceStateChange(attempt: PeerConnectionAttempt) {
+  const { pc, peerSessionId } = attempt
+  // A closed/replaced PC may still dispatch a queued state callback. It must
+  // not reset retry state or schedule work against the replacement.
+  if (!isPeerConnectionAttemptCurrent(attempt)) return
   const state = pc.iceConnectionState
   if (state === 'connected' || state === 'completed') {
+    // ICE alone is not a usable channel: the DataChannel/ECDH exchange can
+    // still wedge after a candidate pair is selected. Keep the first-
+    // connection watchdog alive until the AES key is actually installed.
+    if (hasAESKey(peerSessionId)) clearInitialIceRecovery(peerSessionId)
+    else scheduleInitialIceRecovery(pc, peerSessionId)
     clearDisconnectedTimer(peerSessionId)
     iceRestartAttempts.set(peerSessionId, 0)
-    void onIceConnected(pc, peerSessionId)
+    void onIceConnected(attempt)
+  } else if (state === 'checking') {
+    scheduleInitialIceRecovery(pc, peerSessionId)
   } else if (state === 'disconnected') {
+    clearInitialIceRecovery(peerSessionId)
     // Browsers (esp. mobile Safari + Chrome on Wi-Fi/cellular handoff) flap
     // ICE through 'disconnected' briefly before snapping back to 'connected'
     // on their own. Flipping status='reconnecting' synchronously caused a
@@ -1886,15 +2917,18 @@ function handleIceStateChange(pc: RTCPeerConnection, peerSessionId: string) {
     if (!disconnectedTimers.has(peerSessionId)) {
       const t = setTimeout(() => {
         disconnectedTimers.delete(peerSessionId)
-        const cur = peerConnections.get(peerSessionId)
-        if (!cur) return
-        if (cur.iceConnectionState !== 'disconnected' && cur.iceConnectionState !== 'failed') return
+        if (!isPeerConnectionAttemptCurrent(attempt)) return
+        if (pc.iceConnectionState !== 'disconnected' && pc.iceConnectionState !== 'failed') return
         const prevStatus = useNetworkStore.getState().peers.find(p => p.sessionId === peerSessionId)?.status
-        useNetworkStore.setState(s => ({
-          peers: s.peers.map(p =>
-            p.sessionId === peerSessionId ? { ...p, status: 'reconnecting' as NodeStatus } : p,
-          ),
-        }))
+        useNetworkStore.setState(s => {
+          if (!isPeerConnectionAttemptCurrent(attempt)) return s
+          return {
+            peers: s.peers.map(p =>
+              p.sessionId === peerSessionId ? { ...p, status: 'reconnecting' as NodeStatus } : p,
+            ),
+          }
+        })
+        if (!isPeerConnectionAttemptCurrent(attempt)) return
         if (prevStatus === 'online' || prevStatus === 'transferring') {
           appendSystemChat(peerSessionId, '⚠ 连接中断，尝试恢复中…')
         }
@@ -1903,6 +2937,7 @@ function handleIceStateChange(pc: RTCPeerConnection, peerSessionId: string) {
       disconnectedTimers.set(peerSessionId, t)
     }
   } else if (state === 'failed') {
+    clearInitialIceRecovery(peerSessionId)
     clearDisconnectedTimer(peerSessionId)
     attemptIceRestart(peerSessionId)
   }
@@ -1916,66 +2951,286 @@ function clearDisconnectedTimer(peerSessionId: string) {
   }
 }
 
-async function onIceConnected(pc: RTCPeerConnection, peerSessionId: string) {
-  const selectedPath = await getSelectedIcePath(pc)
-  const ct = selectedPath?.channelType ?? await getSelectedChannelType(pc)
-  useNetworkStore.setState(s => ({
-    peers: s.peers.map(p =>
-      p.sessionId === peerSessionId
-        ? {
-            ...p,
-            // UX-COPY-003: `Peer.status` is TRANSPORT state only. A healthy
-            // idle peer is 'online' — it used to be written as 'transferring'
-            // ("数据流注入中") the instant ICE connected, with no transfer in
-            // sight. The transfer layer is derived via `peerDisplayStatus()`.
-            status: 'online' as NodeStatus,
-            channelType: ct ?? 'stun',
-            icePath: selectedPath?.pathText,
-            icePathMeasuredAt: selectedPath?.pathText ? Date.now() : p.icePathMeasuredAt,
-          }
-        : p,
-    ),
-    connectedPeers: new Set([...s.connectedPeers, peerSessionId]),
-  }))
+function scheduleInitialIceRecovery(pc: RTCPeerConnection, peerSessionId: string) {
+  if (initialIceRecoveryTimers.has(peerSessionId)) return
+  const epoch = networkEpoch
+  const gen = peerGeneration(peerSessionId)
+  const timer = setTimeout(async () => {
+    initialIceRecoveryTimers.delete(peerSessionId)
+    if (!isInitialIceRecoveryCurrent(pc, peerSessionId, epoch, gen)) return
+    // Both sides observe the same bounded window, but only the deterministic
+    // polite side sends the restart offer. The other side merely re-observes,
+    // so a stalled pair can never create symmetric glare.
+    if (!isPolite(peerSessionId)) {
+      scheduleInitialIceReobservation(pc, peerSessionId, epoch, gen)
+      return
+    }
+    if (
+      pc.iceConnectionState === 'connected'
+      || pc.iceConnectionState === 'completed'
+    ) {
+      // ICE restart retains SCTP. Once transport is connected, a missing AES
+      // key means the DataChannel/ECDH layer is what wedged, so rebuild the
+      // entire session once instead of repeating an ineffective ICE restart.
+      if (initialEncryptedSessionRebuilds.has(peerSessionId)) {
+        markInitialIceRecoveryFailed(pc, peerSessionId, epoch, gen)
+        return
+      }
+      initialEncryptedSessionRebuilds.add(peerSessionId)
+      cleanupPeerConnection(peerSessionId, { failQueuedMessages: false })
+      useNetworkStore.setState(s => ({
+        peers: s.peers.map(peer =>
+          peer.sessionId === peerSessionId
+            ? { ...peer, status: 'connecting' as NodeStatus }
+            : peer,
+        ),
+      }))
+      // Freeze this rebuild attempt's identity the instant it starts.
+      // `initiateWebRTC` bumps the peer generation SYNCHRONOUSLY (before its
+      // first await — see its own contract comment), so reading
+      // `peerGeneration()` right after the call, and never again, captures
+      // exactly the generation this specific attempt owns. The `.catch()`
+      // below must judge the rejection against THIS frozen snapshot, never
+      // against `networkEpoch` / `peerGeneration()` read at rejection time —
+      // a late rejection would otherwise always look "current" (it's being
+      // compared against itself) and could misjudge a newer or manually
+      // rebuilt connection that has since taken over this peer.
+      const rebuildTask = initiateWebRTC(peerSessionId)
+      const rebuildAttempt: PeerGenerationAttempt = {
+        peerSessionId,
+        epoch: networkEpoch,
+        gen: peerGeneration(peerSessionId),
+      }
+      rebuildTask.catch(err => {
+        console.warn('[net] initial encrypted-session rebuild failed', peerSessionId, err)
+        // Stale rejection: the epoch ended, a newer attempt/generation has
+        // already superseded this one, the peer left the roster, or AES came
+        // up (through this or any other path) in the meantime. None of that
+        // is this rebuild attempt's business to react to.
+        if (!isRebuildRecoveryCurrent(rebuildAttempt)) return
+        const replacement = peerConnections.get(peerSessionId)
+        if (replacement) {
+          // A PC exists for this still-current attempt (built, but never
+          // finished negotiating) — reuse the normal PC-bound terminal path.
+          markInitialIceRecoveryFailed(replacement, peerSessionId, rebuildAttempt.epoch, rebuildAttempt.gen)
+        } else {
+          // `initiateWebRTC` rejected before it ever created a replacement PC
+          // (e.g. signaling never became ready again). There is no PC for the
+          // PC-bound path to check against, so without this branch the peer
+          // was left stuck at 'connecting' forever with no watchdog and no
+          // actionable retry. Transition directly instead.
+          markPeerRecoveryTerminal(peerSessionId)
+        }
+      })
+      return
+    }
+    if (pc.signalingState !== 'stable' || !isSignalingReady()) {
+      markInitialIceRecoveryFailed(pc, peerSessionId, epoch, gen)
+      return
+    }
+    try {
+      const offer = await pc.createOffer({ iceRestart: true })
+      if (!isInitialIceRecoveryCurrent(pc, peerSessionId, epoch, gen)) return
+      await pc.setLocalDescription(offer)
+      if (!isInitialIceRecoveryCurrent(pc, peerSessionId, epoch, gen)) return
+      sendLocalOffer(peerSessionId, pc, pc.localDescription!.toJSON())
+      scheduleInitialIceReobservation(pc, peerSessionId, epoch, gen)
+    } catch (err) {
+      console.warn('[net] initial ICE recovery failed', peerSessionId, err)
+      markInitialIceRecoveryFailed(pc, peerSessionId, epoch, gen)
+    }
+  }, INITIAL_ICE_RECOVERY_MS)
+  initialIceRecoveryTimers.set(peerSessionId, timer)
 }
 
-function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
+function isInitialIceRecoveryCurrent(
+  pc: RTCPeerConnection,
+  peerSessionId: string,
+  epoch: number,
+  gen: number,
+): boolean {
+  return epoch === networkEpoch
+    && isCurrentGeneration(peerSessionId, gen)
+    && useNetworkStore.getState().peers.some(peer => peer.sessionId === peerSessionId)
+    && peerConnections.get(peerSessionId) === pc
+    && !hasAESKey(peerSessionId)
+    && (
+      pc.iceConnectionState === 'new'
+      || pc.iceConnectionState === 'checking'
+      || pc.iceConnectionState === 'connected'
+      || pc.iceConnectionState === 'completed'
+    )
+}
+
+function scheduleInitialIceReobservation(
+  pc: RTCPeerConnection,
+  peerSessionId: string,
+  epoch: number,
+  gen: number,
+) {
+  clearInitialIceRecovery(peerSessionId)
+  const timer = setTimeout(() => {
+    initialIceRecoveryTimers.delete(peerSessionId)
+    if (!isInitialIceRecoveryCurrent(pc, peerSessionId, epoch, gen)) return
+    markInitialIceRecoveryFailed(pc, peerSessionId, epoch, gen)
+  }, INITIAL_ICE_REOBSERVE_MS)
+  initialIceRecoveryTimers.set(peerSessionId, timer)
+}
+
+function markInitialIceRecoveryFailed(
+  pc: RTCPeerConnection,
+  peerSessionId: string,
+  epoch: number,
+  gen: number,
+) {
+  if (!isInitialIceRecoveryCurrent(pc, peerSessionId, epoch, gen)) return
+  markPeerRecoveryTerminal(peerSessionId)
+}
+
+/**
+ * PC-independent terminal transition: same "give up, surface a real retry
+ * affordance" semantics as `markInitialIceRecoveryFailed`, but callable when
+ * there is no RTCPeerConnection to check identity against — e.g. a rebuild
+ * attempt (Finding 1) whose `initiateWebRTC()` call rejected before it ever
+ * created a replacement PC. Callers are responsible for verifying the
+ * attempt is still current (there is no PC to compare against here).
+ */
+function markPeerRecoveryTerminal(peerSessionId: string) {
+  clearInitialIceRecovery(peerSessionId)
+  useNetworkStore.setState(s => {
+    const connectedPeers = new Set(s.connectedPeers)
+    connectedPeers.delete(peerSessionId)
+    return {
+      peers: s.peers.map(p =>
+        p.sessionId === peerSessionId ? { ...p, status: 'offline' as NodeStatus } : p,
+      ),
+      connectedPeers,
+    }
+  })
+}
+
+/**
+ * Current-ness check for a rebuild attempt that may not have a PC to compare
+ * against (see `markPeerRecoveryTerminal`). Same identity fields as
+ * `isPeerConnectionAttemptCurrent` minus the PC-identity check, plus the
+ * same "AES already ready" bail-out `isInitialIceRecoveryCurrent` uses.
+ */
+function isRebuildRecoveryCurrent(attempt: PeerGenerationAttempt): boolean {
+  return isPeerGenerationAttemptCurrent(attempt) && !hasAESKey(attempt.peerSessionId)
+}
+
+function clearInitialIceRecovery(peerSessionId: string) {
+  const timer = initialIceRecoveryTimers.get(peerSessionId)
+  if (timer) clearTimeout(timer)
+  initialIceRecoveryTimers.delete(peerSessionId)
+}
+
+async function onIceConnected(attempt: PeerConnectionAttempt) {
+  const { pc, peerSessionId } = attempt
+  const stillCurrent = () => isPeerConnectionAttemptCurrent(attempt)
+  if (!stillCurrent()) return
+
+  const selectedPath = await getSelectedIcePath(pc)
+  if (!stillCurrent()) return
+  let ct = selectedPath?.channelType
+  if (!ct) {
+    ct = await getSelectedChannelType(pc)
+    if (!stillCurrent()) return
+  }
+  const encryptionReady = hasAESKey(peerSessionId)
+  useNetworkStore.setState(s => {
+    if (!stillCurrent()) return s
+    const connectedPeers = new Set(s.connectedPeers)
+    if (encryptionReady) connectedPeers.add(peerSessionId)
+    else connectedPeers.delete(peerSessionId)
+    return {
+      peers: s.peers.map(p =>
+        p.sessionId === peerSessionId
+          ? {
+              ...p,
+              // ICE diagnostics may be shown while ECDH is pending, but the
+              // terminal online state belongs to the encrypted channel.
+              status: (encryptionReady ? 'online' : 'connecting') as NodeStatus,
+              channelType: ct ?? 'stun',
+              icePath: selectedPath?.pathText,
+              icePathMeasuredAt: selectedPath?.pathText ? Date.now() : p.icePathMeasuredAt,
+            }
+          : p,
+      ),
+      connectedPeers,
+    }
+  })
+}
+
+function setupDataChannel(dc: RTCDataChannel, attempt: PeerConnectionAttempt) {
+  const { pc, peerSessionId } = attempt
   // Idempotency guard: in reconnect races the same channel instance may flow
   // through setup twice; avoid duplicate listeners / duplicate side effects.
   if (configuredDataChannels.has(dc)) return
   configuredDataChannels.add(dc)
+  const isTransferLane = dc.label.startsWith('misaka-transfer-')
+  const stillCurrent = () => {
+    if (!isPeerConnectionAttemptCurrent(attempt)) return false
+    return isTransferLane
+      ? (transferLanes.get(peerSessionId)?.includes(dc) ?? false)
+      : dataChannels.get(peerSessionId) === dc
+  }
+  let recoveryNoticePending = false
+
+  const publishEncryptedReady = () => {
+    if (!stillCurrent() || !hasAESKey(peerSessionId)) return false
+    initialEncryptedSessionRebuilds.delete(peerSessionId)
+    clearInitialIceRecovery(peerSessionId)
+    useNetworkStore.setState(s => {
+      if (!stillCurrent() || !hasAESKey(peerSessionId)) return s
+      return {
+        peers: s.peers.map(p =>
+          p.sessionId === peerSessionId ? { ...p, status: 'online' as const } : p,
+        ),
+        connectedPeers: new Set([...s.connectedPeers, peerSessionId]),
+      }
+    })
+    if (recoveryNoticePending) {
+      recoveryNoticePending = false
+      appendSystemChat(peerSessionId, '✓ 连接已恢复')
+    }
+    return true
+  }
 
   // Without this, incoming chunk bodies arrive as Blob and the
   // `instanceof ArrayBuffer` check below skips them silently.
   dc.binaryType = 'arraybuffer'
 
   dc.onclose = () => {
+    if (!stillCurrent()) return
     if (dc.readyState === 'closed') {
-      const pc = peerConnections.get(peerSessionId)
-      if (pc && pc.connectionState !== 'closed') {
+      if (pc.connectionState !== 'closed') {
         attemptIceRestart(peerSessionId)
       }
     }
   }
 
   const handleOpen = async () => {
+    if (!stillCurrent()) return
     // Show reconnection notice if there was prior chat activity.
     const prevMsgs = useNetworkStore.getState().chatMessages[peerSessionId] ?? []
     const isReconnect = prevMsgs.some(m => m.type !== 'system')
-    useNetworkStore.setState(s => ({
-      // Transport is up — see the UX-COPY-003 note in onIceConnected.
-      peers: s.peers.map(p =>
-        p.sessionId === peerSessionId ? { ...p, status: 'online' as const } : p,
-      ),
-      connectedPeers: new Set([...s.connectedPeers, peerSessionId]),
-    }))
-    // Only the primary channel announces reconnection. setupDataChannel also
-    // runs for all TRANSFER_LANE_COUNT lane channels; without this guard each
-    // of the 5 'open' handlers appended its own '✓ 连接已恢复' on one reconnect.
-    if (isReconnect && !dc.label.startsWith('misaka-transfer-')) {
-      appendSystemChat(peerSessionId, '✓ 连接已恢复')
-    }
-    if (!dc.label.startsWith('misaka-transfer-')) {
+    if (!isTransferLane) {
+      recoveryNoticePending = isReconnect
+      useNetworkStore.setState(s => {
+        if (!stillCurrent()) return s
+        const connectedPeers = new Set(s.connectedPeers)
+        if (!hasAESKey(peerSessionId)) connectedPeers.delete(peerSessionId)
+        return {
+          peers: s.peers.map(p =>
+            p.sessionId === peerSessionId
+              ? { ...p, status: hasAESKey(peerSessionId) ? 'online' as const : 'connecting' as const }
+              : p,
+          ),
+          connectedPeers,
+        }
+      })
+      publishEncryptedReady()
       try {
         // Protocol handshake first: `hello` tells the peer which delivery
         // semantics we implement. A v1 peer ignores the unknown message and
@@ -1984,6 +3239,7 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
       } catch { /* channel may already be dying */ }
       try {
         const pub = await getMyPublicKey(peerSessionId)
+        if (!stillCurrent()) return
         dc.send(JSON.stringify({ type: 'ecdh-pub', pub }))
       } catch (err) {
         console.warn('[net] ecdh-pub send failed', err)
@@ -2002,6 +3258,7 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
   }
 
   dc.onmessage = async (e) => {
+    if (!stillCurrent()) return
     const owner = ownerFor(peerSessionId)
     if (e.data instanceof ArrayBuffer) {
       const frame = decodeChunkFrame(e.data)
@@ -2083,6 +3340,10 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
 
         if (msg.type === 'ecdh-pub') {
           await setPeerPublicKey(peerSessionId, msg.pub)
+          if (!stillCurrent() || !hasAESKey(peerSessionId)) return
+          // The encrypted channel, rather than ICE/DataChannel alone, is the
+          // terminal success and recovery-publication boundary.
+          publishEncryptedReady()
           ecdhResolvers.get(peerSessionId)?.()
           flushOutgoing(peerSessionId, dc)
           sendResumeRequests(peerSessionId, dc)
@@ -2475,7 +3736,7 @@ async function runSendEngine(
   try {
     const outcome = await engineSendFileParallel(
       lanes, file, transferId, peerNodeId, peerSessionId, record ?? undefined,
-      undefined, peerBitmap, owner.epoch,
+      undefined, peerBitmap, owner.epoch, record?.fileName ?? file.name,
     )
     transferDelivery.set(transferId, outcome.state)
     // BUG-016: only release the retry source once the receiver confirmed a
@@ -2511,19 +3772,21 @@ function sendDurableAck(peerSessionId: string, transferId: string, bytes: number
 async function attemptIceRestart(peerSessionId: string) {
   if (iceRestarting.has(peerSessionId)) return
   const gen = peerGeneration(peerSessionId)
-  const epoch = networkEpoch
-  const stillCurrent = () =>
-    epoch === networkEpoch
-    && isCurrentGeneration(peerSessionId, gen)
-    && useNetworkStore.getState().peers.some(p => p.sessionId === peerSessionId)
+  const generationAttempt = captureGenerationAttempt(peerSessionId, gen)
+  const stillCurrent = () => isPeerGenerationAttemptCurrent(generationAttempt)
+  let pcAttempt: PeerConnectionAttempt | null = null
 
   const attempts = iceRestartAttempts.get(peerSessionId) ?? 0
   if (attempts >= MAX_ICE_RESTART_ATTEMPTS) {
-    useNetworkStore.setState(s => ({
-      peers: s.peers.map(p =>
-        p.sessionId === peerSessionId ? { ...p, status: 'offline' as NodeStatus } : p,
-      ),
-    }))
+    useNetworkStore.setState(s => {
+      if (!stillCurrent()) return s
+      return {
+        peers: s.peers.map(p =>
+          p.sessionId === peerSessionId ? { ...p, status: 'offline' as NodeStatus } : p,
+        ),
+      }
+    })
+    if (!stillCurrent()) return
     failPendingMessages(peerSessionId)
     appendSystemChat(peerSessionId, '连接已断开，未送达的消息可点击 ↺ 重试')
     return
@@ -2546,11 +3809,14 @@ async function attemptIceRestart(peerSessionId: string) {
     // The peer may have left / been blocked / been rebuilt while we slept.
     if (!stillCurrent()) return
 
-    useNetworkStore.setState(s => ({
-      peers: s.peers.map(p =>
-        p.sessionId === peerSessionId ? { ...p, status: 'reconnecting' as NodeStatus } : p,
-      ),
-    }))
+    useNetworkStore.setState(s => {
+      if (!stillCurrent()) return s
+      return {
+        peers: s.peers.map(p =>
+          p.sessionId === peerSessionId ? { ...p, status: 'reconnecting' as NodeStatus } : p,
+        ),
+      }
+    })
 
     const pc = peerConnections.get(peerSessionId)
     if (!pc || pc.connectionState === 'closed' || pc.connectionState === 'failed') {
@@ -2561,6 +3827,8 @@ async function attemptIceRestart(peerSessionId: string) {
       await initiateWebRTC(peerSessionId)
       return
     }
+    pcAttempt = capturePeerConnectionAttempt(peerSessionId, pc, gen)
+    const pcStillCurrent = () => pcAttempt !== null && isPeerConnectionAttemptCurrent(pcAttempt)
 
     // If we're not in 'stable', a restart offer would collide with an outstanding
     // local or inbound offer. Wait briefly for stable rather than skipping outright —
@@ -2576,7 +3844,7 @@ async function attemptIceRestart(peerSessionId: string) {
       }
       // Same re-check after the second await, plus PC identity: a manual
       // reconnect may have replaced the connection we were waiting on.
-      if (!stillCurrent() || peerConnections.get(peerSessionId) !== pc) return
+      if (!pcStillCurrent()) return
     }
     // Signaling must be back up, otherwise the restart offer is dropped by
     // `wsSend` and we've burned an attempt for nothing (BUG-004).
@@ -2584,20 +3852,29 @@ async function attemptIceRestart(peerSessionId: string) {
 
     iceRestartAttempts.set(peerSessionId, attempts + 1)
     const offer = await pc.createOffer({ iceRestart: true })
-    if (!stillCurrent() || peerConnections.get(peerSessionId) !== pc) return
+    if (!pcStillCurrent()) return
     await pc.setLocalDescription(offer)
-    if (!stillCurrent() || peerConnections.get(peerSessionId) !== pc) return
+    if (!pcStillCurrent()) return
     // Trickle — candidates will stream via onicecandidate. (Same fix as
     // createOffer/createAnswer: the `{ once: true }` gathering wait could
     // miss the `complete` event and hang the restart forever.)
-    wsSend({ t: 'SIGNAL_SDP', targetSessionId: peerSessionId, sdp: pc.localDescription!.toJSON() })
+    sendLocalOffer(peerSessionId, pc, pc.localDescription!.toJSON())
   } catch {
-    if (stillCurrent()) {
-      useNetworkStore.setState(s => ({
-        peers: s.peers.map(p =>
-          p.sessionId === peerSessionId ? { ...p, status: 'offline' as NodeStatus } : p,
-        ),
-      }))
+    const attemptCurrent = pcAttempt
+      ? isPeerConnectionAttemptCurrent(pcAttempt)
+      : stillCurrent()
+    if (attemptCurrent) {
+      useNetworkStore.setState(s => {
+        const current = pcAttempt
+          ? isPeerConnectionAttemptCurrent(pcAttempt)
+          : stillCurrent()
+        if (!current) return s
+        return {
+          peers: s.peers.map(p =>
+            p.sessionId === peerSessionId ? { ...p, status: 'offline' as NodeStatus } : p,
+          ),
+        }
+      })
     }
   } finally {
     if (iceRestarting.get(peerSessionId) === gen) iceRestarting.delete(peerSessionId)
@@ -2624,8 +3901,9 @@ async function deliverCompletedFile(transferId: string, peerSessionId: string) {
   deliveredTransfers.add(transferId)
 
   try {
-    const { file, bytes } = await finalizeReceive(transferId)
+    const { file, bytes, cleanup } = await finalizeReceive(transferId)
     const url = URL.createObjectURL(file)
+    artifactLifecycleByUrl.set(url, { cleanup, started: false })
     appendFileChat(peerSessionId, file.name, file.size, url)
     playSound('complete')
     cleanupTransferRecord(transferId)
@@ -2717,6 +3995,7 @@ async function sendResumeRequests(peerSessionId: string, dc: RTCDataChannel) {
 function cleanupPeerConnection(sessionId: string, options: { failQueuedMessages?: boolean } = {}) {
   const { failQueuedMessages = true } = options
   if (failQueuedMessages) failPendingMessages(sessionId)
+  invalidatePeerSignalingIncarnation(sessionId)
   // Anything still parked on an await for this peer (initiation, delayed ICE
   // restart, config migration) is now working on a dead connection — bumping
   // the generation is how those tasks learn to abort (BUG-005 / BUG-007).
@@ -2725,6 +4004,7 @@ function cleanupPeerConnection(sessionId: string, options: { failQueuedMessages?
   iceRestarting.delete(sessionId)
   pendingIceMigration.delete(sessionId)
   clearDisconnectedTimer(sessionId)
+  clearInitialIceRecovery(sessionId)
   // Detach dc.onclose BEFORE calling dc.close(). Otherwise the listener set in
   // setupDataChannel sees pc still alive (we close dc first, pc second) and
   // fires attemptIceRestart for a connection we're intentionally tearing down,
@@ -2756,7 +4036,13 @@ function cleanupPeerConnection(sessionId: string, options: { failQueuedMessages?
     for (const resolve of resolvers) resolve()
   }
   resetCrypto(sessionId)
-  pendingIceCandidates.delete(sessionId)
+  pendingRemoteIce.delete(sessionId)
+  pendingRemoteNegotiationTokens.delete(sessionId)
+  pendingRemoteTokenReservations.delete(sessionId)
+  peerRemoteNegotiationCounters.delete(sessionId)
+  pendingRemoteIceHints.delete(sessionId)
+  installedRemoteNegotiationTokens.delete(sessionId)
+  pendingRemoteIceOverflow.delete(sessionId)
   shortIdToTransferId.delete(sessionId)
   // Without this, when an ICE-failed peer is cleaned up but PEER_LEFT is
   // never received (unilateral local teardown), `connectedPeers` keeps the

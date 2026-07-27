@@ -1,10 +1,11 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useHomeStore } from '@/store/home'
 import { useAuthStore } from '@/store/auth'
 import { onMessage } from '@/lib/signaling'
 import type { ActivityEvent } from '@/types'
 import { ACTIVITY_QUOTES } from '@/data/lore'
-import { scrollBehavior } from '@/hooks/useReducedMotion'
+import { scrollBehavior, useCoarsePointer, useReducedMotion } from '@/hooks/useReducedMotion'
+import MisakaButton from '@/components/ui/MisakaButton'
 
 const TYPE_COLOR: Record<ActivityEvent['type'], string> = {
   join:     'var(--state-success)',
@@ -32,13 +33,17 @@ export default function ActivityStream() {
   const session = useAuthStore(s => s.session)
   const scrollRef = useRef<HTMLDivElement>(null)
   const quoteIndex = useRef(0)
+  const reducedMotion = useReducedMotion()
+  const coarsePointer = useCoarsePointer()
+  const [paused, setPaused] = useState(false)
+  const motionStopped = paused || reducedMotion || coarsePointer
 
   useEffect(() => {
-    if (!session) return
+    if (!session || motionStopped) return
     return onMessage((msg) => {
       if (msg.t === 'ACTIVITY') addActivity(msg.event as ActivityEvent)
     })
-  }, [session, addActivity])
+  }, [session, addActivity, motionStopped])
 
   useEffect(() => {
     // Lore quotes are flavour text mixed into the live activity stream — only
@@ -57,13 +62,28 @@ export default function ActivityStream() {
   // users who asked the OS for reduced motion; `scrollBehavior()` degrades
   // it to an instant jump.
   useEffect(() => {
-    scrollRef.current?.scrollTo({ left: 0, behavior: scrollBehavior() })
-  }, [activities])
+    if (!motionStopped) {
+      scrollRef.current?.scrollTo({ left: 0, behavior: scrollBehavior() })
+    }
+  }, [activities, motionStopped])
 
   if (activities.length === 0) return null
 
   return (
     <section className="py-4">
+      {!reducedMotion && !coarsePointer && (
+        <div className="flex justify-end px-5">
+          <MisakaButton
+            variant="pill"
+            size="sm"
+            className="text-[11px] py-1 px-2"
+            aria-pressed={paused}
+            onClick={() => setPaused(value => !value)}
+          >
+            {paused ? '▶ 继续动态' : '⏸ 暂停动态'}
+          </MisakaButton>
+        </div>
+      )}
       {/* Scrollable stream */}
       <div className="relative">
         {/* Left fade */}

@@ -25,11 +25,10 @@
  */
 
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { runTest, killChild } from './_harness.mjs'
+import { runTest, killChild, spawn } from './_harness.mjs'
 
 runTest(main, { timeoutMs: 90_000 })
 
@@ -72,9 +71,46 @@ function startServer(port, dir, extraEnv = {}) {
 }
 
 async function main() {
+  await caseMissingTurnCredentialsFailBeforeBind()
   await caseCorruptStateFailsClosed()
   await caseStatusSplit()
   console.log('\n✅ 全部测试通过')
+}
+
+async function caseMissingTurnCredentialsFailBeforeBind() {
+  console.log('[0] 自动 TURN 开启但凭据缺失时：启动前失败')
+  const port = 19600 + Math.floor(Math.random() * 90)
+  const dir = mkdtempSync(join(tmpdir(), 'misaka-ready-missing-'))
+  const proc = spawn(process.execPath, ['dist/index.js'], {
+    cwd: CWD,
+    env: {
+      ...process.env,
+      PORT: String(port),
+      TURN_AUTO_ENABLED: 'true',
+      TURN_PROVIDER: 'cloudflare',
+      TURN_CF_KEY_ID: '',
+      TURN_CF_API_TOKEN: '',
+      TURN_CF_ACCOUNT_TAG: '',
+      TURN_PERSIST_DIR: dir,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let stderr = ''
+  proc.stderr.on('data', chunk => { stderr += chunk })
+  try {
+    const result = await Promise.race([
+      new Promise(resolve => proc.once('exit', (code, signal) => resolve({ code, signal }))),
+      wait(5_000).then(() => ({ timeout: true })),
+    ])
+    assert.equal('timeout' in result, false, '缺凭据进程应迅速退出')
+    assert.notEqual(result.code, 0, '缺凭据不得健康启动')
+    assert.match(stderr, /TURN_CF_KEY_ID.*TURN_CF_API_TOKEN.*TURN_CF_ACCOUNT_TAG/s)
+    await assert.rejects(fetch(`http://127.0.0.1:${port}/api/health`))
+    console.log('  ✓ 缺少凭据时未绑定端口并以非零状态退出')
+  } finally {
+    await killChild(proc)
+    rmSync(dir, { recursive: true, force: true })
+  }
 }
 
 // ── A. 无法加载的持久状态 → 绑定前完成加载、TURN fail closed ─────────

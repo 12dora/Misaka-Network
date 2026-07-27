@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { useAuthStore } from '@/store/auth'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
@@ -6,6 +6,7 @@ import QRModal from '@/components/features/QRModal'
 import ScanModal from '@/components/features/ScanModal'
 import SettingsModal from '@/components/features/SettingsModal'
 import { scrollIntoViewSafely } from '@/hooks/useReducedMotion'
+import { deriveNetworkStatus, networkStatusLabel, useNetworkStore } from '@/store/network'
 
 const LINKS = [
   { to: '/',        label: '首页',  kanji: '首' },
@@ -18,6 +19,10 @@ export default function TopNav() {
   const navigate   = useNavigate()
   const isConnected = useAuthStore(s => s.isConnected)
   const identity    = useAuthStore(s => s.identity)
+  const signalingStatus = useNetworkStore(s => s.signalingStatus)
+  const peers = useNetworkStore(s => s.peers)
+  const transfers = useNetworkStore(s => s.transfers)
+  const networkStatus = deriveNetworkStatus({ signalingStatus, peers, transfers })
   const [menuOpen, setMenuOpen] = useState(false)
   const [showQR, setShowQR]         = useState(false)
   const [showScan, setShowScan]     = useState(false)
@@ -30,6 +35,7 @@ export default function TopNav() {
   // user resolved the system dialog with no confirmation either way. Surface
   // the outcome so a deferred install doesn't look like a broken click.
   const [installToast, setInstallToast] = useState<string | null>(null)
+  const toastTimer = useRef<number | null>(null)
   const menuId = useId()
 
   // A11Y-006: close the dropdown on route change so `aria-expanded` never
@@ -53,6 +59,10 @@ export default function TopNav() {
     }
   }, [])
 
+  useEffect(() => () => {
+    if (toastTimer.current !== null) window.clearTimeout(toastTimer.current)
+  }, [])
+
   async function handleInstallApp() {
     if (!installPrompt) return
     await installPrompt.prompt()
@@ -74,8 +84,8 @@ export default function TopNav() {
       setInstallPrompt(null)
       // Clear via state-equality guard so a concurrent toast doesn't get
       // wiped by a delayed timer from an earlier install attempt.
-      const current = installToast
-      setTimeout(() => setInstallToast(prev => (prev === current ? null : prev)), 3000)
+      if (toastTimer.current !== null) window.clearTimeout(toastTimer.current)
+      toastTimer.current = window.setTimeout(() => setInstallToast(null), 3000)
     }
   }
 
@@ -90,7 +100,8 @@ export default function TopNav() {
   // the login card into view after navigation completes.
   function nudgeToLogin() {
     setInstallToast('请先在首页接入御坂网络')
-    setTimeout(() => setInstallToast(prev => (prev === '请先在首页接入御坂网络' ? null : prev)), 2400)
+    if (toastTimer.current !== null) window.clearTimeout(toastTimer.current)
+    toastTimer.current = window.setTimeout(() => setInstallToast(null), 2400)
     navigate('/')
     // Wait a tick for the home page to mount before attempting to scroll.
     // UX-MOTION-001: scripted smooth scrolling ignored `prefers-reduced-
@@ -141,7 +152,7 @@ export default function TopNav() {
             `<Link><button/></Link>` nested two interactive elements, giving
             duplicate tab stops and inconsistent activation across
             browsers. */}
-        <div className="hidden md:flex items-center gap-2">
+        <div className="hidden lg:flex items-center gap-2">
           {LINKS.map(({ to, label }) => {
             const needsAuth = to === '/network' && !isConnected
             if (needsAuth) {
@@ -178,7 +189,7 @@ export default function TopNav() {
             off-screen (P0-6, UX-LAYOUT-004). */}
         <div className="flex items-center gap-3 h-8">
           {isConnected && (
-            <div className="hidden md:flex items-center gap-3">
+            <div className="hidden lg:flex items-center gap-3">
               {installPrompt && (
                 <button type="button" className="nav-pill text-sm !px-3" onClick={handleInstallApp}>
                   ⬇ 安装应用
@@ -213,22 +224,25 @@ export default function TopNav() {
           {/* Status */}
           <span className="h-8 inline-flex items-center gap-1.5 text-xs font-mono leading-none text-[var(--text-on-blue-2)]">
             <span
-              className={isConnected ? 'pulse-dot' : ''}
+              className={isConnected && networkStatus === 'online' ? 'pulse-dot' : ''}
               style={{
                 display: 'inline-block',
                 width: 8, height: 8, borderRadius: '50%',
-                background: isConnected ? 'var(--state-success)' : 'var(--text-muted)',
+                background: !isConnected || networkStatus === 'offline' ? 'var(--text-muted)'
+                  : networkStatus === 'transferring' ? 'var(--accent-cyan)'
+                  : networkStatus === 'online' ? 'var(--state-success)'
+                  : 'var(--state-warn)',
                 flexShrink: 0,
               }}
             />
-            <span className="hidden xs:inline">{isConnected ? '已接入' : '未接入'}</span>
+            <span className="hidden xs:inline">{isConnected ? networkStatusLabel(networkStatus) : '未接入'}</span>
           </span>
 
           {/* Mobile hamburger — A11Y-006: expose the menu's expanded state
               and what it controls. */}
           <button
             type="button"
-            className="tap-target md:hidden flex flex-col justify-center items-center gap-1 w-8 h-8 cursor-pointer"
+            className="tap-target lg:hidden flex flex-col justify-center items-center gap-1 w-8 h-8 cursor-pointer"
             style={{ border: 'none', background: 'transparent' }}
             onClick={() => setMenuOpen(o => !o)}
             aria-label={menuOpen ? '关闭菜单' : '打开菜单'}
@@ -257,7 +271,7 @@ export default function TopNav() {
       {menuOpen && (
         <div
           id={menuId}
-          className="fixed left-0 right-0 z-40 md:hidden flex flex-col"
+          className="fixed left-0 right-0 z-40 lg:hidden flex flex-col"
           style={{
             top: 'var(--nav-h-total)',
             background: 'rgba(14,42,107,0.97)',

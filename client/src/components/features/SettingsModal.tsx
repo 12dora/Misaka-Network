@@ -7,7 +7,7 @@ import MisakaSwitch from '@/components/ui/MisakaSwitch'
 import {
   loadTurnSettings, saveTurnSettings, testTurnServerDetailed,
   fetchTurnStatus, getAutoTurnState, refreshAutoTurn,
-  type TurnServer, type TurnSettings, type TurnTestResult,
+  isValidTurnUrl, type TurnServer, type TurnSettings, type TurnTestResult,
 } from '@/lib/turn'
 import { detectNatType, type NatDetectionResult } from '@/lib/nat'
 import { isSoundEnabled, setSoundEnabled, subscribeSoundPreference, playSound } from '@/lib/sound'
@@ -38,15 +38,8 @@ type SettingsTab = 'turn' | 'sound' | 'about'
 interface TurnStatusView {
   enabled: boolean
   configured: boolean
-  monthlyBytesUsed: number
-  monthlyBytesEffective: number
-  monthlyUsageSource: 'cloudflare' | 'pessimistic'
-  lastCfSyncError?: string
-  monthlyBytesLimit: number
-  percentUsed: number
-  thresholdPct: number
-  killSwitchActive: boolean
-  monthKey: string
+  available: boolean
+  reason?: string
   credentialTtlSec: number
 }
 
@@ -54,14 +47,6 @@ interface TurnStatusView {
 // boolean that could be left stuck at `true` when the underlying promise
 // rejected.
 type ProbeState = 'idle' | 'running' | 'done' | 'error'
-
-function formatBytes(b: number): string {
-  if (b >= 1024 ** 4) return `${(b / 1024 ** 4).toFixed(2)} TB`
-  if (b >= 1024 ** 3) return `${(b / 1024 ** 3).toFixed(2)} GB`
-  if (b >= 1024 ** 2) return `${(b / 1024 ** 2).toFixed(1)} MB`
-  if (b >= 1024)      return `${(b / 1024).toFixed(0)} KB`
-  return `${b} B`
-}
 
 export default function SettingsModal({ onClose }: Props) {
   const [tab, setTab] = useState<SettingsTab>('turn')
@@ -75,6 +60,7 @@ export default function SettingsModal({ onClose }: Props) {
   const [natError, setNatError] = useState<string | null>(null)
   const [turnStatus, setTurnStatus] = useState<TurnStatusView | null>(null)
   const [turnStatusState, setTurnStatusState] = useState<ProbeState>('idle')
+  const [turnStatusRetry, setTurnStatusRetry] = useState(0)
   const [autoTurnActive, setAutoTurnActive] = useState(getAutoTurnState())
   const [issuing, setIssuing] = useState(false)
   const [issueError, setIssueError] = useState<string | null>(null)
@@ -104,11 +90,7 @@ export default function SettingsModal({ onClose }: Props) {
       }
       setTurnStatus({
         enabled: s.enabled, configured: s.configured,
-        monthlyBytesUsed: s.monthlyBytesUsed, monthlyBytesEffective: s.monthlyBytesEffective,
-        monthlyUsageSource: s.monthlyUsageSource, lastCfSyncError: s.lastCfSyncError,
-        monthlyBytesLimit: s.monthlyBytesLimit,
-        percentUsed: s.percentUsed, thresholdPct: s.thresholdPct,
-        killSwitchActive: s.killSwitchActive, monthKey: s.monthKey,
+        available: s.available, reason: s.reason,
         credentialTtlSec: s.credentialTtlSec,
       })
       setTurnStatusState('done')
@@ -117,7 +99,7 @@ export default function SettingsModal({ onClose }: Props) {
     void tick()
     const id = window.setInterval(tick, 10_000)
     return () => { cancelled = true; window.clearInterval(id) }
-  }, [tab])
+  }, [tab, turnStatusRetry])
 
   async function handleDetectNat() {
     if (natState === 'running') return
@@ -154,7 +136,12 @@ export default function SettingsModal({ onClose }: Props) {
   // server-issued auto credentials, and "force relay" must be impossible to
   // leave armed when there is no TURN to relay through — that combination
   // guarantees every connection fails.
-  const hasManualTurn = turnSettings.servers.some(s => s.enabled && s.url.trim() !== '')
+  const hasManualTurn = turnSettings.servers.some(s =>
+    s.enabled
+    && isValidTurnUrl(s.url)
+    && s.username.trim().length > 0
+    && s.credential.length > 0,
+  )
   const turnAvailable = turnSettings.enabled && (hasManualTurn || autoTurnActive.active)
 
   useEffect(() => {
@@ -170,6 +157,7 @@ export default function SettingsModal({ onClose }: Props) {
   }, [turnSettings.enabled, turnAvailable])
 
   function handleAdd() {
+    if (!isValidTurnUrl(form.url)) return
     const server: TurnServer = {
       id: crypto.randomUUID(),
       url: form.url,
@@ -182,7 +170,7 @@ export default function SettingsModal({ onClose }: Props) {
   }
 
   function handleUpdate() {
-    if (!editingServer) return
+    if (!editingServer || !isValidTurnUrl(form.url)) return
     setTurnSettings(s => ({
       ...s,
       servers: s.servers.map(srv =>
@@ -390,7 +378,11 @@ export default function SettingsModal({ onClose }: Props) {
                   variant="pill"
                   size="sm"
                   className="text-[11px] py-1 px-2"
-                  onClick={() => setTurnStatusState('idle')}
+                  onClick={() => {
+                    setTurnStatus(null)
+                    setTurnStatusState('idle')
+                    setTurnStatusRetry(value => value + 1)
+                  }}
                 >
                   重试
                 </MisakaButton>
@@ -401,7 +393,7 @@ export default function SettingsModal({ onClose }: Props) {
                 className="rounded-lg p-3 flex flex-col gap-2"
                 style={{
                   background: 'var(--surface-tint)',
-                  border: `1px solid ${turnStatus.killSwitchActive ? 'var(--state-danger)' : 'var(--border-card)'}`,
+                  border: `1px solid ${turnStatus.available ? 'var(--border-card)' : 'var(--state-warn)'}`,
                 }}
               >
                 <div className="flex items-center justify-between">
@@ -409,15 +401,14 @@ export default function SettingsModal({ onClose }: Props) {
                   <span
                     className="inline-block px-2 py-0.5 rounded text-[10px] font-kanji text-white"
                     style={{
-                      background: turnStatus.killSwitchActive ? 'var(--state-danger)'
-                        : !turnStatus.enabled ? 'var(--text-muted-on-light)'
+                      background: !turnStatus.enabled ? 'var(--text-muted-on-light)'
                         : !turnStatus.configured ? 'var(--text-muted-on-light)'
-                        : autoTurnActive.active ? 'var(--state-success-on-light)' : 'var(--state-warn-on-light)',
+                        : turnStatus.available && autoTurnActive.active ? 'var(--state-success-on-light)' : 'var(--state-warn-on-light)',
                     }}
                   >
-                    {turnStatus.killSwitchActive ? '已熔断'
-                      : !turnStatus.enabled ? '已停用'
+                    {!turnStatus.enabled ? '已停用'
                       : !turnStatus.configured ? '未配置'
+                      : !turnStatus.available ? '暂不可用'
                       : autoTurnActive.active ? '已下发' : '待下发'}
                   </span>
                 </div>
@@ -432,39 +423,10 @@ export default function SettingsModal({ onClose }: Props) {
                   </div>
                 )}
 
-                {turnStatus.configured && (
-                  <>
-                    <div className="flex items-center justify-between">
-                      <span className="font-kanji text-[11px] text-[var(--text-on-white-2)]">本月用量</span>
-                      <span className="font-mono text-[11px] text-[var(--text-on-white)]">
-                        {formatBytes(turnStatus.monthlyBytesUsed)} / {formatBytes(turnStatus.monthlyBytesLimit)}
-                      </span>
-                    </div>
-                    <div
-                      className="w-full h-1.5 rounded-full overflow-hidden"
-                      style={{ background: 'rgba(0,0,0,0.08)' }}
-                    >
-                      <div
-                        className="h-full transition-all"
-                        style={{
-                          width: `${Math.min(100, turnStatus.percentUsed).toFixed(2)}%`,
-                          background: turnStatus.killSwitchActive ? 'var(--state-danger)'
-                            : turnStatus.percentUsed >= turnStatus.thresholdPct * 0.9 ? 'var(--state-warn)'
-                            : 'var(--state-success)',
-                        }}
-                      />
-                    </div>
-                    <p className="font-kanji text-[10px] text-[var(--text-muted-on-light)] leading-snug">
-                      {turnStatus.killSwitchActive
-                        ? `已达 ${turnStatus.thresholdPct}% 熔断阈值，停止下发自动 TURN 直至下月`
-                        : `${turnStatus.percentUsed.toFixed(2)}% · 熔断阈值 ${turnStatus.thresholdPct}% · ${turnStatus.monthKey} · ${turnStatus.monthlyUsageSource === 'cloudflare' ? '服务端统计' : '本地估算'}`}
-                    </p>
-                    {turnStatus.lastCfSyncError && (
-                      <p className="font-kanji text-[10px] leading-snug" style={{ color: 'var(--state-warn-on-light)' }}>
-                        中继用量同步失败，显示的用量可能不准确。
-                      </p>
-                    )}
-                  </>
+                {turnStatus.configured && !turnStatus.available && (
+                  <p className="font-kanji text-[10px] leading-snug" style={{ color: 'var(--state-warn-on-light)' }}>
+                    中继服务暂时不可用。请稍后重试，或使用下方经过验证的手工服务器。
+                  </p>
                 )}
 
                 {autoTurnActive.lastFailReason && !autoTurnActive.active && (
@@ -481,7 +443,7 @@ export default function SettingsModal({ onClose }: Props) {
             </p>
 
             {/* TURN issuance trigger — shown when pending */}
-            {turnStatus && !turnStatus.killSwitchActive && turnStatus.enabled && turnStatus.configured && !autoTurnActive.active && (
+            {turnStatus?.available && !autoTurnActive.active && (
               <div className="flex flex-col items-center gap-2">
                 <MisakaButton
                   variant="primary"
@@ -605,7 +567,13 @@ export default function SettingsModal({ onClose }: Props) {
                   placeholder="turn:example.com:3478?transport=udp"
                   value={form.url}
                   onChange={e => setForm(f => ({ ...f, url: e.target.value }))}
+                  aria-invalid={form.url.length > 0 && !isValidTurnUrl(form.url) ? true : undefined}
                 />
+                {form.url.length > 0 && !isValidTurnUrl(form.url) && (
+                  <p className="font-kanji text-[10px]" style={{ color: 'var(--state-danger-on-light)' }} role="alert">
+                    请输入以 turn: 或 turns: 开头的服务器地址
+                  </p>
+                )}
               </div>
               <div className="flex gap-2">
                 <div className="flex flex-col gap-1 flex-1 min-w-0">
@@ -637,14 +605,14 @@ export default function SettingsModal({ onClose }: Props) {
               <div className="flex gap-2">
                 {editingServer ? (
                   <>
-                    <MisakaButton variant="primary" size="sm" onClick={handleUpdate}>保存</MisakaButton>
+                    <MisakaButton variant="primary" size="sm" onClick={handleUpdate} disabled={!isValidTurnUrl(form.url)}>保存</MisakaButton>
                     <MisakaButton variant="pill" size="sm"
                       onClick={() => { setEditingServer(null); setForm({ url: '', username: '', credential: '' }) }}>
                       取消
                     </MisakaButton>
                   </>
                 ) : (
-                  <MisakaButton variant="primary" size="sm" onClick={handleAdd} disabled={!form.url}>
+                  <MisakaButton variant="primary" size="sm" onClick={handleAdd} disabled={!isValidTurnUrl(form.url)}>
                     + 添加
                   </MisakaButton>
                 )}
@@ -698,6 +666,11 @@ export default function SettingsModal({ onClose }: Props) {
           <div className="flex flex-col gap-4">
             <div className="font-kanji text-xs text-[var(--text-on-white-2)] leading-relaxed">
               <p className="mb-2">© Master Huang · Misaka Network</p>
+              <p className="mb-2">
+                文件在浏览器之间端到端加密传输；直连失败时，流量可能经过服务器自动下发的
+                Cloudflare TURN 或你配置的中继。信令会处理会话、IP 安全状态和聚合传输统计，
+                部分安全/额度数据会跨重启保留。
+              </p>
               <a
                 href="https://github.com/12dora/Misaka-Network"
                 target="_blank"

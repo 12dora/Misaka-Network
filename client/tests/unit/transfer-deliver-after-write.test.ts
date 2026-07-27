@@ -201,7 +201,7 @@ function installFakeOPFS() {
     createWritable: vi.fn(async () => makeWritable(name)),
     getFile: vi.fn(async () => {
       const f = opfsFiles.get(name) ?? { bytes: new Uint8Array(0) }
-      return new File([f.bytes], name)
+      return new File([f.bytes.buffer.slice(f.bytes.byteOffset, f.bytes.byteOffset + f.bytes.byteLength) as ArrayBuffer], name)
     }),
   })
   const dir = {
@@ -246,7 +246,7 @@ async function freshStore() {
   })
   await settle()
   const primary = dcs.find(d => d.label === 'misaka')!
-  return { store: mod.useNetworkStore, primary, transfer }
+  return { store: mod.useNetworkStore, releaseDownloadArtifact: mod.releaseDownloadArtifact, primary, transfer }
 }
 
 async function settle(rounds = 12) {
@@ -284,7 +284,7 @@ function buildPayload(chunkSize: number) {
 
 describe('TEST-006: production receive orchestration must not deliver before the disk write lands', () => {
   it('holds delivery until the LAST OPFS write resolves, then delivers byte-exact', async () => {
-    const { store, primary, transfer } = await freshStore()
+    const { store, releaseDownloadArtifact, primary, transfer } = await freshStore()
     const { chunks, whole } = buildPayload(transfer.CHUNK_SIZE)
     const meta = {
       type: 'meta', transferId: 'opfs-order', shortId: 11,
@@ -308,7 +308,7 @@ describe('TEST-006: production receive orchestration must not deliver before the
     holdWrite = (position) => position === lastOffset
 
     for (let i = 0; i < CHUNKS; i++) {
-      const frame = transfer.encodeChunkFrame(11, i, new Uint8Array(12), chunks[i].buffer.slice(0))
+      const frame = transfer.encodeChunkFrame(11, i, new Uint8Array(12), chunks[i].buffer.slice(0) as ArrayBuffer)
       void primary.onmessage!({ data: frame } as MessageEvent)
       await settle()
     }
@@ -338,9 +338,11 @@ describe('TEST-006: production receive orchestration must not deliver before the
     const delivered = new Uint8Array(await deliveredBlobs[deliveredBlobs.length - 1].arrayBuffer())
     expect(Array.from(delivered)).toEqual(Array.from(whole))
 
-    // BUG-018: terminal cleanup ran — the origin-private copy is gone (the old
-    // code lost the file-name handle before it could `removeEntry`, so every
-    // received file stayed in OPFS forever) and the DB row is no longer active.
+    // The lazy OPFS-backed File must remain readable until the user-facing URL
+    // is released; deleting it during finalize cancels real browser downloads.
+    expect(opfsFiles.has('opfs-order-ordered.bin')).toBe(true)
+    await releaseDownloadArtifact(fileCard!.downloadUrl!)
+    await settle()
     expect(opfsFiles.has('opfs-order-ordered.bin')).toBe(false)
     expect(records.get('opfs-order')?.status).toBe('completed')
 
@@ -381,7 +383,7 @@ describe('TEST-006: production receive orchestration must not deliver before the
     await settle()
 
     // Only the missing chunk is re-shipped.
-    const frame = transfer.encodeChunkFrame(22, 2, new Uint8Array(12), chunks[2].buffer.slice(0))
+    const frame = transfer.encodeChunkFrame(22, 2, new Uint8Array(12), chunks[2].buffer.slice(0) as ArrayBuffer)
     void primary.onmessage!({ data: frame } as MessageEvent)
     await settle(40)
 

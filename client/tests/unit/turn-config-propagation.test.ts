@@ -70,9 +70,32 @@ function turnUrlsIn(cfg: RTCConfiguration): string[] {
 }
 
 beforeEach(() => {
+  vi.unstubAllEnvs()
   localStorage.clear()
   clearAutoTurn()
   setDetectedNatType('unknown')
+})
+
+describe('E2E host-candidate-only ICE configuration', () => {
+  it('removes every external ICE URL and keeps relay-only off for the exact test nonce', async () => {
+    await refreshAutoTurn()
+    vi.stubEnv('VITE_E2E_BUILD_NONCE', 'misaka-playwright-v1')
+    vi.stubEnv('VITE_E2E_HOST_ICE_ONLY', '1')
+
+    const cfg = buildIceConfig()
+    expect(cfg.iceServers).toEqual([])
+    expect(cfg.iceTransportPolicy).toBe('all')
+  })
+
+  it('does not activate for a mismatched frontend nonce', () => {
+    vi.stubEnv('VITE_E2E_BUILD_NONCE', 'wrong-build')
+    vi.stubEnv('VITE_E2E_HOST_ICE_ONLY', '1')
+
+    const urls = (buildIceConfig().iceServers ?? [])
+      .flatMap(server => Array.isArray(server.urls) ? server.urls : [server.urls])
+      .map(String)
+    expect(urls.some(url => url.startsWith('stun:'))).toBe(true)
+  })
 })
 
 describe('turnSettings.enabled = false (CLAUDE.md contract)', () => {
@@ -131,6 +154,21 @@ describe('turnSettings.enabled = false (CLAUDE.md contract)', () => {
     const cfg = buildIceConfig()
     const urls = (cfg.iceServers ?? []).flatMap(s => Array.isArray(s.urls) ? s.urls : [s.urls])
     expect(urls.some(u => u === 'turn:turn.example.com:3478')).toBe(true)
+  })
+
+  it('filters malformed or credential-incomplete manual entries before RTC config', () => {
+    saveTurnSettings({
+      enabled: true,
+      forceRelay: true,
+      servers: [
+        { id: 'bad-url', url: 'turn:?', username: 'u', credential: 'c', enabled: true },
+        { id: 'bad-port', url: 'turn:relay.example:65536', username: 'u', credential: 'c', enabled: true },
+        { id: 'no-user', url: 'turn:relay.example:3478', username: '', credential: 'c', enabled: true },
+        { id: 'no-secret', url: 'turn:relay.example:3478', username: 'u', credential: '', enabled: true },
+      ],
+    })
+    expect(turnUrlsIn(buildIceConfig())).toEqual([])
+    expect(buildIceConfig().iceTransportPolicy).toBe('all')
   })
 })
 

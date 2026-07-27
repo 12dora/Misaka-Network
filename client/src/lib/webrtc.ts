@@ -3,6 +3,7 @@ import {
   SUPPLEMENTAL_STUN,
 } from './turn'
 import { getDetectedNatType } from './nat'
+import { isE2eHostIceOnly } from './e2e-ice'
 import { DEFAULT_STUN, ICE_CANDIDATE_POOL_SIZE } from '@/constants'
 
 // ── Logging helper ───────────────────────────────────────────────────
@@ -24,6 +25,7 @@ const AUTO_TURN_STALE_WINDOW_MS = 10_000
 // can still get TURN ICE servers from the first RTCPeerConnection.
 // refreshAutoTurn is idempotent / coalesces in-flight calls.
 export async function ensureAutoTurnReady(timeoutMs = 1500): Promise<void> {
+  if (isE2eHostIceOnly()) return
   // P1: previously this only re-fetched when there were *zero* servers. A
   // credential that was about to expire (or had just expired) would still
   // satisfy the early-return, so the next PC built with it failed ICE the
@@ -153,6 +155,15 @@ function currentTurnServers(): RTCIceServer[] {
 // state — used both for new PCs and to re-apply via `pc.setConfiguration()`
 // on existing PCs when creds rotate or the user flips force-relay.
 export function buildIceConfig(): RTCConfiguration {
+  if (isE2eHostIceOnly()) {
+    return {
+      iceServers: [],
+      iceTransportPolicy: 'all',
+      bundlePolicy: 'max-bundle',
+      rtcpMuxPolicy: 'require',
+      iceCandidatePoolSize: ICE_CANDIDATE_POOL_SIZE,
+    }
+  }
   const turnSettings = loadTurnSettings()
   // Order: STUN → server-issued auto TURN → manual user TURN. Both TURN
   // tiers sit behind the master switch (see isRelayAllowed above).
@@ -260,24 +271,42 @@ export function createDataChannel(pc: RTCPeerConnection, label = 'misaka'): RTCD
 // usually `new → gathering`, the handler fires, doesn't resolve, gets
 // removed, and the `complete` event later has no handler. The whole
 // handshake hung, the DC never opened, and the user saw "DataChannel 打开超时".
-export async function createOffer(pc: RTCPeerConnection): Promise<RTCSessionDescriptionInit> {
+function assertNegotiationCurrent(isCurrent?: () => boolean) {
+  if (isCurrent && !isCurrent()) throw new DOMException('Stale WebRTC negotiation attempt', 'AbortError')
+}
+
+export async function createOffer(
+  pc: RTCPeerConnection,
+  isCurrent?: () => boolean,
+): Promise<RTCSessionDescriptionInit> {
   const offer = await pc.createOffer()
+  assertNegotiationCurrent(isCurrent)
   await pc.setLocalDescription(offer)
+  assertNegotiationCurrent(isCurrent)
   return pc.localDescription!.toJSON()
 }
 
 export async function createAnswer(
   pc: RTCPeerConnection,
   offer: RTCSessionDescriptionInit,
+  isCurrent?: () => boolean,
 ): Promise<RTCSessionDescriptionInit> {
   await pc.setRemoteDescription(new RTCSessionDescription(offer))
+  assertNegotiationCurrent(isCurrent)
   const answer = await pc.createAnswer()
+  assertNegotiationCurrent(isCurrent)
   await pc.setLocalDescription(answer)
+  assertNegotiationCurrent(isCurrent)
   return pc.localDescription!.toJSON()
 }
 
-export async function applyAnswer(pc: RTCPeerConnection, answer: RTCSessionDescriptionInit) {
+export async function applyAnswer(
+  pc: RTCPeerConnection,
+  answer: RTCSessionDescriptionInit,
+  isCurrent?: () => boolean,
+) {
   await pc.setRemoteDescription(new RTCSessionDescription(answer))
+  assertNegotiationCurrent(isCurrent)
 }
 
 export async function addIceCandidate(pc: RTCPeerConnection, candidate: RTCIceCandidateInit) {
@@ -335,7 +364,20 @@ export function whenSignalingStable(
 // without a valid sdpMid. We need to pull the mid from the first transceiver
 // (or the data-channel only DataChannel-style m-line). Returns a payload
 // that's safe to pass to new RTCIceCandidate() across browsers.
-export function endOfCandidatesFor(pc: RTCPeerConnection): RTCIceCandidateInit {
+export function endOfCandidatesFor(
+  pc: RTCPeerConnection,
+  locator?: RTCIceCandidateInit,
+): RTCIceCandidateInit {
+  if (locator && (locator.sdpMid != null || locator.sdpMLineIndex != null)) {
+    return {
+      candidate: '',
+      sdpMid: locator.sdpMid ?? null,
+      sdpMLineIndex: locator.sdpMLineIndex ?? null,
+      ...(locator.usernameFragment != null
+        ? { usernameFragment: locator.usernameFragment }
+        : {}),
+    }
+  }
   let sdpMid: string | null = null
   let sdpMLineIndex: number | null = null
   try {
@@ -374,6 +416,42 @@ export function endOfCandidatesFor(pc: RTCPeerConnection): RTCIceCandidateInit {
     sdpMid: sdpMid ?? '0',
     sdpMLineIndex: sdpMLineIndex ?? 0,
   }
+}
+
+/** One media-scoped EOC marker per local SDP m-line. */
+export function endOfCandidateMarkersFor(pc: RTCPeerConnection): RTCIceCandidateInit[] {
+  const media: Array<RTCIceCandidateInit & { mediaUfrag?: string | null }> = []
+  let sessionUfrag: string | null = null
+  try {
+    const lines = pc.localDescription?.sdp?.split(/\r?\n/) ?? []
+    let current: (RTCIceCandidateInit & { mediaUfrag?: string | null }) | null = null
+    for (const line of lines) {
+      if (line.startsWith('m=')) {
+        current = {
+          candidate: '',
+          sdpMid: null,
+          sdpMLineIndex: media.length,
+          mediaUfrag: null,
+        }
+        media.push(current)
+      } else if (line.startsWith('a=mid:') && current) {
+        current.sdpMid = line.slice('a=mid:'.length).trim() || null
+      } else if (line.startsWith('a=ice-ufrag:')) {
+        const ufrag = line.slice('a=ice-ufrag:'.length).trim()
+        if (!ufrag) continue
+        if (current) current.mediaUfrag = ufrag
+        else sessionUfrag = ufrag
+      }
+    }
+  } catch { /* malformed/missing local SDP falls back below */ }
+  if (media.length === 0) return [endOfCandidatesFor(pc)]
+  return media.map(({ mediaUfrag, ...marker }) => {
+    const usernameFragment = mediaUfrag ?? sessionUfrag
+    return {
+      ...marker,
+      ...(usernameFragment !== null ? { usernameFragment } : {}),
+    }
+  })
 }
 
 // ── ICE error introspection ──────────────────────────────────────────

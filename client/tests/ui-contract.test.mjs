@@ -15,7 +15,6 @@ const scan = read('src/components/features/ScanModal.tsx')
 const footer = read('src/components/ui/AppFooter.tsx')
 const privacy = read('src/pages/Privacy.tsx')
 const terms = read('src/pages/Terms.tsx')
-const useModalExitHook = read('src/hooks/useModalExit.ts')
 const network = read('src/pages/Network.tsx')
 const networkStore = read('src/store/network.ts')
 const authStore = read('src/store/auth.ts')
@@ -51,11 +50,6 @@ assert.match(topNav, /finally\s*\{\s*setInstallPrompt\(null\)/)
 // the dropdown doesn't sit on top of the opening SettingsModal.
 assert.match(topNav, /onClick=\{\(\)\s*=>\s*\{\s*setMenuOpen\(false\);\s*setShowSettings\(true\)/)
 
-// #14 — global Escape-to-close lives inside useModalExit so every consumer
-// (QR / Scan / Settings) gets it for free without bespoke listeners.
-assert.match(useModalExitHook, /addEventListener\(['"]keydown['"]/)
-assert.match(useModalExitHook, /e\.key !== ['"]Escape['"]/)
-
 // #31 — "刷新 QR" button must be disabled while a fetch is in-flight so the
 // user can't spam-click it. fetchToken sets `loading` on entry; we reuse that.
 assert.match(qr, /onClick=\{fetchToken\}\s+disabled=\{loading\}/)
@@ -81,18 +75,6 @@ assert.match(qr, /QRCode\.toCanvas/)
 assert.match(qr, /QRCode\.toDataURL/)
 assert.match(qr, /qrImageUrl/)
 assert.match(qr, /QR 渲染失败/)
-
-// QR fetch must go through authedFetch so a stale session (server restarted,
-// token unknown server-side) auto-recovers via re-register-and-retry instead
-// of leaving the user staring at "HTTP 401". Same for the copy-link path.
-assert.match(qr, /authedFetch\(path\)/)
-assert.match(qr, /AuthRequiredError/)
-assert.match(qr, /会话已失效/)
-assert.doesNotMatch(qr, /Authorization:\s*`Bearer\s*\$\{session\.token\}`/)
-assert.match(network, /authedFetch\(path\)/)
-assert.match(network, /AuthRequiredError/)
-assert.match(network, /会话已失效/)
-assert.doesNotMatch(network, /headers:\s*\{\s*Authorization:\s*`Bearer\s*\$\{auth\.session\.token\}`/)
 
 // authedFetch core contract: retry once with a fresh token after 401, then
 // throw AuthRequiredError (not just resolve a 401 response).
@@ -124,7 +106,10 @@ assert.match(networkStore, /notifyPrimaryChannel\(fromSessionId\)/)
 assert.match(networkStore, /getMyPublicKey\(peerSessionId\)/)
 assert.match(networkStore, /setPeerPublicKey\(peerSessionId, msg\.pub\)/)
 assert.match(networkStore, /hasAESKey\(peerSessionId\)/)
-assert.match(networkStore, /if \(!dc\.label\.startsWith\('misaka-transfer-'\)\)/)
+assert.match(networkStore, /const isTransferLane = dc\.label\.startsWith\('misaka-transfer-'\)/)
+assert.match(networkStore, /if \(!isTransferLane\)/)
+assert.match(networkStore, /const publishEncryptedReady = \(\) =>/)
+assert.match(networkStore, /if \(!stillCurrent\(\) \|\| !hasAESKey\(peerSessionId\)\) return false/)
 assert.match(networkStore, /if \(hasAESKey\(peerSessionId\)\) flushOutgoing\(peerSessionId, dc\)/)
 assert.match(networkStore, /flushOutgoing\(peerSessionId, dc\)\s+sendResumeRequests\(peerSessionId, dc\)/)
 // receiveChunk now takes (transferId, index, iv, ciphertext) — chunk frame is

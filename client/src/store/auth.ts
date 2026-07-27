@@ -59,7 +59,12 @@ function releaseNodeIdLock() {
 type AuthGet = () => AuthState
 type AuthSet = (partial: Partial<AuthState>) => void
 
-async function doConnect(get: AuthGet, set: AuthSet): Promise<void> {
+interface ConnectOptions {
+  /** Short-lived proof returned by /qr-redeem; committed by /register. */
+  admissionGrant?: string
+}
+
+async function doConnect(get: AuthGet, set: AuthSet, options: ConnectOptions = {}): Promise<void> {
   const current = get().identity
   set({ isLoading: true, error: null, ipFullPrompt: false })
 
@@ -76,7 +81,11 @@ async function doConnect(get: AuthGet, set: AuthSet): Promise<void> {
     const res = await fetch(apiUrl('/api/register'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ nodeId: current.nodeId, passCode: current.passCode }),
+      body: JSON.stringify({
+        nodeId: current.nodeId,
+        passCode: current.passCode,
+        ...(options.admissionGrant ? { admissionGrant: options.admissionGrant } : {}),
+      }),
     })
 
     if (res.status === 409) {
@@ -191,7 +200,7 @@ interface AuthState {
   setPassCode: (passCode: string) => void
   regenerateNodeId: () => void
   regeneratePassCode: () => void
-  connect: () => Promise<void>
+  connect: (options?: ConnectOptions) => Promise<void>
   disconnect: () => Promise<void>
   clearSession: () => void
   releaseAllFromIp: () => Promise<number>
@@ -234,13 +243,13 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     set({ identity, error: null })
   },
 
-  async connect() {
+  async connect(options = {}) {
     // Coalesce concurrent callers (parallel 401 re-auths + onAuthInvalid) onto
     // one registration so they don't race the node lock or double-register.
     if (connectInFlight) return connectInFlight
     connectInFlight = (async () => {
       try {
-        await doConnect(get, set)
+        await doConnect(get, set, options)
       } finally {
         connectInFlight = null
       }

@@ -40,23 +40,36 @@ fi
 BASE="${BASE%/}"
 
 status() {
+  local path="${2:-/api/health}"
   curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
     -H "X-Forwarded-For: $1" \
     -H "X-Real-IP: $1" \
     -H "Forwarded: for=$1" \
-    "$BASE/api/health"
+    "$BASE$path"
+}
+
+check_ws_boundary() {
+  local code
+  code="$(status "198.51.100.7" "/ws")"
+  # A plain HTTP request to the WebSocket endpoint is rejected by ws with
+  # 400/426. 404 means the edge is not routing /ws to this Misaka backend.
+  if [ "$code" != "400" ] && [ "$code" != "426" ]; then
+    echo "FAIL: /ws compatibility probe expected HTTP 400/426, got $code" >&2
+    exit 1
+  fi
 }
 
 if [ "$MODE" = "--fresh" ]; then
   code="$(status 198.51.100.7)"
-  if [ "$code" = "429" ]; then
+  if [ "$code" != "200" ]; then
     echo "FAIL: this client is already rate-limited from a network that never"
-    echo "      called the server. Users are collapsing onto one IP — check"
-    echo "      TRUST_PROXY in docker-compose.prod.yml and the header_up"
-    echo "      rules in the Caddyfile."
+    echo "      called the server, or the endpoint is unhealthy (HTTP $code)."
+    echo "      Require exactly HTTP 200; inspect TRUST_PROXY, Caddy routing and"
+    echo "      the signaling health endpoint."
     exit 1
   fi
-  echo "PASS: fresh network got HTTP $code (not 429) — per-IP budgets are distinct."
+  check_ws_boundary
+  echo "PASS: fresh network got HTTP 200 and /ws reaches a compatible upgrade endpoint."
   exit 0
 fi
 
@@ -69,17 +82,20 @@ saw429=0
 for i in $(seq 1 "$ATTEMPTS"); do
   code="$(status "203.0.113.$(( i % 254 + 1 ))")"
   if [ "$code" = "429" ]; then saw429=1; echo "  -> 429 after $i requests"; break; fi
-  if [ "$code" != "200" ]; then echo "  unexpected HTTP $code at request $i" >&2; fi
+  if [ "$code" != "200" ]; then
+    echo "FAIL: unexpected HTTP $code at request $i" >&2
+    exit 1
+  fi
 done
 
 if [ "$saw429" -ne 1 ]; then
   echo "FAIL: $ATTEMPTS requests with $ATTEMPTS different X-Forwarded-For values"
   echo "      were never rate-limited. The edge is forwarding the client's own"
-  echo "      header — add the request_header/header_up rules from"
-  echo "      Caddyfile.example, or the server is running with a hop count"
-  echo "      higher than the real topology."
+  echo "      header. Caddy must trust only published CDN CIDRs, overwrite from"
+  echo "      validated {client_ip}, and signaling must remain TRUST_PROXY=1."
   exit 1
 fi
 
+check_ws_boundary
 echo "PASS: spoofed X-Forwarded-For did not create new per-IP budgets."
 echo "Now run, from a different network:  $0 $BASE --fresh"

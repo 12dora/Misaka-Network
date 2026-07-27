@@ -22,7 +22,6 @@ function buildURL(
   type: string,
   nodeId: number,
   qrToken: string,
-  passCode?: string,
   fileSessionId?: string,
   channelId?: string,
 ) {
@@ -30,7 +29,6 @@ function buildURL(
   const params = new URLSearchParams({ type, id: String(nodeId), t: qrToken })
   if (type === 'file' && fileSessionId) params.set('fid', fileSessionId)
   if (type === 'channel' && channelId) params.set('cid', channelId)
-  if (passCode) params.set('c', btoa(passCode))
   return `${base}?${params.toString()}`
 }
 
@@ -45,7 +43,6 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [qrToken, setQrToken] = useState<string | null>(null)
   const [expiresAt, setExpiresAt] = useState<number>(0)
-  const [includePass, setIncludePass] = useState(false)
   const [loading, setLoading] = useState(true)
   const [qrError, setQrError] = useState<string | null>(null)
   const [qrImageUrl, setQrImageUrl] = useState<string | null>(null)
@@ -65,10 +62,7 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
     setLoading(true)
     setQrError(null)
     try {
-      const path = passCode
-        ? `/api/qr-token?passCode=${encodeURIComponent(passCode)}`
-        : '/api/qr-token'
-      const res = await authedFetch(path)
+      const res = await authedFetch('/api/qr-token', { method: 'POST' })
       if (res.ok) {
         const data = await res.json() as { qrToken: string; channelId: string; expiresAt: number }
         setQrToken(data.qrToken)
@@ -87,21 +81,21 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
       }
     }
     setLoading(false)
-  }, [session?.token, passCode])
+  }, [session?.token])
 
   useEffect(() => {
     fetchToken()
   }, [fetchToken])
 
   const shareUrl = qrToken
-    ? buildURL(qrType, nodeId, qrToken, includePass ? passCode : undefined, fileSessionId, channelId)
+    ? buildURL(qrType, nodeId, qrToken, fileSessionId, channelId)
     : ''
 
   // Draw QR
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas || !qrToken) return
-    const url = buildURL(qrType, nodeId, qrToken, includePass ? passCode : undefined, fileSessionId, channelId)
+    const url = buildURL(qrType, nodeId, qrToken, fileSessionId, channelId)
     setQrError(null)
     QRCode.toCanvas(canvas, url, {
       width: QR_RENDER_PX,
@@ -120,7 +114,7 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
         .then(setQrImageUrl)
         .catch(() => setQrError('QR 渲染失败，请刷新重试'))
     })
-  }, [qrToken, nodeId, passCode, includePass, qrType, fileSessionId, channelId])
+  }, [qrToken, nodeId, qrType, fileSessionId, channelId])
 
   // BUG-031: the old failure path told the user to "手动选取下方链接" — there
   // was no link anywhere in the modal. And the feedback lived in an
@@ -295,24 +289,9 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
         </div>
       </div>
 
-      {/* Toggle: include passcode in QR.
-          UX-COPY-007: "（不安全）" told the user nothing — it named a risk
-          without naming the consequence. Say what actually changes: the
-          link alone is enough to join. */}
-      <label className="flex items-start gap-2 cursor-pointer w-full">
-        <input
-          type="checkbox"
-          checked={includePass}
-          onChange={e => setIncludePass(e.target.checked)}
-          className="w-4 h-4 rounded accent-[--bg-deep] mt-0.5 shrink-0"
-        />
-        <span className="font-kanji text-xs text-[var(--text-on-white-2)] leading-snug min-w-0">
-          在链接中包含通行码
-          <span className="block text-[11px] mt-0.5" style={{ color: 'var(--state-warn-on-light)' }}>
-            链接包含接入密码，获得链接的人可以直接加入。仅通过可信渠道分享。
-          </span>
-        </span>
-      </label>
+      <p className="font-kanji text-[11px] text-[var(--text-on-white-2)] leading-snug w-full m-0">
+        链接仅包含一次性接入令牌，不包含可重复使用的通行码。扫码设备仍需单独输入通行码。
+      </p>
 
       {/* Expiry */}
       {expiresAt > 0 && (

@@ -3,7 +3,7 @@ import type { WebSocket } from 'ws'
 export interface NodeSession {
   sessionId: string         // unique per WS session — primary routing key
   nodeId: number            // user-input node id; shared across devices of same identity
-  passCodeHash: string      // legacy sha256(passcode) — kept for migration window
+  passCodeHash: string      // deployment-keyed HMAC identity representation
   passCodeVerifyHash?: string  // scrypt(passcode, salt) — primary verification field for new sessions
   passCodeSalt?: string        // 16-byte hex salt for scrypt; absent for legacy sha256 records
   passCodeAlgo?: 'sha256' | 'scrypt'  // absent = 'sha256' (legacy)
@@ -35,6 +35,12 @@ export interface QrTokenRecord {
   expiresAt: number
   used: boolean
   failedAttempts?: number   // wrong-passcode guesses; the single-use token is burned after MAX_ATTEMPTS
+  /**
+   * Redeeming proves knowledge of the owner's passcode but does not consume
+   * the invitation. The opaque grant is committed atomically by /register so
+   * an admission failure (IP/capacity/network) can safely retry.
+   */
+  admissionGrant?: string
 }
 
 export interface ReportRecord {
@@ -60,5 +66,6 @@ export type WSClientMessage =
   | { t: 'LEAVE_CHANNEL' }
   | { t: 'SIGNAL_SDP'; targetSessionId: string; sdp: object }
   | { t: 'SIGNAL_ICE'; targetSessionId: string; candidate: object }
+  | { t: 'SIGNAL_ICE_END'; targetSessionId: string; candidate?: object }
   | { t: 'PING' }
   | { t: 'BLOCK'; sessionId: string }

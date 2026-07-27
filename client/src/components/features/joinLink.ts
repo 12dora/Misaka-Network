@@ -42,10 +42,11 @@ const ALLOWED_TYPES = new Set(['node', 'file', 'channel'])
 const TOKEN_RE = /^[A-Za-z0-9_-]{8,128}$/
 /** file-session / channel ids are uuid-ish opaque ids. */
 const OPAQUE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
-/** `c` carries a base64 passcode (btoa of six digits → 8 chars). */
-const B64_RE = /^[A-Za-z0-9+/]{1,32}={0,2}$/
-
-const ALLOWED_PARAMS = new Set(['type', 'id', 't', 'fid', 'cid', 'c'])
+// Reusable passcodes are deliberately not an invite parameter. A QR/share
+// URL carries only the opaque, expiring server token; the scanner enters the
+// passcode separately and receives a transactional single-use admission
+// grant after successful redemption.
+const ALLOWED_PARAMS = new Set(['type', 'id', 't', 'fid', 'cid'])
 
 function normalisePath(p: string): string {
   return p.length > 1 && p.endsWith('/') ? p.slice(0, -1) : p
@@ -125,9 +126,6 @@ export function parseJoinLink(
     if (v !== null && !OPAQUE_ID_RE.test(v)) return { ok: false, reason: 'BAD_PARAM' }
   }
 
-  const c = params.get('c')
-  if (c !== null && !B64_RE.test(c)) return { ok: false, reason: 'BAD_PARAM' }
-
   // Rebuild the query from validated values only — never echo the caller's
   // raw search string, and drop the fragment.
   const clean = new URLSearchParams()
@@ -136,8 +134,6 @@ export function parseJoinLink(
   clean.set('t', token)
   if (params.get('fid')) clean.set('fid', params.get('fid') as string)
   if (params.get('cid')) clean.set('cid', params.get('cid') as string)
-  if (c) clean.set('c', c)
-
   return { ok: true, path: `${normalisePath(joinRoute)}?${clean.toString()}` }
 }
 
