@@ -29,14 +29,48 @@ jobs:
           cache: npm
           cache-dependency-path: client/package-lock.json
 
+      # Must run BEFORE the build: its `base_path` output is the real path
+      # this deployment will be served from — '/<repository-name>' for a
+      # project site, '' for a user/org site or a custom domain. Feeding that
+      # into VITE_BASE is what keeps asset URLs, the router basename and the
+      # 404 redirect in agreement (CONFIG-005). Nothing here hard-codes the
+      # repository name any more.
+      - name: Setup Pages
+        id: pages
+        uses: actions/configure-pages@v4
+
+      - name: Resolve deployment base
+        id: base
+        env:
+          PAGES_BASE_PATH: ${{ steps.pages.outputs.base_path }}
+        run: |
+          base="$PAGES_BASE_PATH"
+          case "$base" in
+            ""|"/") base="/" ;;
+            *)      base="${base%/}/" ;;
+          esac
+          echo "Resolved VITE_BASE=$base"
+          echo "vite_base=$base" >> "$GITHUB_OUTPUT"
+
       - name: Install dependencies
         run: cd client && npm ci
 
       - name: Build
+        env:
+          VITE_BASE: ${{ steps.base.outputs.vite_base }}
         run: cd client && npm run build
 
-      - name: Setup Pages
-        uses: actions/configure-pages@v4
+      - name: Assert built base is consistent
+        env:
+          VITE_BASE: ${{ steps.base.outputs.vite_base }}
+        run: |
+          set -e
+          # The 404 redirect target must equal the base the bundle was built
+          # with, otherwise a deep link bounces somewhere the router does not
+          # serve.
+          grep -q "var base = '${VITE_BASE}'" client/dist/404.html
+          grep -q "${VITE_BASE}assets/" client/dist/index.html
+          echo "base consistency OK for VITE_BASE=$VITE_BASE"
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

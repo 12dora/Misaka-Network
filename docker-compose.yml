@@ -5,15 +5,29 @@ services:
       dockerfile: Dockerfile
     container_name: misaka-signaling
     restart: unless-stopped
-    # Secrets (TURN_CF_KEY_ID / TURN_CF_API_TOKEN / TURN_CF_ACCOUNT_TAG) live
-    # in .env (gitignored). Public knobs live inline in `environment:` so
-    # docker-compose config diffs stay reviewable.
+    # Secrets live in a gitignored root `.env` (see .env.example):
+    #   TURN_CF_KEY_ID / TURN_CF_API_TOKEN / TURN_CF_ACCOUNT_TAG / SERVER_SECRET
+    #
+    # The file is OPTIONAL so `docker compose up -d --build` works on a clean
+    # checkout: without it the stack still starts, just with auto-TURN
+    # unconfigured and a random per-process SERVER_SECRET. Create it before
+    # you rely on Cloudflare TURN or on identifiers surviving a restart:
+    #   cp .env.example .env
+    #
+    # Public knobs stay inline in `environment:` so `docker compose config`
+    # diffs remain reviewable. Values set here WIN over the env file.
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       PORT: 9080
       MAX_NODES: 10000
       RATE_LIMIT_PER_MIN: 60
+
+      # This stack publishes 9080 directly — there is no reverse proxy in
+      # front of it, so X-Forwarded-For must NOT be trusted or every per-IP
+      # defence becomes spoofable. The Caddy stack in deploy/ sets this to 1.
+      TRUST_PROXY: "0"
 
       # ── TURN auto-provisioning (Cloudflare) ─────────────────────────
       # Master switch. Set to "false" to disable server-side TURN delivery
@@ -26,12 +40,12 @@ services:
       TURN_CREDENTIAL_TTL_SEC: 300
 
       # Per-session / per-IP abuse caps.
-      TURN_MAX_BYTES_PER_SESSION: 1073741824        # 1 GB
-      TURN_MAX_BYTES_PER_HOUR_PER_IP: 10737418240   # 10 GB
+      TURN_MAX_BYTES_PER_SESSION: 1073741824        # 1 GiB
+      TURN_MAX_BYTES_PER_HOUR_PER_IP: 10737418240   # 10 GiB
       TURN_MAX_ISSUE_PER_HOUR_PER_IP: 60
 
-      # Global monthly kill switch (defend the free 1 TB Cloudflare quota).
-      TURN_GLOBAL_MONTHLY_BYTES_LIMIT: 1099511627776  # 1 TB
+      # Global monthly kill switch (defend the free 1 TiB Cloudflare quota).
+      TURN_GLOBAL_MONTHLY_BYTES_LIMIT: 1099511627776  # 1 TiB
       TURN_GLOBAL_THRESHOLD_PCT: 90
       TURN_REVOKE_ALL_ON_KILL: "false"
 
@@ -43,8 +57,8 @@ services:
       TURN_ABUSE_POLL_SEC: 30
       TURN_GLOBAL_POLL_SEC: 120
 
-      # Deny-list TTL (seconds). 0 = permanent.
-      TURN_BAN_DURATION_SEC: 86400                  # 24 h
+      # Retry cadence for CF revoke calls that previously failed (ms).
+      TURN_REVOKE_RETRY_INTERVAL_MS: 60000
 
       # Persistence.
       TURN_PERSIST_DIR: /app/data
@@ -52,4 +66,13 @@ services:
     ports:
       - "9080:9080"
     volumes:
+      # Durable app state: TURN monthly tally / active credentials / issuance
+      # history and the brute-force lock snapshot. Bind mount so it is easy to
+      # back up and inspect; `./data` is gitignored.
       - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9080/api/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s

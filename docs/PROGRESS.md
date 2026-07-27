@@ -51,10 +51,10 @@
 - ☑ 续传从对端真实 chunk bitmap 拉取（sender 接收 ResumeRequest 后使用 peerReceivedChunks）
 - ☑ 取消 / 暂停 / 恢复 三按钮 + 传输信号机
 - ☑ 大文件流式写盘（File System Access API + Blob 拼接降级）
-- ☑ 1GB 文件内存压测（server/tests/stress-1gb.test.mjs）— sender +1.6MB / streaming +0MB / Blob 组装峰值 1.7GB
+- ◐ 1 GiB 文件内存压测脚本存在（`server/tests/stress-1gb.test.mjs`，通过 `npm --prefix server run test:stress` 手动跑，不在默认 CI 内）。结论方向为「sender 与流式接收路径为常数级内存，Blob 组装降级路径峰值随文件大小线性增长」；具体数值随脚本改版会变，请以本机最近一次运行输出为准，不要引用历史数字
 
 ### 2.4 信令服务器加固
-- ◐ 自托管部署（已补 Caddy + docker-compose 生产模板与 /api/health；实际服务器部署未做）
+- ◐ 自托管部署（已补 Caddy + docker-compose 生产模板、/api/health、一跳 proxy-trust 配置与 `deploy/verify-proxy-trust.sh`；实际服务器部署与真实拓扑验证未做）
 - ☑ /api/metrics（real CPU + peak concurrent + uptime）
 - ☑ 异常退出通知对端（SERVER_SHUTDOWN + WS 1001 关闭码）
 - ☑ 通行码暴力穷举集成测试（server/tests/brute-force.test.mjs）
@@ -72,7 +72,7 @@
 - ☑ ICE disconnected 5s 主动重启（不等浏览器 30s failed 超时）
 - ☑ ICE restart 指数退避（1/2/4/8/16s，最多 5 次，超过降级 full reconnect）
 - ☑ NAT 类型检测卡（Settings → TURN 标签：open/cone/symmetric/blocked）
-- ☑ nat-classify.ts 纯逻辑分离 + 18 个单元测试（client/tests/nat-classify.test.mjs）
+- ☑ nat-classify.ts 纯逻辑分离 + 单元测试（`client/tests/unit/nat-classify.test.ts`，Vitest；旧的独立 `.mjs` 脚本已并入 `npm run test:unit`）
 - ☑ SIGNAL_ICE_END 集成测试（server/tests/signaling-end.test.mjs）
 
 ## v3 — 打磨 & 沉浸感
@@ -129,7 +129,7 @@ TURN 自动下发落地：服务端按 sessionId 申请 Cloudflare 短时效凭�
 ## 决策记录（精简）
 
 - ws 而非 socket.io；chunk 64KB；设计 token 走 CSS vars + Tailwind extend
-- 服务端全内存，无持久化；速率限制滑动窗口；上报保留 1h
+- 服务端以内存为主，但**不是完全无持久化**：TURN 状态（`turn-state.json`）与暴破锁/冻结快照（`auth-locks.json`）会原子落盘到 `TURN_PERSIST_DIR`；节点 / 会话 / 频道 / QR token / 上报仍然纯内存，进程重启即清空。速率限制滑动窗口；上报保留 1h
 - chunk 加密：iv(12B) + ciphertext 单帧；DataChannel 文本头 + 二进制体双消息
 - ECDH 在 DataChannel open 后第一帧交换，30s 超时
 - 对等发现：identity-scoped cluster — channelId = `cluster-<nodeId>-<SHA-256(passcode).slice(0,16)>`，仅同 nodeId+passcode 的设备相互可见。允许多设备共享同一身份（手机/电脑同时在线）
@@ -144,7 +144,7 @@ TURN 自动下发落地：服务端按 sessionId 申请 Cloudflare 短时效凭�
 - store.init() 必须幂等（模块级 `initialized` flag）：React 18 StrictMode 开发态会让 useEffect 双调用，第二次会重复 onMessage 注册导致每个信令被处理两次，引发并发 setRemoteDescription/setLocalDescription 触发 `Called in wrong state: stable`
 - signaling.doConnect 在 readyState === CONNECTING 时也直接 return，并把 socket 引用绑到 onopen 闭包里（用局部 `sock` 变量而不是模块级 `ws`），避免重连/重试期间老 ws 的 onopen 引到刚替换的新 ws 上调用 send，触发 "Still in CONNECTING state"
 - 前端配置三级：public/config.json + window.__MISAKA_CONFIG__ + VITE_ env
-- GitHub Pages：VITE_BASE 控制 base path；404.html + sessionStorage 恢复路径
+- 部署 base 单一来源：`VITE_BASE` → Vite `base` → 同时决定 asset URL、`import.meta.env.BASE_URL`（路由 basename 与全部对外绝对链接，见 `client/src/lib/appBase.ts`）、以及构建期写入 `dist/404.html` 的跳转目标。仓库名不再硬编码在任何一处；Pages 工作流从 `actions/configure-pages` 的 `base_path` 推导。404.html + sessionStorage 仍负责恢复深链路径
 - 聊天复用 DataChannel，JSON 文本 type='chat'，不新增协议
 - ICE restart：最多 3 次 ICE restart 后 fallback 到 full reconnect（新 PC + 新 DC）
 - 续传：sender 使用 ResumeRequest 中 peer 上报的 receivedChunks 作 skipSet，不再信任本地乐观记录
@@ -152,7 +152,7 @@ TURN 自动下发落地：服务端按 sessionId 申请 Cloudflare 短时效凭�
 - 大文件写入：优先 File System Access API 流式写盘 → OPFS 磁盘缓存（Chrome 86+/Safari 15.2+/Firefox 111+）→ 老旧浏览器降级 IndexedDB + Blob 组装
 - 网络切换重连：监听 window.online 事件直接调用 doConnect()，复用现有指数退避
 - 信令关闭通知：SERVER_SHUTDOWN 消息 + WS 1001 关闭码，客户端标记 serverShutdown 阻止重连
-- 1GB 压测：sender 流式路径 heapUsed +1.6MB（安全）；接收端流式写盘 +0MB（安全）；Blob 组装降级峰值 RSS 1.7GB（仅 Safari/Firefox 降级路径，可用）
+- 1 GiB 压测（手动脚本，非 CI 门禁）：sender 流式路径与接收端流式写盘为常数级内存；Blob 组装降级路径（仅老旧浏览器回退）峰值随文件大小线性增长，是已知的降级代价。具体数字以最近一次本机运行为准
 - OPFS 磁盘缓存：利用 navigator.storage.getDirectory() 在接收时逐 chunk 落盘，完成后 getFile() 获取引用而非常驻内存。OPFS 所有现代浏览器均支持，替换了 IndexedDB + Blob 全量组装的降级路径，避免 10GB 文件撑爆 JS heap
 - 接收文件手动下载：deliverCompletedFile 不再调用 triggerDownload，改为在 chatMessages 插入 type='file' 的消息（含 fileName/fileSize/downloadUrl 字段）；ChannelChat 对 type='file' 消息渲染文件卡片 + "↓ 下载"按钮；点击后触发下载并 revokeObjectURL，按钮变为"✓ 已下载"
 - v3 沉浸：特殊节点 9982 / 10032 / 20001 在登录卡展示 lore hint；ActivityStream 每 45s 注入一条妹妹语录；设置面板增加音效开关，扫码 / 完成 / 错误音效由 WebAudio 合成且默认开启
@@ -174,7 +174,9 @@ TURN 自动下发落地：服务端按 sessionId 申请 Cloudflare 短时效凭�
 - 接收卡片去重：`deliverCompletedFile` 以 `transferId` 去重，防止同一传输在并发回调下重复插入 file 消息
 - 未读与通知：`unreadByPeer` 记录每节点消息/文件未读数；收到文件时若页面在后台且通知权限已授权，触发系统 Notification
 - 部署标准化：根目录新增 `docker-compose.yml`，后端新增多阶段 `server/Dockerfile`；README 统一提供前后端部署步骤与 `config.json` 运行时后端地址配置方案
-- TURN 自动下发安全模型：客户端零 enforcement（可被 hook 绕过），所有黑名单/字节配额/熔断在服务端内存维护；CF 短时效凭证（默认 300s）是 revoke 失败的兜底，配合 CF revoke API 做主动吊销。`customIdentifier=misaka-${sessionId}` 用于 CF Analytics 按用户细粒度查询。API Token 仅从 env 读取、绝不进日志或响应
+- TURN 自动下发安全模型：客户端零 enforcement（可被 hook 绕过），所有黑名单/字节配额/熔断在服务端内存维护；CF 短时效凭证（默认 300s）是 revoke 失败的兜底，配合 CF revoke API 做主动吊销。`customIdentifier` 用于 CF Analytics 按用户细粒度查询，但**不再是 `misaka-${sessionId}` 明文**：它是 `(sessionId, SERVER_SECRET)` 的单向派生值（见 `deriveCustomIdentifier`），日志里还会再脱敏一次，所以只看 CF 侧记录无法反推 sessionId。这也是 `SERVER_SECRET` 必须跨重启稳定的原因——密钥变了，历史 identifier 就再也对不上，revoke 重试永久失效。API Token 仅从 env 读取、绝不进日志或响应
 - TURN 防滥用 policy 全部 env 可配（单 session 字节上限 / 每 IP 字节 + 签发频率 / 全局月度 1T 90% 熔断 / 凭证 TTL / 轮询周期 / 封禁时长）；pessimistic byte 估算 + Analytics 校准双路径（Analytics 有 1~5 min 延迟，pessimistic 走零延迟快路径）
-- TURN 状态持久化：`server/data/turn-state.json` 原子写（writeFile .tmp + rename），10s 节流批量写 + 关键事件即时写 + 关停 graceful flush。仅 TURN 数据持久化；nodes / channels / qrTokens / reports 维持原内存策略
-- 部署密钥：`TURN_CF_KEY_ID / TURN_CF_API_TOKEN / TURN_CF_ACCOUNT_TAG` 走根目录 `.env`（已加入 .gitignore），compose 用 `env_file` 引用；`.env.example` 仅占位提示
+- TURN 状态持久化：`$TURN_PERSIST_DIR/turn-state.json` 原子写（writeFile .tmp + rename），10s 节流批量写 + 关键事件即时写 + 关停 graceful flush。目录默认 `./data`，容器内固定 `/app/data`（根 compose 绑定 `./data`，生产 compose 用命名卷 `misaka_data`）。同目录下还有 `auth-locks.json`（暴破锁 + nodeId 冻结）；nodes / channels / qrTokens / reports 维持原内存策略
+- 部署密钥：`SERVER_SECRET` 与 `TURN_CF_KEY_ID / TURN_CF_API_TOKEN / TURN_CF_ACCOUNT_TAG` 走 `.env`（已加入 .gitignore）—— 根栈用根 `.env`，Caddy 生产栈用 `deploy/.env`。根 compose 的 `env_file` 标了 `required: false`，干净检出不建文件也能 `docker compose up`；生产 compose 反过来用 `${SERVER_SECRET:?...}` 强制校验，缺密钥直接失败而不是静默用随机值
+- 启动入口统一：`npm run dev` / `npm start` / Docker CMD 全部走 `server/src/bootstrap.ts`，按 `$MISAKA_ENV_FILE` → `server/.env` → 仓库根 `.env` 顺序加载，进程环境始终优先；测试与 Playwright 直接跑 `dist/index.js`（`npm run start:raw`）以保证不读任何 .env
+- 代理信任：拓扑固定为 internet → Caddy → signaling 一跳。Caddy 先丢弃客户端自带的 `X-Forwarded-For / X-Real-IP / Forwarded`，再用 `{http.request.remote.host}` 重写；服务端 `TRUST_PROXY=1`。两者必须成对，验证脚本见 `deploy/verify-proxy-trust.sh`

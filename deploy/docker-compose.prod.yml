@@ -1,3 +1,18 @@
+# Production stack: Caddy (TLS terminator / edge) → signaling (private).
+#
+# Topology assumed by TRUST_PROXY below — exactly ONE hop:
+#
+#   internet ──TLS──> caddy ──http──> signaling:9080
+#
+# The signaling container is NOT published to the host (`expose:` only), so
+# the only way in is through Caddy, and Caddy overwrites X-Forwarded-For with
+# the real socket peer (see Caddyfile.example). Those two facts together are
+# what make TRUST_PROXY=1 safe. If you put another proxy / CDN / load balancer
+# in front of Caddy, you must raise the hop count AND make that outer hop
+# rewrite the forwarded headers too — otherwise a client-supplied header wins
+# again and every per-IP defence (register IP cap, brute-force lock, rate
+# limits, TURN accounting) becomes spoofable.
+
 services:
   signaling:
     build:
@@ -5,12 +20,78 @@ services:
       dockerfile: Dockerfile
     container_name: misaka-signaling
     restart: unless-stopped
+    # Secrets + operator overrides live in a gitignored `deploy/.env`
+    # (see deploy/.env.example). Optional so `docker compose config` works on
+    # a clean checkout, but production MUST create it — at minimum
+    # SERVER_SECRET, and the TURN_CF_* triple if auto TURN stays enabled.
+    #   cp .env.example .env
+    env_file:
+      - path: .env
+        required: false
     environment:
       PORT: 9080
       MAX_NODES: 10000
       RATE_LIMIT_PER_MIN: 60
+
+      # Exactly one trusted hop: the caddy service in this same stack.
+      TRUST_PROXY: "1"
+
+      # Explicit secret mapping. Values come from deploy/.env (or the host
+      # environment); listing them here means a missing secret is visible in
+      # `docker compose config` instead of silently defaulting.
+      #
+      # SERVER_SECRET must be STABLE across restarts: it derives the
+      # Cloudflare customIdentifier, so a rotating value orphans in-flight
+      # credentials and breaks revoke retries. Generate once with
+      #   openssl rand -hex 32
+      SERVER_SECRET: ${SERVER_SECRET:?set SERVER_SECRET in deploy/.env — openssl rand -hex 32}
+      TURN_AUTO_ENABLED: ${TURN_AUTO_ENABLED:-true}
+      TURN_PROVIDER: ${TURN_PROVIDER:-cloudflare}
+      TURN_CF_KEY_ID: ${TURN_CF_KEY_ID:-}
+      TURN_CF_API_TOKEN: ${TURN_CF_API_TOKEN:-}
+      TURN_CF_ACCOUNT_TAG: ${TURN_CF_ACCOUNT_TAG:-}
+
+      # Origin policy. `*` (the default) = public-signaling mode: any browser
+      # origin may talk to this server. A comma-separated list = strict mode.
+      # NOTE the `-` (not `:-`): writing `ALLOWED_ORIGINS=` in deploy/.env is
+      # an explicit lockdown that allows NO browser origin, and that intent is
+      # preserved here instead of being silently upgraded to wildcard.
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS-*}
+
+      # Abuse / cost guards — same defaults as the root compose stack.
+      TURN_CREDENTIAL_TTL_SEC: 300
+      TURN_MAX_BYTES_PER_SESSION: 1073741824        # 1 GiB
+      TURN_MAX_BYTES_PER_HOUR_PER_IP: 10737418240   # 10 GiB
+      TURN_MAX_ISSUE_PER_HOUR_PER_IP: 60
+      TURN_GLOBAL_MONTHLY_BYTES_LIMIT: 1099511627776  # 1 TiB
+      TURN_GLOBAL_THRESHOLD_PCT: 90
+      TURN_REVOKE_ALL_ON_KILL: "false"
+      TURN_PESSIMISTIC_RATE_BPS: 10000000           # 10 Mbps
+      TURN_ABUSE_POLL_SEC: 30
+      TURN_GLOBAL_POLL_SEC: 120
+      TURN_REVOKE_RETRY_INTERVAL_MS: 60000
+
+      # Durable state directory inside the container (see the volume below).
+      TURN_PERSIST_DIR: /app/data
+      TURN_PERSIST_INTERVAL_SEC: 10
     expose:
       - "9080"
+    volumes:
+      # Named volume, NOT the anonymous volume the Dockerfile would otherwise
+      # create: TURN monthly tally, active credentials, issuance history and
+      # the brute-force lock/freeze snapshot must survive `down`/`up` and
+      # image rebuilds, or the kill switch and bans reset to zero.
+      #
+      # Backup:  docker run --rm -v misaka_data:/data -v "$PWD:/backup" \
+      #            alpine tar czf /backup/misaka-data-$(date +%F).tar.gz -C /data .
+      # Restore: docker run --rm -v misaka_data:/data -v "$PWD:/backup" \
+      #            alpine sh -c 'cd /data && tar xzf /backup/<file>.tar.gz'
+      #
+      # Retention: the files hold no user content — only counters, opaque
+      # derived TURN identifiers and IP-keyed abuse state. Daily snapshots
+      # with a short (7–30 day) retention are enough; keep them out of any
+      # world-readable location because the IP-keyed rows are personal data.
+      - misaka_data:/app/data
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9080/api/health"]
       interval: 15s
@@ -34,5 +115,6 @@ services:
       - caddy_config:/config
 
 volumes:
+  misaka_data:
   caddy_data:
   caddy_config:

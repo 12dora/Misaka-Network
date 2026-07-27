@@ -5,11 +5,16 @@
   <title>MISAKA NETWORK</title>
   <script>
     (function () {
-      var repoBase = '/Misaka-Network';
-      var base = location.hostname.endsWith('.github.io') &&
-        (location.pathname === repoBase || location.pathname.indexOf(repoBase + '/') === 0)
-        ? repoBase + '/'
-        : '/';
+      // `%BASE_URL%` is substituted at build time by the
+      // `misaka-base-aware-404` plugin in vite.config.ts, using the SAME
+      // Vite `base` that produced the asset URLs and the router basename —
+      // so this redirect can never point somewhere the router doesn't serve.
+      //
+      // Seeing the literal token means the file was copied without a build,
+      // or the build used a relative base; fall back to the origin root,
+      // which is what a relative base means for routing anyway.
+      var base = '%BASE_URL%';
+      if (base.charAt(0) !== '/') base = '/';
 
       sessionStorage.setItem('misaka-redirect', location.pathname + location.search + location.hash);
       location.replace(base);
@@ -17,6 +22,6 @@
   </script>
 </head>
 <body>
-  <a href="/">Go to MISAKA NETWORK</a>
+  <a href="%BASE_URL%">Go to MISAKA NETWORK</a>
 </body>
 </html>

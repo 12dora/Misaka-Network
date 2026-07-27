@@ -24,5 +24,10 @@ COPY package.json ./
 # / bans survive restarts. Default permissions are fine for the node user.
 RUN mkdir -p /app/data
 VOLUME ["/app/data"]
-EXPOSE 8080
-CMD ["node", "dist/index.js"]
+# Must match the runtime default in src/config.ts (PORT=9080) and the port
+# published by docker-compose.yml / deploy/docker-compose.prod.yml.
+EXPOSE 9080
+# Same entry point as `npm run dev` and `npm start` (see src/bootstrap.ts):
+# it loads /app/.env when one is mounted, and otherwise just runs on the
+# process environment injected by Compose.
+CMD ["node", "dist/bootstrap.js"]
