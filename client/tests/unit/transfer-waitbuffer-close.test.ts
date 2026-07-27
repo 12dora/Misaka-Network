@@ -19,7 +19,8 @@ function makeParkedDc() {
     onbufferedamountlow: null as null | (() => void),
     addEventListener(t: string, fn: () => void) { (listeners[t] ??= new Set()).add(fn) },
     removeEventListener(t: string, fn: () => void) { listeners[t]?.delete(fn) },
-    _fire(t: string) { for (const fn of listeners[t] ?? []) fn() },
+    _fire(t: string) { for (const fn of [...(listeners[t] ?? [])]) fn() },
+    _listenerCount(t: string) { return listeners[t]?.size ?? 0 },
   }
 }
 
@@ -56,8 +57,63 @@ describe('waitForBuffer settles on channel death', () => {
   it('still resolves via bufferedamountlow in the normal case', async () => {
     const dc = makeParkedDc()
     const p = waitForBuffer(dc as unknown as RTCDataChannel)
-    // The browser fires bufferedamountlow once the queue drains.
-    dc.onbufferedamountlow?.()
+    // The browser fires bufferedamountlow once the queue drains. BUG-015
+    // moved the waiter off the single-slot `dc.onbufferedamountlow` property
+    // onto a real listener, so that is what the test dispatches.
+    expect(dc.onbufferedamountlow).toBeNull()
+    dc._fire('bufferedamountlow')
     await expect(p).resolves.toBeUndefined()
+  })
+
+  // ── BUG-015 ────────────────────────────────────────────────────────
+  // Two concurrent transfers (or two lanes of one transfer) can both be
+  // parked above the high-water mark on the SAME channel. The old
+  // implementation stored the waiter in `dc.onbufferedamountlow`, a single
+  // slot: the second waiter overwrote the first, and whichever waiter ran
+  // `cleanup()` first nulled the other one out. The loser's promise never
+  // settled, `Promise.allSettled(lanes)` never resolved, and the send hung.
+  describe('BUG-015: concurrent waiters on one channel', () => {
+    it('wakes EVERY parked waiter on a single bufferedamountlow event', async () => {
+      const dc = makeParkedDc()
+      const settled = [false, false, false]
+      const promises = settled.map((_, i) =>
+        waitForBuffer(dc as unknown as RTCDataChannel).then(() => { settled[i] = true }),
+      )
+      await Promise.resolve()
+      expect(settled).toEqual([false, false, false])
+
+      dc._fire('bufferedamountlow')
+      await Promise.all(promises)
+      expect(settled).toEqual([true, true, true])
+    })
+
+    it('one waiter settling does not strip the others listeners', async () => {
+      const dc = makeParkedDc()
+      let firstDone = false
+      let secondDone = false
+      const first = waitForBuffer(dc as unknown as RTCDataChannel).then(() => { firstDone = true })
+      const second = waitForBuffer(dc as unknown as RTCDataChannel).then(() => { secondDone = true })
+
+      // Deliver the event to the FIRST waiter only by firing once — both
+      // listeners are independent registrations, so both must settle.
+      dc._fire('bufferedamountlow')
+      await Promise.all([first, second])
+      expect(firstDone).toBe(true)
+      expect(secondDone).toBe(true)
+
+      // Every listener removed itself: a later event has nothing to call.
+      const remaining = dc._listenerCount('bufferedamountlow')
+      expect(remaining).toBe(0)
+    })
+
+    it('a dying channel settles all parked waiters, not just one', async () => {
+      const dc = makeParkedDc()
+      const results: string[] = []
+      const a = waitForBuffer(dc as unknown as RTCDataChannel).then(() => results.push('a'))
+      const b = waitForBuffer(dc as unknown as RTCDataChannel).then(() => results.push('b'))
+      dc._fire('close')
+      await Promise.all([a, b])
+      expect(results.sort()).toEqual(['a', 'b'])
+    })
   })
 })

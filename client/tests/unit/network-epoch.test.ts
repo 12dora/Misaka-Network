@@ -125,7 +125,7 @@ vi.mock('@/lib/crypto', () => ({
 }))
 
 vi.mock('@/lib/transfer', () => ({
-  sendFileParallel: vi.fn(async () => {}),
+  sendFileParallel: vi.fn(async () => ({ state: 'saved', acked: true, legacyPeer: false })),
   handleMetaMessage: vi.fn(async () => {}),
   receiveChunk: vi.fn(async () => null),
   completeReceive: vi.fn(async () => new File([], 'x')),
@@ -151,6 +151,26 @@ vi.mock('@/lib/transfer', () => ({
   getReceiveSession: vi.fn(() => null),
   clearTransferSignal: vi.fn(),
   TransferCancelledError: class TransferCancelledError extends Error {},
+  // ── protocol v2 surface (P0 delivery-semantics group) ──
+  PROTOCOL_VERSION: 2,
+  makeHelloMessage: () => JSON.stringify({ type: 'hello', v: 2 }),
+  setPeerProtocolVersion: vi.fn(),
+  negotiatedProtocolVersion: vi.fn(() => 2),
+  validateMetaMessage: vi.fn(() => ({ ok: false, code: 'malformed', message: 'stub' })),
+  prepareReceiveBackend: vi.fn(async () => ({ ok: true, mode: 'idb' })),
+  finalizeReceive: vi.fn(async () => ({ file: new File([], 'x'), bytes: 0, backend: 'idb' })),
+  buildRepairRequest: vi.fn(() => null),
+  applyRepairRequest: vi.fn(() => -1),
+  markReceiverReady: vi.fn(() => true),
+  markReceiverRejected: vi.fn(() => true),
+  markTransferAcked: vi.fn(() => true),
+  hasLiveSendTask: vi.fn(() => false),
+  applyPeerPause: vi.fn(() => true),
+  applyPeerResume: vi.fn(() => true),
+  applyPeerCancel: vi.fn(() => true),
+  resetTransferModuleState: vi.fn(),
+  forgetTransfer: vi.fn(),
+  TransferOwnershipError: class TransferOwnershipError extends Error {},
 }))
 
 vi.mock('@/lib/nat', () => ({
@@ -164,6 +184,8 @@ vi.mock('@/lib/db', () => ({
   getTransfer: vi.fn(async () => null),
   getActiveTransfers: vi.fn(async () => []),
   deleteChunks: vi.fn(async () => {}),
+  // QUALITY-001: the epoch teardown prunes terminal rows.
+  pruneTerminalTransfers: vi.fn(async () => 0),
 }))
 
 vi.mock('@/lib/sound', () => ({ playSound: vi.fn() }))

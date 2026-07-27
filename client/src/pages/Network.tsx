@@ -1052,19 +1052,20 @@ export default function Network() {
     }
     store.pauseTransfer(transferId)
   }
+  // BUG-019: "重试" / "继续" used to be fire-and-forget. The store flipped the
+  // card to 转输中 and then hit a silent early return whenever the source File,
+  // the persisted record or the DataChannel was gone, leaving a permanently
+  // fake in-progress card. The store now validates preconditions BEFORE the
+  // status change and rejects with a structured `TransferResumeError`; this
+  // call site awaits it and surfaces the reason.
   function dispatchResume(transferId: string, peerSid: string) {
     const t = store.transfers.find(tr => tr.id === transferId)
-    if (t?.direction === 'recv') {
-      // TODO(main-agent): wire resumeReceiveTransfer(transferId).
-      const s = useNetworkStore.getState() as unknown as {
-        resumeReceiveTransfer?: (id: string) => void
-        resumeTransfer: (id: string, sid: string) => Promise<void>
-      }
-      if (typeof s.resumeReceiveTransfer === 'function') s.resumeReceiveTransfer(transferId)
-      else void s.resumeTransfer(transferId, peerSid)
-      return
-    }
-    void store.resumeTransfer(transferId, peerSid)
+    const run = t?.direction === 'recv'
+      ? useNetworkStore.getState().resumeReceiveTransfer(transferId)
+      : store.resumeTransfer(transferId, peerSid)
+    void Promise.resolve(run).catch((e: unknown) => {
+      showToast(e instanceof Error ? e.message : '无法继续该传输')
+    })
   }
   function dispatchCancel(transferId: string) {
     const t = store.transfers.find(tr => tr.id === transferId)

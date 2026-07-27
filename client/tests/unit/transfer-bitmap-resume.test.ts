@@ -46,10 +46,12 @@ vi.mock('../../src/lib/crypto', async () => {
 import {
   handleMetaMessage,
   receiveChunk,
+  prepareReceiveBackend,
   buildResumeRequest,
   decodeResumeRequest,
   type MetaMessage,
 } from '../../src/lib/transfer'
+import { makeMeta as buildMeta, makeChunk, CHUNK_SIZE } from './_transfer-fixtures'
 import {
   bitmapToIndexes,
   bitmapPopcount,
@@ -61,17 +63,21 @@ function makeIv(): Uint8Array<ArrayBuffer> {
   return new Uint8Array(12) as Uint8Array<ArrayBuffer>
 }
 
+const OWNER = { peerSessionId: PEER, epoch: 0 }
+
 function makeMeta(transferId: string, totalChunks: number): MetaMessage {
-  return {
-    type: 'meta',
-    transferId,
-    shortId: 1,
-    fileName: 'bitmap-test.bin',
-    fileSize: totalChunks * 64,
-    fileHash: '',
-    totalChunks,
-    mime: 'application/octet-stream',
-  }
+  return buildMeta({ transferId, totalChunks, fileName: 'bitmap-test.bin' })
+}
+
+/** Register the session AND commit a backend (BUG-011) before any chunk. */
+async function openSession(transferId: string, totalChunks: number) {
+  const meta = makeMeta(transferId, totalChunks)
+  const session = await handleMetaMessage(meta, 1, OWNER)
+  await prepareReceiveBackend(
+    { transferId, fileName: meta.fileName, totalChunks, size: meta.fileSize },
+    OWNER,
+  )
+  return { meta, session }
 }
 
 beforeEach(() => {
@@ -82,7 +88,7 @@ beforeEach(() => {
 
 describe('receiver bitmap persistence', () => {
   it('receiveChunk advances receivedCount and persists bitmap (not number[])', async () => {
-    await handleMetaMessage(makeMeta('p1', 10), 1)
+    const { meta } = await openSession('p1', 10)
 
     // Initial save uses bitmap, not chunks.
     const initial = records.get('p1')
@@ -91,15 +97,16 @@ describe('receiver bitmap persistence', () => {
     expect(initial.receivedBitmap.byteLength).toBe(2) // ceil(10/8)
 
     // Send 3 chunks — they should land in the bitmap, not as a JSON array.
-    const buf = new Uint8Array(64).buffer
     for (const i of [0, 2, 7]) {
-      await receiveChunk('p1', i, makeIv(), buf, PEER)
+      const c = makeChunk(meta, i)
+      await receiveChunk('p1', i, c.iv, c.encrypted, PEER)
     }
     // Force a flush by also waiting the throttle window. Our test uses
     // performance.now via vitest fake env; instead, jump straight to the
     // last chunk so the "size === total" branch flushes synchronously.
     for (const i of [1, 3, 4, 5, 6, 8, 9]) {
-      await receiveChunk('p1', i, makeIv(), buf, PEER)
+      const c = makeChunk(meta, i)
+      await receiveChunk('p1', i, c.iv, c.encrypted, PEER)
     }
 
     const final = records.get('p1')
@@ -118,7 +125,7 @@ describe('receiver bitmap persistence', () => {
       direction: 'recv',
       peerNodeId: 1,
       fileName: 'legacy.bin',
-      fileSize: 64 * 100,
+      fileSize: 100 * CHUNK_SIZE,
       fileHash: '',
       totalChunks: 100,
       receivedChunks: [0, 1, 2, 50, 99],
@@ -127,7 +134,7 @@ describe('receiver bitmap persistence', () => {
       updatedAt: 0,
     })
 
-    const session = await handleMetaMessage(makeMeta('p2', 100), 1)
+    const session = await handleMetaMessage(makeMeta('p2', 100), 1, OWNER)
     expect(session.receivedCount).toBe(5)
     // After meta restore, the persisted record should be migrated to
     // bitmap format (receivedChunks emptied, receivedBitmap set).
@@ -146,7 +153,7 @@ describe('receiver bitmap persistence', () => {
       direction: 'recv',
       peerNodeId: 1,
       fileName: 'b.bin',
-      fileSize: 64 * 20,
+      fileSize: 20 * CHUNK_SIZE,
       fileHash: '',
       totalChunks: 20,
       receivedChunks: [],
@@ -156,7 +163,7 @@ describe('receiver bitmap persistence', () => {
       updatedAt: 0,
     })
 
-    const session = await handleMetaMessage(makeMeta('p3', 20), 1)
+    const session = await handleMetaMessage(makeMeta('p3', 20), 1, OWNER)
     expect(session.receivedCount).toBe(3)
     expect(bitmapToIndexes(session.received, 20)).toEqual([5, 6, 7])
   })
@@ -170,7 +177,7 @@ describe('resume wire format', () => {
       direction: 'recv',
       peerNodeId: 1,
       fileName: 's.bin',
-      fileSize: 64 * 10,
+      fileSize: 10 * CHUNK_SIZE,
       fileHash: '',
       totalChunks: 10,
       receivedChunks: [],
@@ -195,7 +202,7 @@ describe('resume wire format', () => {
       direction: 'recv',
       peerNodeId: 1,
       fileName: 'b.bin',
-      fileSize: 64 * 4000,
+      fileSize: 4000 * CHUNK_SIZE,
       fileHash: '',
       totalChunks: 4000,
       receivedChunks: [],

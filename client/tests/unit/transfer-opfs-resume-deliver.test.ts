@@ -1,31 +1,33 @@
-// Regression [P1]: OPFS resume delivered as FAILED. deliverCompletedFile gated
-// the OPFS branch on `opfsWrittenCount(id) === totalChunks`, a popcount of the
-// handle's `written` bitmap — which is only set for chunks written IN THE
-// CURRENT session. After a mid-transfer reload, the sender resume-skips the
-// already-persisted chunks (they are never re-shipped), so their `written` bits
-// are never set this session. When the last missing chunk lands, the receive
-// bitmap hits totalChunks but opfsWrittenCount stays < totalChunks — the gate
-// was false, delivery fell through to the IDB-assemble branch, and it threw
-// "Missing chunk 0" even though every byte was on disk.
+// Regression [P1]: OPFS resume delivered as FAILED. The delivery gate keyed on
+// `opfsWrittenCount(id) === totalChunks`, a popcount of the handle's `written`
+// bitmap — which is only set for chunks written IN THE CURRENT session. After a
+// mid-transfer reload the sender resume-skips the already-persisted chunks, so
+// their `written` bits are never set again: the receive bitmap hit totalChunks
+// while `opfsWrittenCount` stayed below it, the gate was false, delivery fell
+// through to the IDB-assemble branch and threw "Missing chunk 0" even though
+// every byte was on disk.
 //
-// This test reproduces the exact resume state and asserts the invariant the
-// FIXED gate keys on: the receive session's receivedCount (authoritative) reaches
-// totalChunks while opfsWrittenCount does NOT. If someone reverts the network.ts
-// gate to opfsWrittenCount, the delivered file would be wrongly rejected.
+// TEST-006 note: the end-to-end proof that a resumed transfer is delivered FROM
+// OPFS now lives in `transfer-deliver-after-write.test.ts`, which drives the
+// real store handler. This file keeps the tight engine-level invariant that the
+// gate must key on: `session.receivedCount`, never the session-local write
+// bitmap. It drives the production `receiveChunk` (which, since BUG-017, owns
+// the durable write itself) rather than re-implementing the write order.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 const TOTAL = 4
 const RESUME_ID = 'opfs-resume-deliver'
 
-// A prior record: chunks 0 and 1 were already received and written to OPFS in
-// the previous (pre-reload) session.
 vi.mock('../../src/lib/db', () => ({
   saveTransfer: vi.fn(async () => {}),
   updateTransfer: vi.fn(async () => {}),
   getTransfer: vi.fn(async (id: string) =>
     id === RESUME_ID
-      ? { transferId: RESUME_ID, direction: 'recv', totalChunks: TOTAL, receivedChunks: [0, 1] }
+      ? {
+          transferId: RESUME_ID, direction: 'recv', peerSessionId: 'peer-A', epoch: 0,
+          fileSize: TOTAL * 252 * 1024, totalChunks: TOTAL, receivedChunks: [0, 1],
+        }
       : null),
   getActiveTransfers: vi.fn(async () => []),
   saveChunk: vi.fn(async () => {}),
@@ -35,6 +37,7 @@ vi.mock('../../src/lib/db', () => ({
   // [] for a resumed OPFS transfer — the sender skips them via the restored
   // receive bitmap, not via this list.
   getSavedChunkIndexes: vi.fn(async () => []),
+  pruneTerminalTransfers: vi.fn(async () => 0),
 }))
 
 vi.mock('../../src/lib/crypto', async () => {
@@ -48,15 +51,16 @@ vi.mock('../../src/lib/crypto', async () => {
 import {
   handleMetaMessage,
   receiveChunk,
-  createOPFSReceiveFile,
-  writeChunkToOPFS,
+  prepareReceiveBackend,
   opfsWrittenCount,
   getReceiveSession,
   cleanupOPFS,
   type MetaMessage,
 } from '../../src/lib/transfer'
+import { makeMeta, makeChunk } from './_transfer-fixtures'
 
 let origStorage: unknown
+const OWNER = { peerSessionId: 'peer-A', epoch: 0 }
 
 beforeEach(() => {
   origStorage = (navigator as any).storage
@@ -87,39 +91,33 @@ afterEach(async () => {
   else (navigator as any).storage = origStorage
 })
 
-const META: MetaMessage = {
-  type: 'meta',
-  transferId: RESUME_ID,
-  shortId: 1,
-  fileName: 'opfs.bin',
-  fileSize: TOTAL * 64,
-  fileHash: '',
-  totalChunks: TOTAL,
-  mime: 'application/octet-stream',
-}
+const META: MetaMessage = makeMeta({
+  transferId: RESUME_ID, totalChunks: TOTAL, fileName: 'opfs.bin',
+})
 
 describe('OPFS resume: deliver must key on receivedCount, not the session-local write bitmap', () => {
   it('receivedCount reaches totalChunks while opfsWrittenCount stays below it', async () => {
-    // Fresh OPFS handle (empty `written` bitmap) — as prepareReceiveStorage
-    // creates it on resume with keepExistingData:true.
-    await createOPFSReceiveFile(RESUME_ID, META.fileName, TOTAL)
     // handleMetaMessage restores the receive bitmap from the prior record
     // (chunks 0,1) → receivedCount starts at 2 without any this-session write.
-    await handleMetaMessage(META, 1)
+    await handleMetaMessage(META, 1, OWNER)
+    // Real backend selection commits a FRESH OPFS handle (empty `written`
+    // bitmap), exactly as it does on resume with keepExistingData:true.
+    const prepared = await prepareReceiveBackend({
+      transferId: RESUME_ID, fileName: META.fileName,
+      totalChunks: TOTAL, size: META.fileSize,
+    }, OWNER)
+    expect(prepared).toMatchObject({ ok: true, mode: 'opfs' })
 
     const session0 = getReceiveSession(RESUME_ID)
     expect(session0?.receivedCount).toBe(2)
     expect(opfsWrittenCount(RESUME_ID)).toBe(0) // nothing written THIS session yet
 
-    const iv = new Uint8Array(12) as Uint8Array<ArrayBuffer>
-    const buf = new Uint8Array(64).buffer
-
-    // Only the remaining chunks 2,3 are re-shipped by the sender.
+    // Only the remaining chunks 2,3 are re-shipped by the sender. `receiveChunk`
+    // performs the OPFS write itself (BUG-017), so nothing here re-implements
+    // the ordering.
     for (const i of [2, 3]) {
-      const result = await receiveChunk(RESUME_ID, i, iv, buf, 'peer-A')
-      if (result && result.storageMode === 'stream') {
-        await writeChunkToOPFS(RESUME_ID, i, result.decrypted)
-      }
+      const c = makeChunk(META, i)
+      await receiveChunk(RESUME_ID, i, c.iv, c.encrypted, 'peer-A')
     }
 
     const session = getReceiveSession(RESUME_ID)
@@ -128,9 +126,5 @@ describe('OPFS resume: deliver must key on receivedCount, not the session-local 
     // The session-local write bitmap only saw 2,3 — it is SHORT of totalChunks.
     expect(opfsWrittenCount(RESUME_ID)).toBe(2)
     expect(opfsWrittenCount(RESUME_ID)).not.toBe(TOTAL)
-
-    // Therefore the fixed gate (receivedCount === totalChunks) delivers via the
-    // OPFS branch; the old gate (opfsWrittenCount === totalChunks) would have
-    // wrongly fallen through to the IDB-assemble branch and thrown.
   })
 })
