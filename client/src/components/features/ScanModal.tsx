@@ -78,8 +78,15 @@ export default function ScanModal({ onClose }: Props) {
   // detached ref.
   const cameraRef = useRef(createCameraController())
 
+  // A FRESH controller per effect run, disposing only the superseded one.
+  // Reusing one controller for the modal's whole lifetime looked simpler, but
+  // dispose() is permanent: switching 摄像头 re-ran this effect, whose cleanup
+  // disposed the shared controller, and every acquisition afterwards resolved
+  // `stale` — the scanner was dead until the modal was reopened. React 18
+  // StrictMode's mount/unmount/mount replay broke it the same way in dev.
   useEffect(() => {
-    const camera = cameraRef.current
+    const camera = createCameraController()
+    cameraRef.current = camera
     void startCamera()
     return () => {
       stopScanLoop()
