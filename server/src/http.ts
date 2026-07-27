@@ -10,7 +10,8 @@ import {
 } from './store.js'
 import { broadcast } from './activity.js'
 import { checkRateLimit } from './ratelimit.js'
-import { issueCredentials, getTurnStatus } from './turn.js'
+import { issueCredentials, getPublicTurnStatus, getOperatorTurnStatus, classifyTurnStatusAuth } from './turn.js'
+import { getPersistReadiness } from './persist.js'
 import { isHttpOriginAllowed, getRequestOrigin } from './origin.js'
 import type { NodeSession, QrTokenRecord, ReportRecord } from './types.js'
 import {
@@ -443,7 +444,12 @@ router.get('/stats', (_req, res) => {
 })
 
 // GET /api/turn-credentials
-router.get('/turn-credentials', async (req, res) => {
+//
+// BUG-022: this used to be a bare `async` handler. Express 4 does not forward a
+// rejected promise out of a route, so anything that threw after the provider
+// call left the request hanging until the client gave up. It now goes through
+// the same `asyncRoute` boundary as every other async route.
+router.get('/turn-credentials', asyncRoute(async (req, res) => {
   const authHeader = req.headers.authorization
   if (!authHeader?.startsWith('Bearer ')) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
   const token = authHeader.slice(7)
@@ -452,8 +458,11 @@ router.get('/turn-credentials', async (req, res) => {
 
   const result = await issueCredentials(session.sessionId, session.ip)
   if (!result.ok) {
+    // STATE_UNAVAILABLE is the SECURITY-009 fail-closed path (we cannot read
+    // the persisted month), and the ban reasons are the SECURITY-010 deny list.
     const status = result.reason === 'DISABLED' || result.reason === 'NOT_CONFIGURED' ? 503
-      : result.reason === 'GLOBAL_QUOTA_EXCEEDED' ? 503
+      : result.reason === 'GLOBAL_QUOTA_EXCEEDED' || result.reason === 'STATE_UNAVAILABLE' ? 503
+      : result.reason === 'IP_BANNED' || result.reason === 'SESSION_BANNED' ? 403
       : result.reason === 'IP_RATE_LIMITED' || result.reason === 'IP_BYTES_LIMITED' ? 429
       : 502
     res.status(status).json({ enabled: false, reason: result.reason })
@@ -468,19 +477,49 @@ router.get('/turn-credentials', async (req, res) => {
     // CF correlation id and is now a sha256-based derivation that should
     // not leave the server.
   })
+}))
+
+// GET /api/turn-status
+//
+// SECURITY-017: unauthenticated callers used to receive the monthly spend, the
+// configured limit and threshold, the kill-switch state and the raw Cloudflare
+// error string — free cost/kill-switch reconnaissance plus provider
+// diagnostics. The public view is now coarse availability only; the detailed
+// counters sit behind TURN_OPERATOR_TOKEN and report stable error codes.
+router.get('/turn-status', (req, res) => {
+  res.set('Cache-Control', 'no-store')
+  const audience = classifyTurnStatusAuth(req.headers.authorization)
+  if (audience === 'invalid') { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
+  if (audience === 'operator') { res.json(getOperatorTurnStatus()); return }
+  res.json(getPublicTurnStatus())
 })
 
-// GET /api/turn-status (no secrets, safe to expose)
-router.get('/turn-status', (_req, res) => {
-  res.json(getTurnStatus())
-})
-
-// GET /api/health
+// GET /api/health — LIVENESS. The process is up and the event loop is turning.
 router.get('/health', (_req, res) => {
   res.json({
     ok: true,
     uptimeSeconds: Math.floor((Date.now() - stats.startedAt) / 1000),
     onlineNodes: getOnlineCount(),
+  })
+})
+
+// GET /api/ready — READINESS (SECURITY-009). Separate from liveness on purpose:
+// the server only binds after both persisted snapshots have been loaded and
+// validated, and this endpoint is where that outcome is visible. `degraded`
+// means we are serving, but something that was supposed to be restored is not —
+// most importantly an unreadable TURN snapshot, which puts issuance in its
+// fail-closed state.
+router.get('/ready', (_req, res) => {
+  res.set('Cache-Control', 'no-store')
+  const readiness = getPersistReadiness()
+  const ready = readiness.turn !== 'pending' && readiness.locks !== 'pending'
+  const degraded = readiness.turn !== 'ok' || readiness.locks !== 'ok'
+  res.status(ready ? 200 : 503).json({
+    ready,
+    degraded,
+    turnState: readiness.turn,
+    locksState: readiness.locks,
+    uptimeSeconds: Math.floor((Date.now() - stats.startedAt) / 1000),
   })
 })
 

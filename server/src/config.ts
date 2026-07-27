@@ -153,8 +153,34 @@ export const TURN_PESSIMISTIC_RATE_BPS = readNum('TURN_PESSIMISTIC_RATE_BPS', 10
 export const TURN_ABUSE_POLL_SEC = readInt('TURN_ABUSE_POLL_SEC', 30, { min: 1 })
 export const TURN_GLOBAL_POLL_SEC = readInt('TURN_GLOBAL_POLL_SEC', 120, { min: 1 })
 
-// Deny-list TTL.
+// Deny-list TTL. SECURITY-010: this was configured but read by nobody — an
+// abusive session was revoked and could re-sign immediately. It now drives a
+// persisted deny list (`TurnState.denyList`). 0 disables denial entirely.
 export const TURN_BAN_DURATION_SEC = readInt('TURN_BAN_DURATION_SEC', 86400, { min: 0 })                            // 24h
+// How many distinct abusive sessions an IP has to produce inside the deny
+// window before the IP ITSELF is denied. Session-level denial is immediate;
+// the IP level needs a strike count because carrier-grade NAT collapses many
+// unrelated users onto one address.
+export const TURN_IP_BAN_STRIKES = readInt('TURN_IP_BAN_STRIKES', 3, { min: 1 })
+
+// BUG-022: wall-clock deadline for every Cloudflare call (credential issue,
+// revoke, analytics). Without it a provider that accepts the connection and
+// then never finishes parks the reservation — and the HTTP request — forever.
+export const TURN_CF_TIMEOUT_MS = readInt('TURN_CF_TIMEOUT_MS', 8000, { min: 200, max: 120_000 })
+
+// BUG-024: the analytics queries used to carry hard-coded 1,000 / 10,000 row
+// limits with no pagination, so a high-cardinality month silently under-reported
+// (and the monthly kill switch could therefore never trip). Per-identifier
+// queries now page with a cursor; hitting MAX_PAGES is an explicit degraded
+// state rather than a silent truncation.
+export const TURN_ANALYTICS_PAGE_LIMIT = readInt('TURN_ANALYTICS_PAGE_LIMIT', 1000, { min: 1, max: 10_000 })
+export const TURN_ANALYTICS_MAX_PAGES = readInt('TURN_ANALYTICS_MAX_PAGES', 20, { min: 1, max: 10_000 })
+
+// SECURITY-017: bearer token that unlocks the DETAILED /api/turn-status view
+// (monthly spend, threshold, kill-switch state, deny-list size). Unset means
+// the detailed view is unavailable to everyone and only the coarse public
+// availability is served.
+export const TURN_OPERATOR_TOKEN = process.env.TURN_OPERATOR_TOKEN ?? ''
 
 // Persistence.
 export const TURN_PERSIST_DIR = process.env.TURN_PERSIST_DIR ?? './data'

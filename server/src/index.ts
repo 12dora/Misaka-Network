@@ -87,23 +87,30 @@ setWSS(wss)
 setupWS(wss)
 startCleanupTask()
 
-// Load persisted brute-force locks + node freezes BEFORE we accept the first
-// request. Without this an attacker mid-lockout could just wait for the
-// process to restart and resume.
-loadPersistedLocks().catch(err => {
-  console.error('[boot] persist load (locks) failed:', err.message)
-})
+// SECURITY-009: AWAIT both persisted snapshots before we bind. These used to
+// be fire-and-forget, so between `listen()` and the load completing the process
+// served requests against EMPTY security state — persisted brute-force locks
+// and node freezes were not in force, the persisted TURN kill switch was off,
+// and any TURN reservation made inside that window was thrown away the moment
+// the snapshot replaced the state object. Both loaders validate their file and
+// report a readiness state (see /api/ready); an unreadable TURN snapshot makes
+// issuance fail CLOSED rather than start a fresh 0-byte month.
+try {
+  await loadPersistedLocks()
+} catch (err) {
+  console.error('[boot] persist load (locks) failed:', (err as Error).message)
+}
+try {
+  await loadTurnState()
+} catch (err) {
+  console.error('[boot] TURN state load failed; issuance will fail closed:', (err as Error).message)
+}
 
-// TURN auto-provisioning: persist + pollers. Loaded async at boot so the HTTP
-// server still binds even if the filesystem is slow. Pollers self-start only
-// when Cloudflare credentials are configured (see turn.turnConfigured()).
-loadTurnState().then(() => {
-  startPersistFlusher()
-  startTurnPollers()
-  startTurnRevokeRetry()
-}).catch(err => {
-  console.error('[boot] TURN init failed; running without auto TURN:', err.message)
-})
+// TURN auto-provisioning: persist + pollers. Pollers self-start only when
+// Cloudflare credentials are configured (see turn.turnConfigured()).
+startPersistFlusher()
+startTurnPollers()
+startTurnRevokeRetry()
 
 httpServer.listen(PORT, () => {
   console.log(`御坂信令服务器 listening on :${PORT}`)
