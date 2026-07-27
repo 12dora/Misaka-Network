@@ -13,10 +13,12 @@ import { describe, it, expect, beforeEach } from 'vitest'
 class FakeWorker {
   onmessage: ((e: MessageEvent) => void) | null = null
   onerror: ((e: { message?: string }) => void) | null = null
+  terminated = false
+  posted: unknown[] = []
   static instances: FakeWorker[] = []
   constructor() { FakeWorker.instances.push(this) }
-  postMessage() { /* never replies — we simulate a crash instead */ }
-  terminate() {}
+  postMessage(msg: unknown) { this.posted.push(msg) }
+  terminate() { this.terminated = true }
 }
 
 import { encryptInWorker, decryptInWorker } from '../../src/lib/cryptoPool'
@@ -25,18 +27,24 @@ beforeEach(() => {
   ;(globalThis as unknown as { Worker: unknown }).Worker = FakeWorker
 })
 
+/** Crash every worker currently in the pool (robust against the RR cursor). */
+function crashAll(message: string): FakeWorker[] {
+  const before = [...FakeWorker.instances]
+  for (const w of before) w.onerror?.({ message })
+  return before
+}
+
 describe('cryptoPool: worker crash rejects in-flight ops instead of hanging', () => {
   it('rejects the pending encrypt promise when its worker fires onerror', async () => {
     const p = encryptInWorker('peer-x', new Uint8Array(12), new ArrayBuffer(16))
     expect(FakeWorker.instances.length).toBeGreaterThan(0)
-    // Crash every pooled worker (robust against round-robin cursor position).
-    for (const w of FakeWorker.instances) w.onerror?.({ message: 'boom' })
+    crashAll('boom')
     await expect(p).rejects.toThrow(/crypto worker crashed/)
   })
 
   it('also settles decrypt ops on crash', async () => {
     const p = decryptInWorker('peer-y', new Uint8Array(12), new ArrayBuffer(16))
-    for (const w of FakeWorker.instances) w.onerror?.({ message: 'oom' })
+    crashAll('oom')
     await expect(p).rejects.toThrow(/crypto worker crashed/)
   })
 })

@@ -4,6 +4,21 @@ export interface TransferRecord {
   transferId: string
   direction: 'send' | 'recv'
   peerNodeId: number
+  /**
+   * SECURITY-015: the peer *session* that owns this transfer. `peerNodeId` is
+   * a user-chosen identity number shared by every device of one identity, so
+   * it can never authorise a control message — a third device in the same
+   * identity cluster has the same nodeId. The session id is unique per device
+   * and is what `assertTransferOwner` checks resume / pause / cancel / meta
+   * against. Optional so records written by pre-v2 builds still load.
+   */
+  peerSessionId?: string
+  /**
+   * SECURITY-015: the network epoch the transfer was created in. A record from
+   * a previous authenticated session must not be resumable by whoever holds
+   * the session id next.
+   */
+  epoch?: number
   fileName: string
   fileSize: number
   fileHash: string
@@ -83,6 +98,69 @@ export async function getActiveTransfers(): Promise<TransferRecord[]> {
 export async function deleteTransfer(transferId: string) {
   const db = await getDB()
   await db.delete('transfers', transferId)
+}
+
+// ── Terminal retention (QUALITY-001) ─────────────────────────────────
+// There is no transfer-history feature: a record whose status is terminal
+// (`completed` / `failed` / `failed:unsupported`) has no consumer once its
+// card leaves the screen, yet every send and every receive used to leave one
+// behind forever. Long-lived installs accumulated tens of thousands of rows,
+// which slows `getActiveTransfers()` (a full-store scan) on every reconnect
+// and burns origin quota that the *active* transfers need.
+//
+// The contract is deliberately simple and lives in exactly one place:
+//
+//   * terminal rows are kept only as a short debugging tail;
+//   * the tail is bounded by BOTH age and count — whichever bites first;
+//   * `active` / `paused` rows are NEVER pruned (they are resume state).
+
+export const TERMINAL_RETENTION_MS = 24 * 60 * 60 * 1000  // 24 h
+export const TERMINAL_RETENTION_MAX = 50                  // newest N kept
+
+const TERMINAL_STATUSES: ReadonlySet<TransferRecord['status']> =
+  new Set<TransferRecord['status']>(['completed', 'failed', 'failed:unsupported'])
+
+export function isTerminalStatus(status: TransferRecord['status']): boolean {
+  return TERMINAL_STATUSES.has(status)
+}
+
+/**
+ * Delete terminal transfer records that are older than `maxAgeMs` or that fall
+ * outside the newest `maxCount`. Returns the number of rows removed so callers
+ * (and tests) can assert the policy actually ran.
+ *
+ * Safe to call concurrently with live transfers: it only ever touches rows in
+ * a terminal state, and it reads `now` once so a row cannot be judged against
+ * a moving deadline.
+ */
+export async function pruneTerminalTransfers(
+  { maxAgeMs = TERMINAL_RETENTION_MS, maxCount = TERMINAL_RETENTION_MAX, now = Date.now() }: {
+    maxAgeMs?: number
+    maxCount?: number
+    now?: number
+  } = {},
+): Promise<number> {
+  const db = await getDB()
+  const all = await db.getAll('transfers') as TransferRecord[]
+  const terminal = all
+    .filter(t => isTerminalStatus(t.status))
+    .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))  // newest first
+
+  const doomed: string[] = []
+  terminal.forEach((record, rank) => {
+    const tooOld = now - (record.updatedAt ?? 0) > maxAgeMs
+    const tooMany = rank >= maxCount
+    if (tooOld || tooMany) doomed.push(record.transferId)
+  })
+  if (doomed.length === 0) return 0
+
+  const tx = db.transaction('transfers', 'readwrite')
+  await Promise.all(doomed.map(id => tx.store.delete(id)))
+  await tx.done
+  // Chunk rows for a terminal transfer are dead weight too — a completed
+  // IDB-mode receive deletes them at delivery, but a *failed* one never did.
+  await Promise.all(doomed.map(id => deleteChunks(id).catch(() => {})))
+  return doomed.length
 }
 
 // ── Chunks ───────────────────────────────────────────────────────────

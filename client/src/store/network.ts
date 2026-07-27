@@ -16,17 +16,25 @@ import {
 } from '@/lib/crypto'
 import {
   sendFileParallel as engineSendFileParallel, handleMetaMessage, receiveChunk,
-  completeReceive, cancelReceive, createTransferId, buildResumeRequest,
+  cancelReceive, createTransferId, buildResumeRequest,
   pauseTransfer, resumeTransfer, cancelTransfer as engineCancelTransfer,
-  streamChunkToDisk,
-  finalizeStreamedFile, cancelStreamWrite, getWriteHandle,
-  writeChunkToOPFS, getOPFSFile, getOPFSHandle, cleanupOPFS,
-  decodeChunkFrame, decodeResumeRequest, checkMetaOOMGuard,
-  prepareReceiveStorage, opfsWrittenCount, getReceiveSession, clearTransferSignal,
+  cancelStreamWrite,
+  cleanupOPFS,
+  decodeChunkFrame, decodeResumeRequest,
+  clearTransferSignal,
   TransferCancelledError,
-  type MetaMessage, type SendCallbacks, type ResumeRequest,
+  // P0 delivery-semantics group (protocol v2).
+  makeHelloMessage, setPeerProtocolVersion,
+  validateMetaMessage, prepareReceiveBackend, finalizeReceive,
+  buildRepairRequest, applyRepairRequest, markReceiverReady, markReceiverRejected,
+  markTransferAcked, hasLiveSendTask,
+  applyPeerPause, applyPeerResume, applyPeerCancel,
+  resetTransferModuleState, forgetTransfer,
+  TransferOwnershipError,
+  type SendCallbacks, type ResumeRequest,
+  type TransferOwner, type DeliveryState,
 } from '@/lib/transfer'
-import { getTransfer, getActiveTransfers } from '@/lib/db'
+import { getTransfer, getActiveTransfers, pruneTerminalTransfers } from '@/lib/db'
 import { playSound } from '@/lib/sound'
 import { notifyIncomingFile } from '@/lib/notify'
 import { refreshAutoTurn, clearAutoTurn, onTurnConfigChange, fetchTurnStatus, getAutoTurnState, loadTurnSettings } from '@/lib/turn'
@@ -67,7 +75,59 @@ const shortIdToTransferId = new Map<string, Map<number, string>>()
 let initialized = false   // see init() — prevents StrictMode double-registration
 const deliveredTransfers = new Set<string>()  // one file card per transferId
 const transferSpeedSamples = new Map<string, { bytes: number; at: number }>()
+// BUG-016: how far each transfer really got. `Transfer.status` stays the
+// coarse UI state; this map carries the durable-delivery truth
+// (queued → delivered → saved) that the ✓ badge must not overstate.
+const transferDelivery = new Map<string, DeliveryState>()
+export function getTransferDeliveryState(transferId: string): DeliveryState | undefined {
+  return transferDelivery.get(transferId)
+}
 let currentToken = ''
+
+// ── Bounded terminal retention (QUALITY-001) ─────────────────────────
+// Nothing in the app reads a completed transfer card, a delivered chat
+// message or a finished receive session after the user has moved on, yet all
+// three grew without limit for the lifetime of a tab. The store keeps a short
+// tail so the UI still shows recent history; `pruneTerminalTransfers()` does
+// the same for the IndexedDB rows.
+const MAX_TERMINAL_TRANSFER_CARDS = 30
+const MAX_CHAT_MESSAGES_PER_PEER = 300
+
+function isTerminalTransfer(t: Transfer): boolean {
+  return t.status === 'completed' || t.status === 'failed' || t.status === 'failed:unsupported'
+}
+
+/**
+ * Drop the oldest terminal transfer cards beyond the retention window. Active,
+ * pending and paused transfers are never touched — they are live state.
+ */
+export function pruneTerminalTransferCards(transfers: Transfer[]): Transfer[] {
+  const terminalCount = transfers.reduce((n, t) => n + (isTerminalTransfer(t) ? 1 : 0), 0)
+  if (terminalCount <= MAX_TERMINAL_TRANSFER_CARDS) return transfers
+  let toDrop = terminalCount - MAX_TERMINAL_TRANSFER_CARDS
+  const kept: Transfer[] = []
+  for (const t of transfers) {
+    if (toDrop > 0 && isTerminalTransfer(t)) {
+      toDrop--
+      transferSpeedSamples.delete(t.id)
+      transferDelivery.delete(t.id)
+      deliveredTransfers.delete(t.id)
+      continue
+    }
+    kept.push(t)
+  }
+  return kept
+}
+
+/** Bound one peer's chat log, revoking object URLs the dropped entries pinned. */
+export function pruneChatMessages(msgs: ChannelMessage[]): ChannelMessage[] {
+  if (msgs.length <= MAX_CHAT_MESSAGES_PER_PEER) return msgs
+  const dropped = msgs.slice(0, msgs.length - MAX_CHAT_MESSAGES_PER_PEER)
+  for (const m of dropped) {
+    if (m.downloadUrl) { try { URL.revokeObjectURL(m.downloadUrl) } catch { /* ignore */ } }
+  }
+  return msgs.slice(msgs.length - MAX_CHAT_MESSAGES_PER_PEER)
+}
 
 // ── Session epoch (BUG-001 / BUG-002) ────────────────────────────────
 // One epoch = one authenticated signaling session. A new token, a new
@@ -124,14 +184,17 @@ function enqueuePeerTask(peerSessionId: string, what: string, fn: () => Promise<
   return next
 }
 
-// Messages typed before the DC fully opened, flushed in dc.onopen.
-const outgoingQueue = new Map<string, string[]>()
+// Messages typed before the DC fully opened, flushed in dc.onopen. Each entry
+// keeps its msgId so a partial flush can report exactly which messages made it
+// (BUG-020) instead of marking the whole batch 'sent'.
+interface OutgoingItem { payload: string; msgId?: string }
+const outgoingQueue = new Map<string, OutgoingItem[]>()
 // Track msgIds in outgoingQueue so we can update their status on flush or failure.
 const queuedMessageIds = new Map<string, Set<string>>()
 
 function queueOutgoing(peerSessionId: string, payload: string, msgId?: string) {
   const q = outgoingQueue.get(peerSessionId) ?? []
-  q.push(payload)
+  q.push({ payload, msgId })
   outgoingQueue.set(peerSessionId, q)
   if (msgId) {
     const ids = queuedMessageIds.get(peerSessionId) ?? new Set<string>()
@@ -139,19 +202,55 @@ function queueOutgoing(peerSessionId: string, payload: string, msgId?: string) {
     queuedMessageIds.set(peerSessionId, ids)
   }
 }
-function flushOutgoing(peerSessionId: string, dc: RTCDataChannel) {
+
+/** Per-message outcome of one flush attempt (BUG-020). */
+export interface FlushResult {
+  sent: string[]
+  failed: string[]
+}
+
+/**
+ * BUG-020: the flush used to `try { dc.send(p) } catch { /* ignore *​/ }` every
+ * queued payload, then unconditionally delete the queue and mark EVERY queued
+ * id as 'sent'. A channel that closed mid-flush therefore reported success for
+ * messages that never left the tab, and the payloads were gone — no retry set,
+ * no failure surfaced.
+ *
+ * Now each payload is tracked individually: only what actually reached
+ * `dc.send()` is removed and marked 'sent'; the rest stay queued and are
+ * marked 'failed' so the ↺ affordance is truthful.
+ */
+function flushOutgoing(peerSessionId: string, dc: RTCDataChannel): FlushResult {
+  const result: FlushResult = { sent: [], failed: [] }
   const q = outgoingQueue.get(peerSessionId)
-  if (!q?.length) return
-  for (const p of q) {
-    try { dc.send(p) } catch { /* ignore */ }
+  if (!q?.length) return result
+
+  const remaining: OutgoingItem[] = []
+  for (const item of q) {
+    if (dc.readyState !== 'open') {
+      remaining.push(item)
+      if (item.msgId) result.failed.push(item.msgId)
+      continue
+    }
+    try {
+      dc.send(item.payload)
+      if (item.msgId) result.sent.push(item.msgId)
+    } catch {
+      remaining.push(item)
+      if (item.msgId) result.failed.push(item.msgId)
+    }
   }
-  outgoingQueue.delete(peerSessionId)
-  // All queued messages are now in-flight → mark as 'sent'.
+
+  if (remaining.length > 0) outgoingQueue.set(peerSessionId, remaining)
+  else outgoingQueue.delete(peerSessionId)
+
   const ids = queuedMessageIds.get(peerSessionId)
   if (ids) {
-    for (const id of ids) updateMessageStatus(peerSessionId, id, 'sent')
-    queuedMessageIds.delete(peerSessionId)
+    for (const id of result.sent) { updateMessageStatus(peerSessionId, id, 'sent'); ids.delete(id) }
+    for (const id of result.failed) updateMessageStatus(peerSessionId, id, 'failed')
+    if (ids.size === 0) queuedMessageIds.delete(peerSessionId)
   }
+  return result
 }
 
 function updateMessageStatus(peerSessionId: string, msgId: string, status: MessageStatus) {
@@ -573,6 +672,20 @@ function genMsgId(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
 }
 
+/**
+ * BUG-020: raised by `sendFilesToAll` when SOME targets failed. Carries the
+ * exact (peer, file) pairs so the UI can offer a scoped retry instead of the
+ * old "all-or-silence" behaviour.
+ */
+export class PartialFanoutError extends Error {
+  failures: Array<{ peerSessionId: string; fileName: string }>
+  constructor(message: string, failures: Array<{ peerSessionId: string; fileName: string }>) {
+    super(message)
+    this.name = 'PartialFanoutError'
+    this.failures = failures
+  }
+}
+
 // ── Epoch teardown ───────────────────────────────────────────────────
 
 /**
@@ -595,11 +708,22 @@ function defaultEpochTransferTeardown(transfers: Transfer[]) {
     try { cancelStreamWrite(t.id) } catch { /* no stream writer */ }
     cleanupOPFS(t.id).catch(() => {})
     clearTransferSignal(t.id)
+    // Ownership, ready-barrier, buffered frames and any live send task belong
+    // to the epoch that is ending (SECURITY-015).
+    forgetTransfer(t.id)
   }
   sendingFiles.clear()
   transferSpeedSamples.clear()
   deliveredTransfers.clear()
   shortIdToTransferId.clear()
+  transferDelivery.clear()
+  // The transfer module also holds per-peer negotiated protocol versions,
+  // in-flight backend preparations and owner records for transfers that never
+  // made it into `state.transfers`. All of it is epoch-scoped.
+  resetTransferModuleState()
+  // QUALITY-001: an epoch boundary is the natural moment to retire terminal
+  // DB rows — nothing in the next epoch can resume them.
+  void pruneTerminalTransfers().catch(() => {})
 }
 
 let epochTransferTeardown: EpochTransferTeardown = defaultEpochTransferTeardown
@@ -838,13 +962,17 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
           }
           set(s => {
             const { [sid]: _omit, ...restChat } = s.chatMessages
-            const { [sid]: _f, ...restFiles } = s.pendingFiles
             const { [sid]: _u, ...restUnread } = s.unreadByPeer
             const nextConnected = new Set(s.connectedPeers); nextConnected.delete(sid)
             return {
               peers: s.peers.map(p => p.sessionId === sid ? { ...p, status: 'offline' as const } : p),
               chatMessages: restChat,
-              pendingFiles: restFiles,
+              // BUG-021: a peer that steps away (laptop lid, tunnel, brief WS
+              // drop) must NOT destroy the files the user staged for them. The
+              // `File` handles came from a picker/drop the user cannot silently
+              // repeat — they stay until the user removes them or the epoch
+              // ends. The peer card already shows 'offline'.
+              pendingFiles: s.pendingFiles,
               connectedPeers: nextConnected,
               unreadByPeer: restUnread,
               selectedSessionId: s.selectedSessionId === sid ? null : s.selectedSessionId,
@@ -1024,11 +1152,15 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
       next.add(sessionId)
       return { sendingPeers: next }
     })
-    let allOk = true
+    // BUG-021: remember exactly WHICH staged ids succeeded. The old code
+    // snapshotted `items` at entry and, on `allOk`, deleted the whole
+    // `pendingFiles[sessionId]` bucket — so anything the user added while the
+    // snapshot was in flight was silently destroyed without ever being sent.
+    const sentIds: string[] = []
     try {
       for (const item of items) {
         const ok = await sendFileToPeer(item.file, sessionId, item.displayName)
-        if (!ok) allOk = false
+        if (ok) sentIds.push(item.id)
       }
     } finally {
       set(s => {
@@ -1037,13 +1169,18 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
         return { sendingPeers: next }
       })
     }
-    if (allOk) {
+    if (sentIds.length > 0) {
+      const done = new Set(sentIds)
       set(s => {
-        const { [sessionId]: _drop, ...rest } = s.pendingFiles
-        return { pendingFiles: rest }
+        const remaining = (s.pendingFiles[sessionId] ?? []).filter(item => !done.has(item.id))
+        if (remaining.length === 0) {
+          const { [sessionId]: _drop, ...rest } = s.pendingFiles
+          return { pendingFiles: rest }
+        }
+        return { pendingFiles: { ...s.pendingFiles, [sessionId]: remaining } }
       })
     }
-    // On failure leave the staged queue in place so the user can retry / prune.
+    // Failures (and anything staged mid-flight) stay put so the user can retry.
   },
 
   async sendFile(file) {
@@ -1055,7 +1192,28 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
   async sendFilesToAll(files) {
     const targets = get().peers.filter(p => p.status !== 'offline').map(p => p.sessionId)
     if (targets.length === 0) throw new Error('没有可用的目标节点')
-    await Promise.allSettled(targets.flatMap(sid => files.map(file => sendFileToPeer(file, sid))))
+    // BUG-020: a fanout used to `allSettled` and discard every result, so a
+    // broadcast where every peer failed looked identical to one where every
+    // peer succeeded. Keep the per-(peer, file) outcome and surface a partial
+    // success to the caller.
+    const jobs = targets.flatMap(sid => files.map(file => ({ sid, file })))
+    const settled = await Promise.allSettled(
+      jobs.map(job => sendFileToPeer(job.file, job.sid)),
+    )
+    const failures = jobs.filter((_job, i) => {
+      const r = settled[i]
+      return r.status === 'rejected' || r.value === false
+    })
+    if (failures.length === jobs.length) {
+      throw new Error(`群发失败：${jobs.length} 个目标全部未送达`)
+    }
+    if (failures.length > 0) {
+      const peers = new Set(failures.map(f => f.sid))
+      throw new PartialFanoutError(
+        `部分节点未送达：${failures.length}/${jobs.length} 个任务失败（${peers.size} 个节点）`,
+        failures.map(f => ({ peerSessionId: f.sid, fileName: f.file.name })),
+      )
+    }
   },
 
   sendChatMessage(peerSessionId, text) {
@@ -1132,10 +1290,10 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     set(s => ({
       transfers: s.transfers.map(t => t.id === transferId ? { ...t, status: 'paused' as const } : t),
     }))
-    // Receiver-driven pause: tell the sender to stop. The local signal we
-    // just set causes in-flight chunks to be dropped in receiveChunk; this
-    // upstream notice prevents the sender from continuing to encrypt + ship
-    // bytes that the receiver will throw away.
+    // Receiver-driven pause: tell the sender to stop. Chunks already inside
+    // the SCTP queue keep arriving for a moment and are recorded (not just
+    // dropped) by `receiveChunk` so `buildRepairRequest` can ask for them back
+    // on resume — see BUG-013 and the resume path below.
     const t = get().transfers.find(tr => tr.id === transferId)
     if (t && t.direction === 'recv') {
       const dc = dataChannels.get(t.peerSessionId)
@@ -1146,38 +1304,51 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
   },
 
   async resumeTransfer(transferId, peerSessionId) {
+    const t = get().transfers.find(tr => tr.id === transferId)
+    // BUG-019: a failed transfer's Retry used to flip the card to
+    // "transferring" and then silently return when the source file, the DB
+    // record or the DataChannel was gone. Validate every precondition BEFORE
+    // touching the status, and surface a structured failure otherwise.
+    const precondition = await checkResumePreconditions(transferId, peerSessionId, t)
+    if (!precondition.ok) {
+      failTransferRecord(transferId, precondition.message)
+      appendSystemChat(peerSessionId, `无法继续传输：${precondition.message}`)
+      throw new TransferResumeError(precondition.code, precondition.message)
+    }
+
     resumeTransfer(transferId)
     set(s => ({
       transfers: s.transfers.map(t => t.id === transferId ? { ...t, status: 'transferring' as const } : t),
     }))
-    const t = get().transfers.find(tr => tr.id === transferId)
-    // Receiver-driven resume: tell the sender to start shipping again. The
-    // sender's lane loop is waiting in waitWhilePaused for transferSignals to
-    // flip back, but the sender's local signal only reflects what the SENDER
-    // toggled — when the user paused from the receive side the sender's
-    // signal was set via 'transfer-pause' below. We undo that here.
+
     if (t && t.direction === 'recv') {
       const dc = dataChannels.get(peerSessionId)
       if (dc?.readyState === 'open') {
         try { dc.send(JSON.stringify({ type: 'transfer-resume', transferId })) } catch { /* ignore */ }
+        // BUG-013: everything the pause discarded (plus anything else still
+        // missing) goes back on the wire as an explicit repair request. Without
+        // it the sender considers those chunks sent and the transfer can never
+        // reach 100 % again.
+        const repair = buildRepairRequest(transferId)
+        if (repair) {
+          try { dc.send(JSON.stringify(repair)) } catch { /* ignore */ }
+        }
       }
       // Receiver side: nothing else to do — the sender owns the send loop.
       return
     }
-    const dc = dataChannels.get(peerSessionId)
-    const file = sendingFiles.get(transferId)
-    if (dc && file && dc.readyState === 'open') {
-      const record = await getTransfer(transferId)
-      if (record) {
-        const request = await buildResumeRequest(transferId)
-        const peerNodeId = get().peers.find(p => p.sessionId === peerSessionId)?.nodeId ?? 0
-        const lanes = await ensureTransferLanes(peerSessionId)
-        const peerBitmap = request ? decodeResumeRequest(request, record.totalChunks) : undefined
-        engineSendFileParallel(lanes, file, transferId, peerNodeId, peerSessionId, record, undefined, peerBitmap)
-          .then(() => sendingFiles.delete(transferId))
-          .catch(() => {})
-      }
-    }
+
+    // Send side. `engineSendFileParallel` wakes the LIVE task when one exists
+    // (BUG-014) and only starts a fresh engine when the previous one has fully
+    // settled, so this can no longer produce two engines for one id.
+    const owner = ownerFor(peerSessionId)
+    const file = sendingFiles.get(transferId)!
+    const record = await getTransfer(transferId)
+    const request = await buildResumeRequest(transferId, owner)
+    const peerNodeId = get().peers.find(p => p.sessionId === peerSessionId)?.nodeId ?? 0
+    const lanes = await ensureTransferLanes(peerSessionId)
+    const peerBitmap = request && record ? decodeResumeRequest(request, record.totalChunks) : undefined
+    await runSendEngine(lanes, file, transferId, peerNodeId, peerSessionId, record, peerBitmap, owner)
   },
 
   cancelTransferAction(transferId) {
@@ -1200,6 +1371,8 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     cleanupOPFS(transferId).catch(() => {})
     sendingFiles.delete(transferId)
     transferSpeedSamples.delete(transferId)
+    transferDelivery.delete(transferId)
+    forgetTransfer(transferId)
     set(s => ({ transfers: s.transfers.filter(t => t.id !== transferId) }))
   },
 
@@ -1209,7 +1382,9 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
 
   async resumeReceiveTransfer(transferId) {
     const t = get().transfers.find(tr => tr.id === transferId)
-    if (!t) return
+    // BUG-019: a missing transfer is a real failure, not a silent no-op — the
+    // caller has a button that must report why nothing happened.
+    if (!t) throw new TransferResumeError('unknown-transfer', '该传输记录已不存在')
     await get().resumeTransfer(transferId, t.peerSessionId)
   },
 
@@ -1339,7 +1514,7 @@ async function sendFileToPeer(file: File, peerSessionId: string, displayName = f
     fileName: displayName, fileSize: file.size,
     progress: 0, speedBps: 0, status: 'pending', startedAt: Date.now(),
   }
-  useNetworkStore.setState(s => ({ transfers: [...s.transfers, transfer] }))
+  useNetworkStore.setState(s => ({ transfers: pruneTerminalTransferCards([...s.transfers, transfer]) }))
   // Surface the send intent in the chat history immediately.
   appendSystemChat(peerSessionId, `开始发送文件 ${displayName}`, 'sent')
 
@@ -1364,24 +1539,42 @@ async function sendFileToPeer(file: File, peerSessionId: string, displayName = f
         ),
       }))
     },
+    onDeliveryState(state) {
+      transferDelivery.set(transferId, state)
+    },
   }
 
   try {
     sendingFiles.set(transferId, file)
-    await engineSendFileParallel(dcs, file, transferId, peerNodeId, peerSessionId, undefined, callbacks)
-    sendingFiles.delete(transferId)
+    const outcome = await engineSendFileParallel(
+      dcs, file, transferId, peerNodeId, peerSessionId, undefined, callbacks,
+      undefined, networkEpoch,
+    )
+    transferDelivery.set(transferId, outcome.state)
+    // BUG-016: hold the source File until the receiver confirms a DURABLE
+    // write. A v1 peer can never confirm, so legacy semantics still release it
+    // — but for a v2 peer, "the last dc.send() returned" is not a reason to
+    // throw away the only thing a retry could use.
+    if (outcome.state === 'saved' || outcome.legacyPeer) sendingFiles.delete(transferId)
     clearTransferSignal(transferId)
     useNetworkStore.setState(s => ({
       transfers: s.transfers.map(t =>
         t.id === transferId ? { ...t, progress: 1, status: 'completed' as const } : t,
       ),
     }))
-    appendSystemChat(peerSessionId, `已发送文件 ${displayName}`, 'sent')
+    appendSystemChat(
+      peerSessionId,
+      outcome.state === 'saved'
+        ? `已发送文件 ${displayName}`
+        : `已送出文件 ${displayName}（等待对方确认落盘）`,
+      'sent',
+    )
     playSound('complete')
     transferSpeedSamples.delete(transferId)
     return true
   } catch (e) {
     sendingFiles.delete(transferId)
+    transferDelivery.delete(transferId)
     clearTransferSignal(transferId)
     transferSpeedSamples.delete(transferId)
     // A cancel (local or peer-driven) is not a failure: the transfer card is
@@ -1404,7 +1597,7 @@ async function sendFileToPeer(file: File, peerSessionId: string, displayName = f
 function appendSystemChat(peerSessionId: string, content: string, direction: 'sent' | 'recv' | 'system' = 'system') {
   const m: ChannelMessage = { id: genMsgId(), type: 'system', content, timestamp: Date.now(), direction }
   useNetworkStore.setState(s => {
-    const msgs = [...(s.chatMessages[peerSessionId] ?? []), m]
+    const msgs = pruneChatMessages([...(s.chatMessages[peerSessionId] ?? []), m])
     return { chatMessages: { ...s.chatMessages, [peerSessionId]: msgs } }
   })
 }
@@ -1784,6 +1977,12 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
     }
     if (!dc.label.startsWith('misaka-transfer-')) {
       try {
+        // Protocol handshake first: `hello` tells the peer which delivery
+        // semantics we implement. A v1 peer ignores the unknown message and
+        // both sides fall back to v1 (see negotiatedProtocolVersion).
+        dc.send(makeHelloMessage())
+      } catch { /* channel may already be dying */ }
+      try {
         const pub = await getMyPublicKey(peerSessionId)
         dc.send(JSON.stringify({ type: 'ecdh-pub', pub }))
       } catch (err) {
@@ -1803,6 +2002,7 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
   }
 
   dc.onmessage = async (e) => {
+    const owner = ownerFor(peerSessionId)
     if (e.data instanceof ArrayBuffer) {
       const frame = decodeChunkFrame(e.data)
       if (!frame) return
@@ -1814,16 +2014,12 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
       // becomes an unhandledrejection and the UI hangs at whatever % the last
       // good chunk left it at. Surface it as a failed transfer + error tone.
       try {
-        // Defer `deliverCompletedFile` until AFTER the stream-mode write
-        // below has actually persisted the final chunk. The progress-throttle
-        // gate inside `receiveChunk` fires with received===total as soon as
-        // the receive bitmap is set, but for OPFS / FSA the matching disk
-        // write happens out here in this handler. If we deliver immediately,
-        // `opfsWrittenCount === totalChunks` is still false for the last
-        // index and `deliverCompletedFile` falls through to the IDB-assemble
-        // branch — which then throws "Missing chunk 0" because nothing was
-        // ever saved to IDB under stream mode.
-        let finalChunkLanded = false
+        // BUG-017: `receiveChunk` now owns the whole decrypt → DURABLE WRITE →
+        // bitmap → persist → progress sequence. This handler used to perform
+        // the OPFS / FSA write itself AFTER receiveChunk had already recorded
+        // and persisted the chunk, so a crash in between left a resume bitmap
+        // claiming bytes that were never on disk. Nothing writes out here any
+        // more, and `result.done` is only true once the last byte is durable.
         const result = await receiveChunk(
           transferId, frame.index, frame.iv, frame.ciphertext, peerSessionId,
           {
@@ -1849,7 +2045,6 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
                     : t,
                 ),
               }))
-              if (received === total) finalChunkLanded = true
             },
             onError(error) {
               useNetworkStore.setState(s => ({
@@ -1861,20 +2056,7 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
           },
         )
 
-        if (result) {
-          const { decrypted: decryptedData, storageMode } = result
-          if (storageMode === 'stream') {
-            await Promise.all([
-              streamChunkToDisk(transferId, frame.index, decryptedData),
-              writeChunkToOPFS(transferId, frame.index, decryptedData),
-            ])
-          }
-          // DataChannel is ordered + reliable — no application-level per-chunk
-          // ack is needed. The sender uses the resume bitmap (built from the
-          // session's received set) for recovery, not per-chunk acks.
-        }
-
-        if (finalChunkLanded) deliverCompletedFile(transferId, peerSessionId)
+        if (result?.done) await deliverCompletedFile(transferId, peerSessionId)
       } catch (err) {
         const errStr = err instanceof Error ? err.message : String(err)
         console.warn('[net] receiveChunk failed', errStr)
@@ -1892,6 +2074,13 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
       try {
         const msg = JSON.parse(e.data)
 
+        // Protocol handshake (v2). Must be processed before anything that
+        // depends on the negotiated version.
+        if (msg.type === 'hello') {
+          setPeerProtocolVersion(peerSessionId, msg.v)
+          return
+        }
+
         if (msg.type === 'ecdh-pub') {
           await setPeerPublicKey(peerSessionId, msg.pub)
           ecdhResolvers.get(peerSessionId)?.()
@@ -1901,122 +2090,41 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
         }
 
         if (msg.type === 'meta') {
-          const meta = msg as MetaMessage
-          const peerNodeId = useNetworkStore.getState().peers.find(p => p.sessionId === peerSessionId)?.nodeId ?? 0
-
-          // P1-5: refuse files that would force an in-memory IDB assemble
-          // larger than MAX_INMEMORY_RECEIVE_BYTES — for those, this tab
-          // would OOM mid-receive on low-end devices. The check is BEFORE
-          // shortId registration so we don't accidentally accept the
-          // chunk stream that follows.
-          const rejection = checkMetaOOMGuard(meta)
-          if (rejection) {
-            // Tell the sender to stop — they're about to ship hundreds of
-            // megabytes that we'd throw away.
-            try {
-              dc.send(JSON.stringify({ type: 'transfer-cancel', transferId: meta.transferId }))
-            } catch { /* peer DC might already be dying — ignore */ }
-            useNetworkStore.setState(s => {
-              if (s.transfers.some(t => t.id === meta.transferId)) return s
-              return {
-                transfers: [...s.transfers, {
-                  id: meta.transferId, direction: 'recv' as const,
-                  peerSessionId, peerNodeId,
-                  fileName: meta.fileName, fileSize: meta.fileSize,
-                  progress: 0, speedBps: 0,
-                  status: 'failed:unsupported' as const,
-                  error: rejection.message,
-                  startedAt: Date.now(),
-                }],
-              }
-            })
-            appendSystemChat(peerSessionId, `已拒绝接收 ${meta.fileName}：${rejection.message}`)
-            playSound('error')
-            return
-          }
-
-          // Register shortId → transferId BEFORE any await. If a chunk for
-          // this transfer arrives while handleMetaMessage is still in flight
-          // (very common — meta + chunk are queued back-to-back on the lane),
-          // the binary-frame handler MUST already see the demux entry,
-          // otherwise the chunk is silently dropped at the `if (!transferId)`
-          // early-return. Hit during the folder e2e test.
-          let peerMap = shortIdToTransferId.get(peerSessionId)
-          if (!peerMap) {
-            peerMap = new Map()
-            shortIdToTransferId.set(peerSessionId, peerMap)
-          }
-          peerMap.set(meta.shortId, meta.transferId)
-          await handleMetaMessage(meta, peerNodeId)
-          // Three-tier storage selection: prompt FSA → OPFS probe → IDB fallback.
-          // Failure is non-fatal (we still display the card and let receiveChunk
-          // run; on truly unsupported environments the IDB OOM guard will refuse
-          // and surface failed:unsupported).
-          let storageMode: Transfer['storageMode'] = 'idb'
-          try {
-            const sel = await prepareReceiveStorage({
-              transferId: meta.transferId,
-              fileName: meta.fileName,
-              totalChunks: meta.totalChunks,
-              size: meta.fileSize,
-            })
-            storageMode = sel.mode
-          } catch (err) {
-            console.warn('[net] prepareReceiveStorage failed, falling back to idb', err)
-          }
-          useNetworkStore.setState(s => {
-            if (s.transfers.some(t => t.id === meta.transferId)) return s
-            return {
-              transfers: [...s.transfers, {
-                id: meta.transferId, direction: 'recv' as const,
-                peerSessionId, peerNodeId,
-                fileName: meta.fileName, fileSize: meta.fileSize,
-                progress: 0, speedBps: 0, status: 'transferring' as const,
-                startedAt: Date.now(),
-                storageMode,
-              }],
-            }
-          })
-          const alreadyAnnounced = useNetworkStore.getState().chatMessages[peerSessionId]
-            ?.some(m => m.type === 'system' && m.content === `正在接收文件 ${meta.fileName}`)
-          if (!alreadyAnnounced) appendSystemChat(peerSessionId, `正在接收文件 ${meta.fileName}`)
-          // #16: surface an OS notification at start-of-transfer so a tab-
-          // backgrounded recipient can decline a big incoming file early
-          // rather than discovering it only after the entire payload lands.
-          notifyIncomingFile({ peerNodeId, fileName: meta.fileName, fileSize: meta.fileSize })
-          // #5: zero-byte files send no chunks at all (totalChunks=0). The
-          // chunk-driven completion gate never fires; deliver synthetically
-          // from the empty Blob and clean up. (#14 cleanup of demux map below.)
-          if (meta.totalChunks === 0 && meta.fileSize === 0) {
-            const emptyBlob = new Blob([], { type: meta.mime || 'application/octet-stream' })
-            const emptyFile = new File([emptyBlob], meta.fileName, { type: meta.mime || 'application/octet-stream' })
-            const url = URL.createObjectURL(emptyFile)
-            appendFileChat(peerSessionId, meta.fileName, 0, url)
-            playSound('complete')
-            useNetworkStore.setState(s => ({
-              transfers: s.transfers.map(t =>
-                t.id === meta.transferId ? { ...t, progress: 1, status: 'completed' as const } : t,
-              ),
-            }))
-            shortIdToTransferId.get(peerSessionId)?.delete(meta.shortId)
-          }
+          await handleIncomingMeta(msg, peerSessionId, dc, owner)
           return
         }
 
         if (msg.type === 'resume') {
-          const resumeRequest = msg as ResumeRequest
-          const file = sendingFiles.get(resumeRequest.transferId)
-          const record = await getTransfer(resumeRequest.transferId)
-          if (file && record) {
-            const peerNodeId = useNetworkStore.getState().peers.find(p => p.sessionId === peerSessionId)?.nodeId ?? 0
-            const lanes = await ensureTransferLanes(peerSessionId)
-            // decodeResumeRequest handles both legacy (`receivedChunks`)
-            // and new (`receivedRanges`) wire formats, capped at totalChunks
-            // so a malformed peer can't trigger an oversize bitmap alloc.
-            const peerBitmap = decodeResumeRequest(resumeRequest, record.totalChunks)
-            engineSendFileParallel(lanes, file, resumeRequest.transferId, peerNodeId, peerSessionId, record, undefined, peerBitmap)
-              .then(() => sendingFiles.delete(resumeRequest.transferId))
-              .catch(() => {})
+          await handleResumeRequest(msg as ResumeRequest, peerSessionId, owner)
+          return
+        }
+
+        // BUG-011: the receiver has committed a writable backend — the sender
+        // may start shipping payload.
+        if (msg.type === 'transfer-ready' && typeof msg.transferId === 'string') {
+          markReceiverReady(msg.transferId, owner)
+          return
+        }
+        // Receiver refused before any payload moved.
+        if (msg.type === 'transfer-reject' && typeof msg.transferId === 'string') {
+          if (markReceiverRejected(msg.transferId, owner)) {
+            sendingFiles.delete(msg.transferId)
+            failTransferRecord(msg.transferId, String(msg.message ?? '接收端拒绝了该传输'))
+          }
+          return
+        }
+        // BUG-013: receiver lost in-flight chunks to a pause — re-queue exactly
+        // those indexes into the LIVE send task (never a second engine).
+        if (msg.type === 'transfer-repair' && typeof msg.transferId === 'string') {
+          const requeued = applyRepairRequest(msg, owner)
+          if (requeued < 0) await restartSendForRepair(msg.transferId, peerSessionId, owner)
+          return
+        }
+        // BUG-016: the receiver has the file durably written.
+        if (msg.type === 'transfer-done' && typeof msg.transferId === 'string') {
+          if (markTransferAcked(msg.transferId, owner)) {
+            transferDelivery.set(msg.transferId, 'saved')
+            sendingFiles.delete(msg.transferId)
           }
           return
         }
@@ -2035,7 +2143,7 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
             direction: 'recv',
           }
           useNetworkStore.setState(s => {
-            const msgs = [...(s.chatMessages[peerSessionId] ?? []), chatMsg]
+            const msgs = pruneChatMessages([...(s.chatMessages[peerSessionId] ?? []), chatMsg])
             const shouldMarkUnread = s.selectedSessionId !== peerSessionId
             const prevUnread = s.unreadByPeer[peerSessionId] ?? { message: 0, file: 0 }
             return {
@@ -2057,11 +2165,12 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
 
         // Peer-driven transfer control plane — these arrive when the OTHER
         // side clicked pause / resume / cancel on the same transfer.
-        // We mirror the local signal so the existing checkSignals / receiveChunk
-        // paths handle it uniformly. Without these, "pause on the receiver"
-        // was a UI lie: the sender kept blasting and the receiver kept saving.
+        // SECURITY-015: every one of them is ownership-checked. `peerNodeId`
+        // is shared by all devices of an identity, so without the
+        // (peerSessionId, epoch) check a third device in the cluster could
+        // pause or cancel a transfer between two others.
         if (msg.type === 'transfer-pause' && typeof msg.transferId === 'string') {
-          pauseTransfer(msg.transferId)
+          if (!applyPeerPause(msg.transferId, owner)) return
           useNetworkStore.setState(s => ({
             transfers: s.transfers.map(t =>
               t.id === msg.transferId ? { ...t, status: 'paused' as const } : t,
@@ -2070,7 +2179,7 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
           return
         }
         if (msg.type === 'transfer-resume' && typeof msg.transferId === 'string') {
-          resumeTransfer(msg.transferId)
+          if (!applyPeerResume(msg.transferId, owner)) return
           useNetworkStore.setState(s => ({
             transfers: s.transfers.map(t =>
               t.id === msg.transferId ? { ...t, status: 'transferring' as const } : t,
@@ -2079,12 +2188,14 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
           return
         }
         if (msg.type === 'transfer-cancel' && typeof msg.transferId === 'string') {
-          engineCancelTransfer(msg.transferId)
+          if (!applyPeerCancel(msg.transferId, owner)) return
           cancelReceive(msg.transferId)
           cancelStreamWrite(msg.transferId)
           cleanupOPFS(msg.transferId).catch(() => {})
           sendingFiles.delete(msg.transferId)
           transferSpeedSamples.delete(msg.transferId)
+          transferDelivery.delete(msg.transferId)
+          forgetTransfer(msg.transferId)
           useNetworkStore.setState(s => ({
             transfers: s.transfers.filter(t => t.id !== msg.transferId),
           }))
@@ -2093,6 +2204,297 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
       } catch { /* not JSON */ }
     }
   }
+}
+
+/** The `(peerSessionId, epoch)` pair every control message is checked against. */
+function ownerFor(peerSessionId: string): TransferOwner {
+  return { peerSessionId, epoch: networkEpoch }
+}
+
+// ── Resume / retry preconditions (BUG-019) ───────────────────────────
+// Retry on a failed send used to be optimistic: it flipped the card to
+// "transferring", then hit one of several silent early returns (no live
+// DataChannel, no persisted record, source File already released) and left a
+// permanently fake in-progress card with no bytes moving and no way back.
+
+export type ResumeFailureCode =
+  | 'unknown-transfer'
+  | 'not-resumable'
+  | 'source-missing'
+  | 'record-missing'
+  | 'channel-unavailable'
+
+export class TransferResumeError extends Error {
+  code: ResumeFailureCode
+  constructor(code: ResumeFailureCode, message: string) {
+    super(message)
+    this.name = 'TransferResumeError'
+    this.code = code
+  }
+}
+
+type PreconditionResult =
+  | { ok: true }
+  | { ok: false; code: ResumeFailureCode; message: string }
+
+export async function checkResumePreconditions(
+  transferId: string,
+  peerSessionId: string,
+  transfer: Transfer | undefined,
+): Promise<PreconditionResult> {
+  if (!transfer) {
+    return { ok: false, code: 'unknown-transfer', message: '该传输记录已不存在' }
+  }
+  if (transfer.status === 'completed') {
+    return { ok: false, code: 'not-resumable', message: '该传输已完成' }
+  }
+  const dc = dataChannels.get(peerSessionId)
+  if (!dc || dc.readyState !== 'open') {
+    return { ok: false, code: 'channel-unavailable', message: '与该节点的数据信道尚未就绪' }
+  }
+  // Receiver side needs nothing else — the sender owns the send loop.
+  if (transfer.direction === 'recv') return { ok: true }
+
+  if (!sendingFiles.has(transferId)) {
+    return {
+      ok: false,
+      code: 'source-missing',
+      message: '源文件已释放，请重新选择该文件后再发送',
+    }
+  }
+  const record = await getTransfer(transferId)
+  if (!record) {
+    return { ok: false, code: 'record-missing', message: '传输记录已丢失，请重新发送该文件' }
+  }
+  return { ok: true }
+}
+
+/**
+ * Inbound `meta`, end to end:
+ *
+ *   validate (SECURITY-007) → ownership (SECURITY-015) → register demux →
+ *   register session → prepare + PROVE a writable backend, deduplicated per
+ *   (peer, transfer) (BUG-011) → apply the size cap to the COMMITTED backend
+ *   (BUG-012) → ACK `transfer-ready` so the sender may ship payload.
+ *
+ * Nothing may write a byte before the ACK; chunks that a legacy (v1) sender
+ * pushes early are buffered inside the receive session and replayed in index
+ * order once the backend commits.
+ */
+async function handleIncomingMeta(
+  raw: unknown,
+  peerSessionId: string,
+  dc: RTCDataChannel,
+  owner: TransferOwner,
+) {
+  const validated = validateMetaMessage(raw)
+  if (!validated.ok) {
+    console.warn('[net] rejecting malformed meta', validated.code, validated.message)
+    const badId = (raw as { transferId?: unknown })?.transferId
+    if (typeof badId === 'string' && badId.length > 0 && badId.length <= 256) {
+      try {
+        dc.send(JSON.stringify({
+          type: 'transfer-reject', transferId: badId,
+          reason: validated.code, message: validated.message,
+        }))
+      } catch { /* peer DC might already be dying */ }
+    }
+    appendSystemChat(peerSessionId, `已拒绝一个非法的传输请求：${validated.message}`)
+    return
+  }
+  const meta = validated.meta
+  setPeerProtocolVersion(peerSessionId, meta.v)
+  const peerNodeId = useNetworkStore.getState().peers.find(p => p.sessionId === peerSessionId)?.nodeId ?? 0
+
+  // Register shortId → transferId BEFORE any await. If a chunk for this
+  // transfer arrives while the session is still being created (very common —
+  // meta + chunk are queued back-to-back on the lane), the binary-frame
+  // handler MUST already see the demux entry.
+  let peerMap = shortIdToTransferId.get(peerSessionId)
+  if (!peerMap) {
+    peerMap = new Map()
+    shortIdToTransferId.set(peerSessionId, peerMap)
+  }
+  peerMap.set(meta.shortId, meta.transferId)
+
+  try {
+    await handleMetaMessage(meta, peerNodeId, owner)
+  } catch (err) {
+    // Ownership / immutable-metadata mismatch: never touch existing state.
+    peerMap.delete(meta.shortId)
+    const message = err instanceof TransferOwnershipError ? err.message : String(err)
+    console.warn('[net] rejecting meta', message)
+    try {
+      dc.send(JSON.stringify({
+        type: 'transfer-reject', transferId: meta.transferId,
+        reason: 'owner-mismatch', message,
+      }))
+    } catch { /* ignore */ }
+    appendSystemChat(peerSessionId, `已拒绝接收 ${meta.fileName}：${message}`)
+    return
+  }
+
+  const prepared = await prepareReceiveBackend({
+    transferId: meta.transferId,
+    fileName: meta.fileName,
+    totalChunks: meta.totalChunks,
+    size: meta.fileSize,
+  }, owner).catch((err): { ok: false; rejection: { reason: string; message: string } } => ({
+    ok: false,
+    rejection: { reason: 'no-writable-backend', message: String(err) },
+  }))
+
+  if (!prepared.ok) {
+    // BUG-012: the cap is applied to the backend we actually committed, so a
+    // Chromium tab that lost the save picker and fell back to IndexedDB is
+    // refused here rather than OOM-ing halfway through.
+    try {
+      dc.send(JSON.stringify({ type: 'transfer-reject', transferId: meta.transferId, reason: prepared.rejection.reason, message: prepared.rejection.message }))
+      dc.send(JSON.stringify({ type: 'transfer-cancel', transferId: meta.transferId }))
+    } catch { /* peer DC might already be dying — ignore */ }
+    peerMap.delete(meta.shortId)
+    await cancelReceive(meta.transferId).catch(() => {})
+    useNetworkStore.setState(s => {
+      if (s.transfers.some(t => t.id === meta.transferId)) return s
+      return {
+        transfers: pruneTerminalTransferCards([...s.transfers, {
+          id: meta.transferId, direction: 'recv' as const,
+          peerSessionId, peerNodeId,
+          fileName: meta.fileName, fileSize: meta.fileSize,
+          progress: 0, speedBps: 0,
+          status: 'failed:unsupported' as const,
+          error: prepared.rejection.message,
+          startedAt: Date.now(),
+        }]),
+      }
+    })
+    appendSystemChat(peerSessionId, `已拒绝接收 ${meta.fileName}：${prepared.rejection.message}`)
+    playSound('error')
+    return
+  }
+
+  useNetworkStore.setState(s => {
+    if (s.transfers.some(t => t.id === meta.transferId)) return s
+    return {
+      transfers: pruneTerminalTransferCards([...s.transfers, {
+        id: meta.transferId, direction: 'recv' as const,
+        peerSessionId, peerNodeId,
+        fileName: meta.fileName, fileSize: meta.fileSize,
+        progress: 0, speedBps: 0, status: 'transferring' as const,
+        startedAt: Date.now(),
+        storageMode: prepared.mode,
+      }]),
+    }
+  })
+
+  // The ACK is what unparks the sender (BUG-011). Sent only after the backend
+  // is committed and the card exists.
+  try {
+    dc.send(JSON.stringify({ type: 'transfer-ready', transferId: meta.transferId, shortId: meta.shortId }))
+  } catch { /* the sender's own timeout covers this */ }
+
+  const alreadyAnnounced = useNetworkStore.getState().chatMessages[peerSessionId]
+    ?.some(m => m.type === 'system' && m.content === `正在接收文件 ${meta.fileName}`)
+  if (!alreadyAnnounced) appendSystemChat(peerSessionId, `正在接收文件 ${meta.fileName}`)
+  // #16: surface an OS notification at start-of-transfer so a tab-backgrounded
+  // recipient can decline a big incoming file early.
+  notifyIncomingFile({ peerNodeId, fileName: meta.fileName, fileSize: meta.fileSize })
+
+  // #5: zero-byte files send no chunks at all (totalChunks=0). The chunk-driven
+  // completion gate never fires; deliver synthetically and clean up.
+  if (meta.totalChunks === 0 && meta.fileSize === 0) {
+    const emptyFile = new File([new Blob([], { type: meta.mime })], meta.fileName, { type: meta.mime })
+    const url = URL.createObjectURL(emptyFile)
+    appendFileChat(peerSessionId, meta.fileName, 0, url)
+    playSound('complete')
+    useNetworkStore.setState(s => ({
+      transfers: s.transfers.map(t =>
+        t.id === meta.transferId ? { ...t, progress: 1, status: 'completed' as const } : t,
+      ),
+    }))
+    sendDurableAck(peerSessionId, meta.transferId, 0)
+    peerMap.delete(meta.shortId)
+    forgetTransfer(meta.transferId)
+  }
+}
+
+/**
+ * A peer asks us to resume sending. SECURITY-015: only the session that owns
+ * the transfer may ask, and BUG-014: a live task is woken, never duplicated.
+ */
+async function handleResumeRequest(
+  req: ResumeRequest,
+  peerSessionId: string,
+  owner: TransferOwner,
+) {
+  if (typeof req.transferId !== 'string') return
+  const file = sendingFiles.get(req.transferId)
+  const record = await getTransfer(req.transferId)
+  if (!file || !record) return
+  if (record.peerSessionId && record.peerSessionId !== peerSessionId) {
+    console.warn('[net] refusing resume for a transfer owned by another session', req.transferId)
+    return
+  }
+  const peerNodeId = useNetworkStore.getState().peers.find(p => p.sessionId === peerSessionId)?.nodeId ?? 0
+  const lanes = await ensureTransferLanes(peerSessionId)
+  // decodeResumeRequest handles both legacy (`receivedChunks`) and new
+  // (`receivedRanges`) wire formats, capped at totalChunks so a malformed
+  // peer can't trigger an oversize bitmap alloc.
+  const peerBitmap = decodeResumeRequest(req, record.totalChunks)
+  // engineSendFileParallel itself dedupes against the live task (BUG-014).
+  void runSendEngine(lanes, file, req.transferId, peerNodeId, peerSessionId, record, peerBitmap, owner)
+}
+
+/**
+ * A repair request arrived for a transfer whose send engine already finished.
+ * Restart it from the persisted record — the requested indexes come back via
+ * the resume bitmap path.
+ */
+async function restartSendForRepair(transferId: string, peerSessionId: string, owner: TransferOwner) {
+  if (hasLiveSendTask(transferId)) return
+  const file = sendingFiles.get(transferId)
+  const record = await getTransfer(transferId)
+  if (!file || !record) return
+  if (record.peerSessionId && record.peerSessionId !== peerSessionId) return
+  const peerNodeId = useNetworkStore.getState().peers.find(p => p.sessionId === peerSessionId)?.nodeId ?? 0
+  const lanes = await ensureTransferLanes(peerSessionId)
+  void runSendEngine(lanes, file, transferId, peerNodeId, peerSessionId, record, undefined, owner)
+}
+
+/** Shared tail for every resume/repair-driven send restart. */
+async function runSendEngine(
+  lanes: RTCDataChannel[],
+  file: File,
+  transferId: string,
+  peerNodeId: number,
+  peerSessionId: string,
+  record: Awaited<ReturnType<typeof getTransfer>>,
+  peerBitmap: Uint8Array | undefined,
+  owner: TransferOwner,
+) {
+  try {
+    const outcome = await engineSendFileParallel(
+      lanes, file, transferId, peerNodeId, peerSessionId, record ?? undefined,
+      undefined, peerBitmap, owner.epoch,
+    )
+    transferDelivery.set(transferId, outcome.state)
+    // BUG-016: only release the retry source once the receiver confirmed a
+    // durable write (or the peer is v1 and can never confirm).
+    if (outcome.state === 'saved' || outcome.legacyPeer) sendingFiles.delete(transferId)
+  } catch (err) {
+    if (!(err instanceof TransferCancelledError)) {
+      console.warn('[net] resume send failed', transferId, err)
+    }
+  }
+}
+
+/** Tell the sender their file is durably written (BUG-016). */
+function sendDurableAck(peerSessionId: string, transferId: string, bytes: number) {
+  const dc = dataChannels.get(peerSessionId)
+  if (dc?.readyState !== 'open') return
+  try {
+    dc.send(JSON.stringify({ type: 'transfer-done', transferId, bytes }))
+  } catch { /* the sender's ACK timeout covers this */ }
 }
 
 /**
@@ -2202,69 +2604,41 @@ async function attemptIceRestart(peerSessionId: string) {
   }
 }
 
-// Whether every chunk of an OPFS transfer is on disk. Prefer the authoritative
-// receive-completion signal (session.receivedCount): the session-local `written`
-// bitmap only counts chunks written IN THIS session, so after a mid-transfer
-// reload the already-persisted chunks are never re-shipped and their bits never
-// get set — opfsWrittenCount would then stay < totalChunks forever and delivery
-// wrongly fell through to the IDB-assemble branch ("Missing chunk 0"). We fall
-// back to opfsWrittenCount if the receive session is already gone. The final
-// chunk's disk write is awaited before deliver is called (see setupDataChannel),
-// and getOPFSFile drains the write queue, so receivedCount===total is safe.
-function isOpfsFullyReceived(transferId: string, totalChunks: number): boolean {
-  const session = getReceiveSession(transferId)
-  if (session) return session.receivedCount === totalChunks
-  return opfsWrittenCount(transferId) === totalChunks
-}
-
+/**
+ * BUG-018: ONE terminal completion path for every receive backend.
+ *
+ * There used to be three ad-hoc branches here (FSA handle / OPFS handle /
+ * IDB assemble), each with its own partial cleanup. The OPFS one dropped the
+ * file-name handle inside `getOPFSFile` before it could `removeEntry`, so the
+ * origin-private copy survived, and none of them retired the `active` DB row,
+ * the receive session or the resume bitmap. `finalizeReceive` in lib/transfer
+ * now owns all of it — closing the backend, verifying the artefact is exactly
+ * `fileSize` bytes, deleting chunks, removing the OPFS entry, marking the
+ * record completed and dropping the session, signal and owner record.
+ *
+ * This function is the UI half: object URL, chat card, sound, transfer card,
+ * demux cleanup and the receiver's durable-write ACK (BUG-016).
+ */
 async function deliverCompletedFile(transferId: string, peerSessionId: string) {
   if (deliveredTransfers.has(transferId)) return
   deliveredTransfers.add(transferId)
 
-  const handle = getWriteHandle(transferId)
-  const opfsHandle = getOPFSHandle(transferId)
-
-  if (handle) {
-    try {
-      const streamedFile = await finalizeStreamedFile(transferId)
-      const url = URL.createObjectURL(streamedFile)
-      appendFileChat(peerSessionId, streamedFile.name, streamedFile.size, url)
-      playSound('complete')
-      cleanupTransferRecord(transferId)
-    } catch (err) {
-      failTransferRecord(transferId, String(err))
-      deliveredTransfers.delete(transferId)
-      playSound('error')
-    }
-  } else if (opfsHandle && isOpfsFullyReceived(transferId, opfsHandle.totalChunks)) {
-    try {
-      const file = await getOPFSFile(transferId)
-      const url = URL.createObjectURL(file)
-      appendFileChat(peerSessionId, file.name, file.size, url)
-      playSound('complete')
-      cleanupTransferRecord(transferId)
-      cleanupOPFS(transferId).catch(() => {})
-    } catch (err) {
-      failTransferRecord(transferId, String(err))
-      deliveredTransfers.delete(transferId)
-      playSound('error')
-      cleanupOPFS(transferId).catch(() => {})
-    }
-  } else {
-    try {
-      const assembledFile = await completeReceive(transferId)
-      const url = URL.createObjectURL(assembledFile)
-      appendFileChat(peerSessionId, assembledFile.name, assembledFile.size, url)
-      playSound('complete')
-      cleanupTransferRecord(transferId)
-    } catch (err) {
-      failTransferRecord(transferId, String(err))
-      deliveredTransfers.delete(transferId)
-      playSound('error')
-      // #15: assemble can throw with a partial IndexedDB chunk set ("Missing
-      // chunk N"). Without this, the orphan chunk rows leak to disk forever.
-      import('@/lib/db').then(({ deleteChunks }) => deleteChunks(transferId).catch(() => {}))
-    }
+  try {
+    const { file, bytes } = await finalizeReceive(transferId)
+    const url = URL.createObjectURL(file)
+    appendFileChat(peerSessionId, file.name, file.size, url)
+    playSound('complete')
+    cleanupTransferRecord(transferId)
+    // BUG-016: tell the sender the bytes are durably written. Only now may it
+    // report "saved" and release the retry source.
+    sendDurableAck(peerSessionId, transferId, bytes)
+  } catch (err) {
+    failTransferRecord(transferId, String(err))
+    deliveredTransfers.delete(transferId)
+    playSound('error')
+    // A failed finalize can leave a partial IndexedDB chunk set behind.
+    import('@/lib/db').then(({ deleteChunks }) => deleteChunks(transferId).catch(() => {}))
+    cleanupOPFS(transferId).catch(() => {})
   }
   // Common cleanup: drop the control signal (a receiver pause/resume creates
   // one) and the demux entry for any peer's map that pointed at this
@@ -2323,12 +2697,20 @@ function failTransferRecord(transferId: string, error: string) {
 async function sendResumeRequests(peerSessionId: string, dc: RTCDataChannel) {
   if (dc.label.startsWith('misaka-transfer-')) return
   const active = await getActiveTransfers()
+  const owner = ownerFor(peerSessionId)
   const peerNodeId = useNetworkStore.getState().peers.find(p => p.sessionId === peerSessionId)?.nodeId ?? 0
   for (const record of active) {
-    if (record.direction === 'recv' && record.peerNodeId === peerNodeId) {
-      const req = await buildResumeRequest(record.transferId)
-      if (req && dc.readyState === 'open') dc.send(JSON.stringify(req))
-    }
+    if (record.direction !== 'recv') continue
+    // SECURITY-015: `peerNodeId` alone is not an owner — every device of one
+    // identity shares it, so matching on it would have broadcast one device's
+    // resume bitmap to a sibling device. Prefer the recorded session id and
+    // only fall back to nodeId for records written before ownership existed.
+    const belongs = record.peerSessionId
+      ? record.peerSessionId === peerSessionId
+      : record.peerNodeId === peerNodeId
+    if (!belongs) continue
+    const req = await buildResumeRequest(record.transferId, record.peerSessionId ? owner : undefined)
+    if (req && dc.readyState === 'open') dc.send(JSON.stringify(req))
   }
 }
 

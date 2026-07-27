@@ -43,22 +43,17 @@ vi.mock('../../src/lib/crypto', async () => {
 import {
   handleMetaMessage,
   receiveChunk,
+  prepareReceiveBackend,
   createOPFSReceiveFile,
   writeChunkToOPFS,
   cleanupOPFS,
   type MetaMessage,
 } from '../../src/lib/transfer'
 
-const META: MetaMessage = {
-  type: 'meta',
-  transferId: 'quota',
-  shortId: 1,
-  fileName: 'quota.bin',
-  fileSize: 4 * 64,
-  fileHash: '',
-  totalChunks: 4,
-  mime: 'application/octet-stream',
-}
+import { makeMeta, makeChunk } from './_transfer-fixtures'
+
+const OWNER = { peerSessionId: 'peer-A', epoch: 0 }
+const META: MetaMessage = makeMeta({ transferId: 'quota', totalChunks: 4, fileName: 'quota.bin' })
 
 beforeEach(() => {
   idbThrowsQuota = false
@@ -68,10 +63,15 @@ beforeEach(() => {
 describe('saveChunk QuotaExceeded → STORAGE_QUOTA_EXCEEDED', () => {
   it('receiveChunk rethrows a uniform STORAGE_QUOTA_EXCEEDED error', async () => {
     const id = 'q-idb'
-    await handleMetaMessage({ ...META, transferId: id }, 1)
+    const meta = { ...META, transferId: id }
+    await handleMetaMessage(meta, 1, OWNER)
+    // BUG-011: commit the (IndexedDB) backend before any chunk is accepted.
+    await prepareReceiveBackend(
+      { transferId: id, fileName: meta.fileName, totalChunks: meta.totalChunks, size: meta.fileSize },
+      OWNER,
+    )
     idbThrowsQuota = true
-    const iv = new Uint8Array(12) as Uint8Array<ArrayBuffer>
-    const buf = new Uint8Array(64).buffer
+    const { iv, encrypted: buf } = makeChunk(meta, 0)
 
     await expect(
       receiveChunk(id, 0, iv, buf, 'peer-A'),

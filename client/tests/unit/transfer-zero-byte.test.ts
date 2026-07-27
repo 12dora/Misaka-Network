@@ -62,7 +62,7 @@ describe('sendFileParallel: zero-byte file', () => {
         undefined,
         { onProgress: (sent, total) => progress.push([sent, total]) },
       ),
-    ).resolves.toBeUndefined()
+    ).resolves.toMatchObject({ state: 'saved', acked: false })
 
     // Final tick must be 1/1, not 0/0 (which renders NaN%).
     expect(progress.at(-1)).toEqual([1, 1])

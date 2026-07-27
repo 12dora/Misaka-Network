@@ -77,11 +77,14 @@ describe('sendFileParallel: file-size guard', () => {
 
   it('accepts a small file (no guard hit)', async () => {
     const small = fakeFileOfSize(0)
+    // BUG-016: the engine now returns a structured SendOutcome instead of
+    // void, so "no guard hit" means it resolved with a delivery state (the
+    // zero-byte fast path reaches `delivered` without any chunk frames).
     await expect(
       sendFileParallel(
         [makeFakeDc()], small,
         'transfer-tiny', 3, 'peer-Z',
       ),
-    ).resolves.toBeUndefined()
+    ).resolves.toMatchObject({ state: 'saved' })
   })
 })
