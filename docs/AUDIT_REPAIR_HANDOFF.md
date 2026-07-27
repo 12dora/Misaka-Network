@@ -95,11 +95,51 @@ CONFIG-002、005、QUALITY-005 **INCOMPLETE**。另报 8 个新问题，**均未
 
 完整原文在会话 scratchpad 的 `review-deploy.md`（临时目录，可能已随会话清理；上面的摘要是权威副本）。
 
-### 其余三个域
+### client UI/a11y 域（已完成）
 
-- **client UI/a11y**：复核在会话结束时仍在运行，**结果未取回**，需要重跑。
-- **server core**、**client net core**：**故意未跑**——wave 2 正在改同一批文件，
-  应在 wave 2 落地后对「wave1+wave2 最终状态」各跑一次合并复核。
+结论：SECURITY-006、BUG-030、031、CONFIG-006、UX-LAYOUT-001/003/005/006/007/008/009、
+UX-MOTION-002、A11Y-003/004/005/006/007、UX-COPY-007 **VERIFIED**。
+其中 SECURITY-006 复核者专门尝试了协议相对 URL、反斜杠、内嵌凭据、大小写/默认端口、
+尾点、IDN、编码键值、点段、活动 scheme、fragment 和重定向参数，**未找到绕过**。
+
+**INCOMPLETE / 新问题（1 个已修，其余未修）：**
+
+1. ~~**HIGH** — 切换摄像头后扫描器永久失效~~ **已修复并提交（`6e652f1`）**：
+   `ScanModal` 把控制器放在 ref 里跨整个生命周期，而按 `facingMode` 重跑的 effect
+   在 cleanup 里调用了永久性的 `dispose()`，切换后每次 acquire 都返回 `stale`；
+   StrictMode 的挂载重放也会以同样方式破坏首次挂载。改为每次 effect 运行创建独立控制器、
+   只 dispose 被取代的那个。新增组件级测试 `scan-modal-camera-switch.test.tsx`
+   （在修复前失败、修复后通过）。
+2. **MEDIUM** — `MisakaDialog` 清理时无条件移除 body 子元素的 `inert`/`aria-hidden`，
+   会破坏本来就处于隐藏状态的子树。应记录原值并按引用计数还原。
+3. **MEDIUM** — 堆叠对话框的 Escape：每个消费者各自在 `window` 上注册监听，
+   `stopPropagation()` 不能抑制同目标的其他监听器，一次 Escape 会关闭所有层；
+   而 `IpFullPrompt` 没有 `useModalExit`，**根本无法用 Escape 关闭**。
+   应由 primitive 自己处理 Escape，只让 `dialogStack` 栈顶响应。
+4. **MEDIUM** — TURN 状态的「重试」按钮不会真的重试：只把状态置为 `idle`，
+   轮询 effect 只依赖 `tab`，要等下一个 10 秒周期。
+5. **MEDIUM** — BUG-026 未完成：5 秒超时从 `createOffer()`/`setLocalDescription()`
+   **resolve 之后**才开始计时，这两个 Promise 可以永远 pending；NAT 检测也没有外层 deadline。
+6. **MEDIUM** — BUG-028 未完成：「重试」只清空 error boundary 状态，
+   模块级 `lazy()` 对象仍持有已 reject 的 import promise，会立刻再次抛出。
+7. **MEDIUM** — BUG-029 未完成：`UpdateBanner` 在 3 秒超时后**无条件 reload**，
+   不确认新 worker 是否接管；点击守卫用的是上一次渲染的 `busy` 值，可能滞后。
+8. **MEDIUM** — BUG-008 UI 半未完成：任何非空手工 TURN 字符串都算「可用」，
+   填 `foo` 这种无效值也能开启强制中继，仍可造成「relay-only 但无可用 relay」。
+9. **MEDIUM** — UX-MOTION-001 / A11Y-008 未完成：`ActivityStream` 仍每 45 秒注入内容并自动滚动，
+   没有暂停控件、也没有 coarse-pointer 静态化（ACGN 那条独立的 lore log 才加了暂停）。
+10. **MEDIUM** — A11Y-002 未完成：`ACGN.tsx` 仍把原始 `--accent-cyan` 用作白底 12px 文字
+    （约 2.25:1）。对比度测试只校验声明的配对，不校验实际用法。
+11. **MEDIUM** — UX-LAYOUT-004 未完成：导航改到 `md` 断点后，768–800px
+    （审计区间的上半段）仍是原来的密集布局，也没有加该断点的回归测试。
+12. **LOW** — `TopNav` 的 PWA 安装提示永不消失（3 秒后的相等性判断比的是上一轮渲染的 `null`）。
+13. **LOW** — 测试对两个最高风险集成给出虚假信心（摄像头、UpdateBanner 都只测了注册表/控制器本身）。
+    第 1 条已按此建议补了组件级测试，UpdateBanner 仍缺。
+
+### server core、client net core 域
+
+**故意未跑**——wave 2 当时正在改同一批文件。应在 W2-A 落地后，
+对「wave1+wave2 最终状态」各跑一次合并复核。
 
 ## 编排规则（沿用，勿破坏）
 
