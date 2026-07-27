@@ -1,8 +1,10 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
+import MisakaDialog from '@/components/ui/MisakaDialog'
 import { useModalExit } from '@/hooks/useModalExit'
-import { appUrl } from '@/lib/appBase'
+import { createCameraController } from '@/hooks/useCameraStream'
+import { parseJoinLink, describeJoinLinkRejection } from '@/components/features/joinLink'
 import jsQR from 'jsqr'
 
 interface Props {
@@ -27,9 +29,10 @@ function describeCameraError(err: unknown): string {
       case 'SecurityError':         return '需要 HTTPS 或 localhost 才能使用摄像头'
       case 'AbortError':            return '摄像头启动被中断，请重试'
     }
-    if ('message' in err) return String((err as { message: string }).message)
   }
-  return String(err)
+  // UX-COPY-004: never surface the raw exception text — it used to print
+  // browser-internal messages straight into the modal.
+  return '摄像头启动失败，请重试或改用下方链接接入'
 }
 
 // P1: surface the "where do I open the camera permission" question with a
@@ -63,22 +66,41 @@ export default function ScanModal({ onClose }: Props) {
   const [manualUrl, setManualUrl] = useState('')
   const [manualError, setManualError] = useState<string | null>(null)
   const [cameraCount, setCameraCount] = useState(0)
+  const [acquiring, setAcquiring] = useState(false)
   const modal = useModalExit(onClose)
-  const streamRef = useRef<MediaStream | null>(null)
   const animRef = useRef<number>(0)
+  const inputId = useId()
+
+  // SECURITY-012: one controller owns the camera for the whole lifetime of
+  // the modal. Every acquisition path (mount, facing-mode change, Retry)
+  // goes through it, so a stream that arrives after the modal closed is
+  // stopped by its own request generation instead of being orphaned on a
+  // detached ref.
+  const cameraRef = useRef(createCameraController())
 
   useEffect(() => {
-    let cancelled = false
-    startCamera(() => cancelled)
-    // Mark cancelled BEFORE stopCamera so a getUserMedia still pending when the
-    // modal unmounts (permission prompt open) is stopped the moment it resolves.
-    return () => { cancelled = true; stopCamera() }
+    const camera = cameraRef.current
+    void startCamera()
+    return () => {
+      stopScanLoop()
+      // dispose() bumps the generation synchronously, so a getUserMedia
+      // still sitting on the permission prompt is already stale when it
+      // resolves and stops its own tracks.
+      camera.dispose()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [facingMode])
 
-  async function startCamera(isCancelledArg?: () => boolean) {
-    // Guard against being passed a DOM event (retry button onClick).
-    const isCancelled = typeof isCancelledArg === 'function' ? isCancelledArg : () => false
-    stopCamera()
+  function stopScanLoop() {
+    if (animRef.current) {
+      cancelAnimationFrame(animRef.current)
+      animRef.current = 0
+    }
+  }
+
+  async function startCamera() {
+    const camera = cameraRef.current
+    stopScanLoop()
 
     if (!navigator.mediaDevices?.getUserMedia) {
       setHasCamera(false)
@@ -91,24 +113,30 @@ export default function ScanModal({ onClose }: Props) {
       return
     }
 
-    // Use 'ideal' so the browser falls back to any available camera when the
-    // requested facing mode is missing (common on desktops with only a webcam).
+    setAcquiring(true)
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      // Use 'ideal' so the browser falls back to any available camera when
+      // the requested facing mode is missing (common on desktops with only
+      // a webcam).
+      const result = await camera.acquire({
         video: { facingMode: { ideal: facingMode }, width: { ideal: 640 }, height: { ideal: 640 } },
         audio: false,
       })
-      // The component may have unmounted (or facingMode changed) while the
-      // permission prompt was open. Without this guard the just-granted stream
-      // is stored on a detached ref that no cleanup will ever stop — the camera
-      // light stays on and an orphaned rAF scan loop runs setState-after-unmount.
-      if (isCancelled()) {
-        stream.getTracks().forEach(t => t.stop())
+
+      // Overlapping requests are refused by the controller; a double-tap on
+      // Retry must not open a second camera.
+      if (result.status === 'busy') return
+      // The modal closed (or the facing mode changed) while the permission
+      // prompt was open. The controller has already stopped the tracks.
+      if (result.status === 'stale') return
+      if (result.status === 'error') {
+        setHasCamera(false)
+        setCameraError(describeCameraError(result.error))
         return
       }
-      streamRef.current = stream
+
       if (videoRef.current) {
-        videoRef.current.srcObject = stream
+        videoRef.current.srcObject = result.stream
         try {
           await videoRef.current.play()
         } catch {
@@ -116,6 +144,9 @@ export default function ScanModal({ onClose }: Props) {
           // will still render frames; ignore so scanning can proceed.
         }
       }
+      // The play() await is another window in which the modal can close.
+      if (camera.current() !== result.stream) return
+
       setHasCamera(true)
       setCameraError(null)
       // Probe device list after permission is granted — pre-permission the
@@ -123,29 +154,24 @@ export default function ScanModal({ onClose }: Props) {
       // the "切换摄像头" button when there is actually something to switch to.
       try {
         const devices = await navigator.mediaDevices.enumerateDevices()
+        if (camera.current() !== result.stream) return
         setCameraCount(devices.filter(d => d.kind === 'videoinput').length)
       } catch {
         setCameraCount(1)
       }
-      startScanning()
-    } catch (err) {
-      setHasCamera(false)
-      setCameraError(describeCameraError(err))
+      startScanning(result.stream)
+    } finally {
+      setAcquiring(false)
     }
   }
 
   function stopCamera() {
-    if (animRef.current) {
-      cancelAnimationFrame(animRef.current)
-      animRef.current = 0
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop())
-      streamRef.current = null
-    }
+    stopScanLoop()
+    cameraRef.current.stop()
   }
 
-  function startScanning() {
+  function startScanning(stream: MediaStream) {
+    const camera = cameraRef.current
     const BarcodeDetectorCtor = (window as unknown as Record<string, unknown>).BarcodeDetector as typeof BarcodeDetector | undefined
 
     async function scanWithBarcodeDetector() {
@@ -180,15 +206,18 @@ export default function ScanModal({ onClose }: Props) {
     }
 
     async function tick() {
-      if (!streamRef.current) return
+      // Identity check, not just "is there a stream": after a facing-mode
+      // switch the old loop must die rather than scan the new camera twice.
+      if (camera.current() !== stream) return
       const found = await scanWithBarcodeDetector()
       if (!found) await scanWithJsQR()
+      if (camera.current() !== stream) return
       animRef.current = requestAnimationFrame(tick)
     }
 
     // Small delay to let camera warm up
     setTimeout(() => {
-      if (streamRef.current) tick()
+      if (camera.current() === stream) void tick()
     }, 500)
   }
 
@@ -196,173 +225,182 @@ export default function ScanModal({ onClose }: Props) {
     setFacingMode(prev => prev === 'environment' ? 'user' : 'environment')
   }
 
-  function handleBackdrop(e: React.MouseEvent<HTMLDivElement>) {
-    if (e.target === e.currentTarget) {
-      stopCamera()
-      modal.requestClose()
-    }
-  }
-
   function handleClose() {
     stopCamera()
     modal.requestClose()
   }
 
-  function openDetectedUrl(raw: string) {
-    try {
-      const url = new URL(raw)
-      const sameOrigin = url.origin === location.origin
-      window.location.href = sameOrigin ? `${url.pathname}${url.search}${url.hash}` : raw
-      return true
-    } catch {
-      if (raw.startsWith('misaka://')) {
-        const path = raw.slice('misaka://'.length) || '/'
-        window.location.href = appUrl(path.startsWith('/') ? path : `/${path}`)
-        return true
-      }
+  // SECURITY-006 — the ONLY navigation path out of this modal.
+  //
+  // The old implementation handed anything `new URL()` accepted to
+  // `window.location.href`: a foreign HTTPS origin navigated away from the
+  // app, and `javascript:` / `data:` values were left to the browser and
+  // CSP to stop. `parseJoinLink` allow-lists scheme, credentials, origin,
+  // the exact join route and every query parameter, and returns a relative
+  // path we build ourselves — the raw value never reaches the assignment.
+  function openDetectedUrl(raw: string): boolean {
+    const parsed = parseJoinLink(raw)
+    if (!parsed.ok) {
+      setManualError(describeJoinLinkRejection(parsed.reason))
+      return false
     }
-    return false
+    window.location.href = parsed.path
+    return true
   }
 
   function handleManualJoin() {
     setManualError(null)
-    if (!openDetectedUrl(manualUrl.trim())) {
-      setManualError('请输入有效的御坂网络 QR 链接')
-    }
+    openDetectedUrl(manualUrl.trim())
   }
 
   // When QR detected, navigate. P1-7: openDetectedUrl returns false for
   // arbitrary QR codes (a Wi-Fi QR, a non-misaka URL, etc.). Previously
   // that branch silently no-op'd while the modal stayed open with the
   // "✓ 已识别" overlay — the user assumed the app was hung. Clear the
-  // detected state, close the modal, and surface a brief toast hint.
+  // detected state, keep the camera alive so the user can try another code.
   useEffect(() => {
     if (!detected) return
-    stopCamera()
     const ok = openDetectedUrl(detected)
-    if (!ok) {
-      setDetected(null)
-      // Use the manualError slot to surface the message inline before
-      // closing — without this the modal disappears with no explanation.
-      setManualError('非御坂网络的 QR 码，已忽略')
-      // Brief delay so the message is visible, then dismiss the modal.
-      setTimeout(() => modal.requestClose(), 1500)
+    if (ok) {
+      stopCamera()
+      return
     }
+    setDetected(null)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [detected])
 
   return (
-    <div
-      className={`fixed inset-0 z-[100] flex items-center justify-center p-4 ${modal.backdropClass}`}
-      style={{ background: 'rgba(14,42,107,0.55)', backdropFilter: 'blur(8px)' }}
-      onClick={handleBackdrop}
-    >
-      <div
-        className={`relative flex flex-col items-center gap-4 rounded-2xl p-5 xs:p-6 ${modal.panelClass}`}
-        style={{
-          background: 'var(--surface)',
-          boxShadow: 'var(--shadow-float)',
-          // P0-2: gracefully shrink on 320px-class devices instead of relying
-          // on width: 100% inside a fixed-padding backdrop.
-          width: 'min(340px, 100% - 8px)',
-          // P1-13: landscape phone / split-view iPad — without a maxHeight the
-          // aspect-square camera + URL input + buttons overflow and the
-          // "接入" / "取消" actions are off-screen.
-          maxHeight: '90svh',
-          overflowY: 'auto',
-        }}
-        onClick={e => e.stopPropagation()}
-      >
-        {/* Header */}
+    <MisakaDialog
+      title="扫描节点 QR"
+      description="仅扫描御坂网络接入码"
+      onRequestClose={handleClose}
+      backdropClass={modal.backdropClass}
+      panelClass={modal.panelClass}
+      backdropStyle={{ background: 'rgba(14,42,107,0.55)', backdropFilter: 'blur(8px)' }}
+      panelClassName="relative flex flex-col items-center gap-4 rounded-2xl p-5 xs:p-6"
+      panelStyle={{
+        background: 'var(--surface)',
+        boxShadow: 'var(--shadow-float)',
+        // P0-2: gracefully shrink on 320px-class devices instead of relying
+        // on width: 100% inside a fixed-padding backdrop.
+        width: 'min(340px, 100% - 8px)',
+        // P1-13: landscape phone / split-view iPad — without a maxHeight the
+        // aspect-square camera + URL input + buttons overflow and the
+        // "接入" / "取消" actions are off-screen.
+        maxHeight: '90svh',
+        overflowY: 'auto',
+      }}
+      renderHeader={({ titleId, descriptionId }) => (
         <div className="flex items-center gap-2">
           <MisakaKanjiBlock char="読" size="md" />
           <div>
-            <div className="font-kanji font-bold text-base text-[var(--text-on-white)]">
+            <h2 id={titleId} className="font-kanji font-bold text-base text-[var(--text-on-white)] m-0">
               扫描节点 QR
-            </div>
-            <div className="font-kanji text-xs text-[var(--text-on-white-2)]">
-              扫描或粘贴接入链接
-            </div>
+            </h2>
+            {/* SECURITY-006 replacement copy — set the expectation before
+                the user points the camera at an arbitrary code. */}
+            <p id={descriptionId} className="font-kanji text-xs text-[var(--text-on-white-2)] m-0">
+              仅扫描御坂网络接入码
+            </p>
           </div>
         </div>
+      )}
+    >
+      {/* Accent line */}
+      <div className="w-12 h-0.5" style={{ background: 'var(--accent-cyan)' }} />
 
-        {/* Accent line */}
-        <div className="w-12 h-0.5" style={{ background: 'var(--accent-cyan)' }} />
-
-        {/* Camera view */}
-        <div className="corner-frame relative w-full aspect-square rounded-xl overflow-hidden" style={{ background: '#000' }}>
-          {hasCamera ? (
-            <>
-              <video
-                ref={videoRef}
-                className="w-full h-full object-cover"
-                playsInline
-                muted
-              />
-              <canvas ref={canvasRef} className="hidden" />
-              {/* Scan line */}
-              <div className="scan-line" />
-            </>
-          ) : (
-            <div className="w-full h-full flex flex-col items-center justify-center gap-2 px-4 text-center">
-              <MisakaKanjiBlock char="禁" size="lg" />
-              <p className="font-kanji text-sm text-[var(--text-on-blue-2)]">无法访问摄像头</p>
-              <p className="font-kanji text-xs text-[var(--text-muted)] break-words">
-                {cameraError ?? '请检查权限设置'}
-              </p>
-              {/* P1: platform-specific guidance when the user previously
-                  denied the prompt — otherwise they're stuck (the browser
-                  won't re-prompt) with no path forward. */}
-              {cameraError?.includes('权限') && (
-                <p className="font-kanji text-[10px] text-[var(--text-on-blue-2)] break-words leading-snug px-2 mt-1">
-                  {permissionHelpHint()}
-                </p>
-              )}
-              <MisakaButton variant="pill" size="sm" onClick={() => startCamera()} className="mt-2">
-                重试
-              </MisakaButton>
-            </div>
-          )}
-          {detected && (
-            <div className="absolute inset-0 flex items-center justify-center" style={{ background: 'rgba(0,194,138,0.15)' }}>
-              <span className="font-kanji font-bold text-sm" style={{ color: 'var(--state-success)' }}>✓ 已识别</span>
-            </div>
-          )}
-        </div>
-
-        {/* Actions */}
-        <div className="w-full rounded-xl p-3" style={{ background: 'var(--surface-tint)' }}>
-          <label className="block font-kanji text-xs text-[var(--text-on-white-2)] mb-2">
-            粘贴 QR 链接
-          </label>
-          <div className="flex gap-2">
-            <input
-              value={manualUrl}
-              onChange={e => setManualUrl(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter') handleManualJoin() }}
-              placeholder="http://localhost:5173/join?..."
-              className="misaka-input text-xs flex-1"
+      {/* Camera view */}
+      <div className="corner-frame relative w-full aspect-square rounded-xl overflow-hidden" style={{ background: '#000' }}>
+        {hasCamera ? (
+          <>
+            <video
+              ref={videoRef}
+              className="w-full h-full object-cover"
+              playsInline
+              muted
             />
-            <MisakaButton variant="primary" size="sm" onClick={handleManualJoin} disabled={!manualUrl.trim()}>
-              接入
+            <canvas ref={canvasRef} className="hidden" />
+            {/* Scan line */}
+            <div className="scan-line" />
+          </>
+        ) : (
+          <div className="w-full h-full flex flex-col items-center justify-center gap-2 px-4 text-center">
+            <MisakaKanjiBlock char="禁" size="lg" />
+            <p className="font-kanji text-sm text-[var(--text-on-blue-2)]">无法访问摄像头</p>
+            <p className="font-kanji text-xs text-[var(--text-on-blue-2)] break-words">
+              {cameraError ?? '请检查权限设置'}
+            </p>
+            {/* P1: platform-specific guidance when the user previously
+                denied the prompt — otherwise they're stuck (the browser
+                won't re-prompt) with no path forward. */}
+            {cameraError?.includes('权限') && (
+              <p className="font-kanji text-[10px] text-[var(--text-on-blue-2)] break-words leading-snug px-2 mt-1">
+                {permissionHelpHint()}
+              </p>
+            )}
+            <MisakaButton
+              variant="pill"
+              size="sm"
+              onClick={() => { void startCamera() }}
+              disabled={acquiring}
+              className="mt-2"
+            >
+              {acquiring ? '启动中…' : '重试'}
             </MisakaButton>
           </div>
-          {manualError && (
-            <p className="font-kanji text-[10px] text-[var(--state-danger)] mt-2">{manualError}</p>
-          )}
-        </div>
+        )}
+        {detected && (
+          <div className="absolute inset-0 flex items-center justify-center" style={{ background: 'rgba(14,42,107,0.72)' }}>
+            {/* A11Y-002: this overlay sits on dark video, so it takes the
+                on-blue variant, not the on-light one. */}
+            <span className="font-kanji font-bold text-sm" style={{ color: 'var(--state-success-on-blue)' }}>✓ 已识别</span>
+          </div>
+        )}
+      </div>
 
-        {/* Actions */}
-        <div className="flex gap-2 w-full">
-          {hasCamera && cameraCount > 1 && (
-            <MisakaButton variant="pill" size="sm" fullWidth onClick={switchCamera}>
-              切换摄像头
-            </MisakaButton>
-          )}
-          <MisakaButton variant="pill" size="sm" fullWidth onClick={handleClose}>
-            取消
+      {/* Manual entry — A11Y-004: real label association */}
+      <div className="w-full rounded-xl p-3" style={{ background: 'var(--surface-tint)' }}>
+        <label htmlFor={inputId} className="block font-kanji text-xs text-[var(--text-on-white-2)] mb-2">
+          粘贴接入链接
+        </label>
+        <div className="flex gap-2">
+          <input
+            id={inputId}
+            value={manualUrl}
+            onChange={e => { setManualUrl(e.target.value); setManualError(null) }}
+            onKeyDown={e => { if (e.key === 'Enter') handleManualJoin() }}
+            placeholder="https://…/join?type=node&id=…"
+            aria-invalid={manualError ? true : undefined}
+            aria-describedby={manualError ? `${inputId}-error` : undefined}
+            className="misaka-input text-xs flex-1 min-w-0"
+          />
+          <MisakaButton variant="primary" size="sm" onClick={handleManualJoin} disabled={!manualUrl.trim()}>
+            接入
           </MisakaButton>
         </div>
+        {manualError && (
+          <p
+            id={`${inputId}-error`}
+            className="font-kanji text-[11px] mt-2 leading-snug"
+            style={{ color: 'var(--state-danger-on-light)' }}
+            role="alert"
+          >
+            {manualError}
+          </p>
+        )}
       </div>
-    </div>
+
+      {/* Actions */}
+      <div className="flex gap-2 w-full">
+        {hasCamera && cameraCount > 1 && (
+          <MisakaButton variant="pill" size="sm" fullWidth onClick={switchCamera} disabled={acquiring}>
+            切换摄像头
+          </MisakaButton>
+        )}
+        <MisakaButton variant="pill" size="sm" fullWidth onClick={handleClose}>
+          取消
+        </MisakaButton>
+      </div>
+    </MisakaDialog>
   )
 }

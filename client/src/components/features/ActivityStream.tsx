@@ -4,6 +4,7 @@ import { useAuthStore } from '@/store/auth'
 import { onMessage } from '@/lib/signaling'
 import type { ActivityEvent } from '@/types'
 import { ACTIVITY_QUOTES } from '@/data/lore'
+import { scrollBehavior } from '@/hooks/useReducedMotion'
 
 const TYPE_COLOR: Record<ActivityEvent['type'], string> = {
   join:     'var(--state-success)',
@@ -51,9 +52,12 @@ export default function ActivityStream() {
     return () => window.clearInterval(timer)
   }, [session, addActivity])
 
-  // Auto scroll to left on new activity
+  // Auto scroll to left on new activity.
+  // UX-MOTION-001: a scripted smooth scroll moves the viewport contents for
+  // users who asked the OS for reduced motion; `scrollBehavior()` degrades
+  // it to an instant jump.
   useEffect(() => {
-    scrollRef.current?.scrollTo({ left: 0, behavior: 'smooth' })
+    scrollRef.current?.scrollTo({ left: 0, behavior: scrollBehavior() })
   }, [activities])
 
   if (activities.length === 0) return null
@@ -75,7 +79,7 @@ export default function ActivityStream() {
 
         <div
           ref={scrollRef}
-          className="flex items-center gap-3 overflow-x-auto px-16 py-4 scroll-smooth"
+          className="flex items-center gap-3 overflow-x-auto px-16 py-4"
           style={{ scrollbarWidth: 'none', height: 72 }}
         >
           {activities.map(event => (

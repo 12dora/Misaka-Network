@@ -200,7 +200,13 @@ export default function Join() {
                 接入御坂 {joinInfo.targetNodeId} 号
               </div>
             </div>
+            {/* A11Y-004: the surrounding heading is not a programmatic
+                label; associate one explicitly. */}
+            <label htmlFor="join-passcode" className="sr-only">通行码，6 位数字</label>
             <input
+              id="join-passcode"
+              aria-invalid={errorMsg ? true : undefined}
+              aria-describedby={errorMsg ? 'join-passcode-error' : undefined}
               value={manualPass}
               onChange={e => setManualPass(e.target.value.replace(/\D/g, '').slice(0, 6))}
               onKeyDown={e => { if (e.key === 'Enter') submitPassCode() }}
@@ -211,7 +217,7 @@ export default function Join() {
               className="misaka-input text-center font-mono text-xl tracking-[0.35em]"
             />
             {errorMsg && (
-              <p className="font-kanji text-xs text-[var(--state-danger)] text-center">{errorMsg}</p>
+              <p id="join-passcode-error" role="alert" className="font-kanji text-xs text-center" style={{ color: 'var(--state-danger-on-light)' }}>{errorMsg}</p>
             )}
             <div className="flex gap-2 w-full">
               <MisakaButton variant="pill" size="sm" fullWidth onClick={() => navigate('/', { replace: true })}>
@@ -236,7 +242,7 @@ export default function Join() {
           <>
             <MisakaKanjiBlock char="断" size="lg" />
             <div className="text-center">
-              <div className="font-kanji font-bold text-lg text-[var(--state-danger)]">
+              <div className="font-kanji font-bold text-lg" style={{ color: 'var(--state-danger-on-light)' }}>
                 接入失败
               </div>
               <div className="font-kanji text-xs text-[var(--text-on-white-2)] mt-1">

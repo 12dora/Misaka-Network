@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useId, useState } from 'react'
 import MisakaCard from '@/components/ui/MisakaCard'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
@@ -6,6 +6,7 @@ import AppFooter from '@/components/ui/AppFooter'
 import MisakaHeroTitle from '@/components/ui/MisakaHeroTitle'
 import { QUOTES, CHARACTERS, LORE_LOG, LORE_TIMELINE, getCharacterByNodeId } from '@/data/lore'
 import { publicAssetUrl } from '@/lib/appBase'
+import { scrollIntoViewSafely, useCoarsePointer, useReducedMotion } from '@/hooks/useReducedMotion'
 
 const HERO_CHARACTER = publicAssetUrl('assets/misaka.webp')
 
@@ -77,6 +78,16 @@ function EasterEggSection() {
   const [quote, setQuote] = useState(QUOTES[0])
   const [nodeQuery, setNodeQuery] = useState('')
   const [queryResult, setQueryResult] = useState<string | null>(null)
+  const [queryError, setQueryError] = useState(false)
+  const nodeQueryId = useId()
+  // A11Y-008 / UX-MOTION-001: the lore log drifts forever and could only be
+  // paused by hovering — unreachable for keyboard and touch users. Coarse
+  // pointers and reduced-motion users start paused; everyone gets an
+  // explicit control.
+  const reducedMotion = useReducedMotion()
+  const coarsePointer = useCoarsePointer()
+  const [lorePaused, setLorePaused] = useState(false)
+  const loreStopped = lorePaused || reducedMotion || coarsePointer
 
   function randomQuote() {
     const idx  = Math.floor(Math.random() * QUOTES.length)
@@ -86,9 +97,11 @@ function EasterEggSection() {
   function queryNode() {
     const n = parseInt(nodeQuery, 10)
     if (isNaN(n) || n < 1 || n > 20001) {
+      setQueryError(true)
       setQueryResult('节点编号范围为 1~20001')
       return
     }
+    setQueryError(false)
     setQueryResult(getCharacterByNodeId(n))
   }
 
@@ -119,24 +132,46 @@ function EasterEggSection() {
             <MisakaKanjiBlock char="号" size="sm" />
             <span className="font-kanji font-bold text-sm text-[var(--text-on-white)]">实验体编号查询</span>
           </div>
-          <div className="flex gap-2 mb-4">
+          {/* A11Y-004: a placeholder is not a label. */}
+          <label htmlFor={nodeQueryId} className="block font-kanji text-xs text-[var(--text-on-white-2)] mb-1.5">
+            实验体编号，范围 1–20001
+          </label>
+          {/* UX-LAYOUT-005: a `flex-1` number input keeps its intrinsic
+              min-content width unless `min-width: 0` is set, so in a narrow
+              three-column card the input + 查询 button overflowed the card.
+              `min-w-0` lets it actually shrink, and `flex-wrap` gives the
+              button its own line before anything is clipped. */}
+          <div className="flex flex-wrap gap-2 mb-4">
             <input
+              id={nodeQueryId}
               type="number"
               min={1}
               max={20001}
+              inputMode="numeric"
               placeholder="1~20001"
               value={nodeQuery}
-              onChange={e => setNodeQuery(e.target.value)}
+              onChange={e => { setNodeQuery(e.target.value); setQueryError(false) }}
               onKeyDown={e => e.key === 'Enter' && queryNode()}
-              className="flex-1 px-3 py-2 rounded-lg text-sm font-mono focus:outline-none"
+              aria-invalid={queryError || undefined}
+              aria-describedby={queryResult ? `${nodeQueryId}-result` : undefined}
+              // A11Y-005: `focus:outline-none` removed the ONLY focus
+              // indicator on this input. Keep it (the platform ring clashes
+              // with the card style) but reinstate the shared ring.
+              className="misaka-focus-ring flex-1 min-w-0 px-3 py-2 rounded-lg text-sm font-mono focus:outline-none"
               style={{ border: '1px solid var(--border-card)', background: 'var(--surface)', color: 'var(--text-on-white)' }}
             />
-            <MisakaButton variant="primary" size="sm" onClick={queryNode}>查询</MisakaButton>
+            <MisakaButton variant="primary" size="sm" className="shrink-0" onClick={queryNode}>查询</MisakaButton>
           </div>
           {queryResult && (
             <div
-              className="rounded-lg p-3 font-kanji text-xs text-[var(--text-on-white)] leading-relaxed"
-              style={{ background: 'var(--surface-tint)', whiteSpace: 'pre-wrap' }}
+              id={`${nodeQueryId}-result`}
+              role="status"
+              className="rounded-lg p-3 font-kanji text-xs leading-relaxed"
+              style={{
+                background: 'var(--surface-tint)',
+                whiteSpace: 'pre-wrap',
+                color: queryError ? 'var(--state-warn-on-light)' : 'var(--text-on-white)',
+              }}
             >
               {queryResult}
             </div>
@@ -145,11 +180,31 @@ function EasterEggSection() {
 
         {/* Lore Log */}
         <MisakaCard padding="md" className="flex flex-col">
-          <div className="flex items-center gap-2 mb-4">
-            <MisakaKanjiBlock char="録" size="sm" />
-            <span className="font-kanji font-bold text-sm text-[var(--text-on-white)]">网络日志</span>
+          <div className="flex items-center justify-between gap-2 mb-4">
+            <div className="flex items-center gap-2 min-w-0">
+              <MisakaKanjiBlock char="録" size="sm" />
+              <span className="font-kanji font-bold text-sm text-[var(--text-on-white)]">网络日志</span>
+            </div>
+            {/* A11Y-008: keyboard- and touch-reachable pause. Hidden when
+                motion is already off, so we never offer a control that
+                does nothing. */}
+            {!reducedMotion && !coarsePointer && (
+              <MisakaButton
+                variant="pill"
+                size="sm"
+                className="text-[11px] py-1 px-2 shrink-0"
+                aria-pressed={lorePaused}
+                onClick={() => setLorePaused(p => !p)}
+              >
+                {lorePaused ? '▶ 继续滚动' : '⏸ 暂停滚动'}
+              </MisakaButton>
+            )}
           </div>
-          <div className="lore-log flex flex-col gap-2 overflow-y-auto" style={{ maxHeight: 200 }}>
+          <div
+            className="lore-log flex flex-col gap-2 overflow-y-auto"
+            data-paused={loreStopped ? 'true' : 'false'}
+            style={{ maxHeight: 200 }}
+          >
             {LORE_LOG.map((entry, i) => (
               <div key={i} className="flex items-start gap-2 text-xs">
                 <span
@@ -191,7 +246,7 @@ export default function ACGN() {
     <div className="min-h-screen" style={{ background: 'var(--bg-primary)' }}>
 
       {/* ── Mobile Hero ───────────────────────────────────────────── */}
-      <section className="md:hidden relative overflow-hidden pt-16">
+      <section className="md:hidden relative overflow-hidden pt-nav">
         <div
           className="absolute inset-0 pointer-events-none dot-grid"
           style={{
@@ -202,9 +257,8 @@ export default function ACGN() {
         />
 
         <div
-          className="relative w-full overflow-hidden"
+          className="hero-stage relative w-full overflow-hidden"
           style={{
-            height: 'clamp(310px, 50svh, 430px)',
             background: 'linear-gradient(180deg, rgba(14,42,107,0.18) 0%, rgba(255,255,255,0.08) 100%)',
           }}
         >
@@ -256,7 +310,7 @@ export default function ACGN() {
           <MisakaButton
             variant="pill"
             size="sm"
-            onClick={() => document.getElementById('about')?.scrollIntoView({ behavior: 'smooth' })}
+            onClick={() => scrollIntoViewSafely(document.getElementById('about'))}
           >
             了解更多
           </MisakaButton>
@@ -269,7 +323,7 @@ export default function ACGN() {
         style={{
           gridTemplateColumns: '44% 1fr',
           minHeight: 'min(80vh, 680px)',
-          paddingTop: 64,
+          paddingTop: 'var(--nav-h-total)',
         }}
       >
         <div className="relative flex items-end justify-center">
@@ -281,7 +335,7 @@ export default function ACGN() {
             fetchPriority="high"
             decoding="async"
             style={{
-              maxHeight: 'calc(min(100dvh, 820px) - 64px)',
+              maxHeight: 'calc(min(100dvh, 820px) - var(--nav-h-total))',
               width: '100%',
               objectFit: 'contain',
               objectPosition: 'bottom center',
@@ -302,7 +356,7 @@ export default function ACGN() {
             <MisakaButton
               variant="pill"
               size="sm"
-              onClick={() => document.getElementById('about')?.scrollIntoView({ behavior: 'smooth' })}
+              onClick={() => scrollIntoViewSafely(document.getElementById('about'))}
             >
               了解更多
             </MisakaButton>

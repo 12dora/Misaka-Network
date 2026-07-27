@@ -1,10 +1,11 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useId, useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { useAuthStore } from '@/store/auth'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import QRModal from '@/components/features/QRModal'
 import ScanModal from '@/components/features/ScanModal'
 import SettingsModal from '@/components/features/SettingsModal'
+import { scrollIntoViewSafely } from '@/hooks/useReducedMotion'
 
 const LINKS = [
   { to: '/',        label: '首页',  kanji: '首' },
@@ -29,6 +30,11 @@ export default function TopNav() {
   // user resolved the system dialog with no confirmation either way. Surface
   // the outcome so a deferred install doesn't look like a broken click.
   const [installToast, setInstallToast] = useState<string | null>(null)
+  const menuId = useId()
+
+  // A11Y-006: close the dropdown on route change so `aria-expanded` never
+  // reports a menu that navigation already dismissed.
+  useEffect(() => { setMenuOpen(false) }, [location.pathname])
 
   useEffect(() => {
     const onBeforeInstallPrompt = (e: Event) => {
@@ -87,19 +93,26 @@ export default function TopNav() {
     setTimeout(() => setInstallToast(prev => (prev === '请先在首页接入御坂网络' ? null : prev)), 2400)
     navigate('/')
     // Wait a tick for the home page to mount before attempting to scroll.
+    // UX-MOTION-001: scripted smooth scrolling ignored `prefers-reduced-
+    // motion` entirely — route it through the shared helper.
     setTimeout(() => {
-      const el = document.querySelector('[data-login-card]') as HTMLElement | null
-      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      scrollIntoViewSafely(document.querySelector('[data-login-card]'), { block: 'center' })
     }, 180)
   }
 
   return (
     <>
       <nav
-        className="fixed top-0 left-0 right-0 z-50 flex items-center justify-between h-16"
+        aria-label="主导航"
+        className="fixed top-0 left-0 right-0 z-50 flex items-center justify-between"
         style={{
           paddingLeft:  'clamp(1rem, 4vw, 2rem)',
           paddingRight: 'clamp(1rem, 4vw, 2rem)',
+          // UX-LAYOUT-007: a bare `h-16` put the nav content under the iOS
+          // status bar / notch when launched from the Home Screen. The
+          // shared token adds the top safe-area inset to the 64 px chrome.
+          height: 'var(--nav-h-total)',
+          paddingTop: 'var(--safe-top)',
           background: 'rgba(26,79,196,0.78)',
           backdropFilter: 'blur(20px)',
           WebkitBackdropFilter: 'blur(20px)',
@@ -111,20 +124,31 @@ export default function TopNav() {
           <MisakaKanjiBlock char="御" size="md" />
           <span className="font-kanji font-bold text-white leading-tight">
             <span className="text-base">御坂网络</span>
-            <span className="hidden sm:block font-mono text-[10px] font-normal text-[var(--text-on-blue-2)] tracking-widest">
+            <span className="hidden md:block font-mono text-[10px] font-normal text-[var(--text-on-blue-2)] tracking-widest">
               MISAKA NETWORK
             </span>
           </span>
         </Link>
 
-        {/* Desktop nav pills */}
-        <div className="hidden sm:flex items-center gap-2">
+        {/* Desktop nav pills.
+            UX-LAYOUT-004: these used to appear at `sm` (640 px) together
+            with the connected action group and the status chip. Their
+            intrinsic no-wrap widths overflow a 640–800 px viewport, and
+            `body { overflow-x: hidden }` silently clips whatever doesn't
+            fit. Everything now switches at `md` (768 px), where the full
+            row demonstrably fits; below that the hamburger owns it.
+            A11Y-006: `Link` is styled as the pill directly — the old
+            `<Link><button/></Link>` nested two interactive elements, giving
+            duplicate tab stops and inconsistent activation across
+            browsers. */}
+        <div className="hidden md:flex items-center gap-2">
           {LINKS.map(({ to, label }) => {
             const needsAuth = to === '/network' && !isConnected
             if (needsAuth) {
               return (
                 <button
                   key={to}
+                  type="button"
                   className="nav-pill text-sm opacity-60 cursor-pointer"
                   onClick={nudgeToLogin}
                   title="请先接入网络"
@@ -135,10 +159,13 @@ export default function TopNav() {
               )
             }
             return (
-              <Link key={to} to={to} className="no-underline">
-                <button className={`nav-pill text-sm${isActive(to) ? ' active' : ''}`}>
-                  {label}
-                </button>
+              <Link
+                key={to}
+                to={to}
+                className={`nav-pill text-sm${isActive(to) ? ' active' : ''}`}
+                aria-current={isActive(to) ? 'page' : undefined}
+              >
+                {label}
               </Link>
             )
           })}
@@ -146,29 +173,31 @@ export default function TopNav() {
 
         {/* Right: QR / scan / status / mobile menu.
             Install / QR / Scan are duplicated inside the mobile hamburger
-            dropdown below — hiding them on <sm prevents the nav from
-            overflowing on 320–390 px phones and pushing the hamburger
-            off-screen (P0-6). */}
+            dropdown below — hiding them below `md` prevents the nav from
+            overflowing on 320–800 px viewports and pushing the hamburger
+            off-screen (P0-6, UX-LAYOUT-004). */}
         <div className="flex items-center gap-3 h-8">
           {isConnected && (
-            <div className="hidden sm:flex items-center gap-3">
+            <div className="hidden md:flex items-center gap-3">
               {installPrompt && (
-                <button className="nav-pill text-sm !px-3" onClick={handleInstallApp}>
+                <button type="button" className="nav-pill text-sm !px-3" onClick={handleInstallApp}>
                   ⬇ 安装应用
                 </button>
               )}
-              <button className="nav-pill text-sm !px-3" onClick={() => setShowQR(true)}>
+              <button type="button" className="nav-pill text-sm !px-3" onClick={() => setShowQR(true)}>
                 🔲 我的 QR
               </button>
-              <button className="nav-pill text-sm !px-3" onClick={() => setShowScan(true)}>
+              <button type="button" className="nav-pill text-sm !px-3" onClick={() => setShowScan(true)}>
                 📷 扫描
               </button>
             </div>
           )}
 
-          {/* Settings */}
+          {/* Settings — A11Y-007: `.tap-target` grows the hit area to 44 px
+              on coarse pointers without changing the 32 px visual. */}
           <button
-            className="w-8 h-8 inline-grid place-items-center rounded-full cursor-pointer hover:opacity-70 transition-opacity leading-none"
+            type="button"
+            className="tap-target w-8 h-8 inline-grid place-items-center rounded-full cursor-pointer hover:opacity-70 transition-opacity leading-none"
             style={{ border: 'none', background: 'transparent', lineHeight: 0, padding: 0 }}
             onClick={() => { setMenuOpen(false); setShowSettings(true) }}
             aria-label="设置"
@@ -195,12 +224,16 @@ export default function TopNav() {
             <span className="hidden xs:inline">{isConnected ? '已接入' : '未接入'}</span>
           </span>
 
-          {/* Mobile hamburger */}
+          {/* Mobile hamburger — A11Y-006: expose the menu's expanded state
+              and what it controls. */}
           <button
-            className="sm:hidden flex flex-col justify-center items-center gap-1 w-8 h-8 cursor-pointer"
+            type="button"
+            className="tap-target md:hidden flex flex-col justify-center items-center gap-1 w-8 h-8 cursor-pointer"
             style={{ border: 'none', background: 'transparent' }}
             onClick={() => setMenuOpen(o => !o)}
-            aria-label="菜单"
+            aria-label={menuOpen ? '关闭菜单' : '打开菜单'}
+            aria-expanded={menuOpen}
+            aria-controls={menuId}
           >
             <span
               className="block w-5 h-0.5 bg-white rounded transition-all duration-200"
@@ -218,11 +251,15 @@ export default function TopNav() {
         </div>
       </nav>
 
-      {/* Mobile dropdown menu */}
+      {/* Mobile dropdown menu.
+          UX-LAYOUT-007: `top-16` ignored the safe-area inset, so on a notched
+          iPhone in standalone mode the dropdown overlapped the nav. */}
       {menuOpen && (
         <div
-          className="fixed top-16 left-0 right-0 z-40 sm:hidden flex flex-col"
+          id={menuId}
+          className="fixed left-0 right-0 z-40 md:hidden flex flex-col"
           style={{
+            top: 'var(--nav-h-total)',
             background: 'rgba(14,42,107,0.97)',
             backdropFilter: 'blur(20px)',
             borderBottom: '1px solid rgba(255,255,255,0.12)',
@@ -246,7 +283,9 @@ export default function TopNav() {
                 >
                   <MisakaKanjiBlock char={kanji} size="sm" />
                   <span className="font-kanji font-semibold text-white">{label}</span>
-                  <span className="ml-auto font-kanji text-[10px] text-[var(--text-muted)]">需登录</span>
+                  {/* A11Y-002: --text-muted is a fill token; on the deep-blue
+                      dropdown the AA-verified text token is --text-on-blue-2. */}
+                  <span className="ml-auto font-kanji text-[10px] text-[var(--text-on-blue-2)]">需登录</span>
                 </button>
               )
             }
@@ -254,39 +293,38 @@ export default function TopNav() {
               <Link
                 key={to}
                 to={to}
-                className="no-underline"
+                className="no-underline flex items-center gap-3 px-6 py-4 border-b"
                 onClick={() => setMenuOpen(false)}
+                aria-current={isActive(to) ? 'page' : undefined}
+                style={{
+                  minHeight: 44,
+                  borderColor: 'rgba(255,255,255,0.08)',
+                  background: isActive(to) ? 'rgba(255,255,255,0.08)' : 'transparent',
+                }}
               >
-                <div
-                  className="flex items-center gap-3 px-6 py-4 border-b"
-                  style={{
-                    borderColor: 'rgba(255,255,255,0.08)',
-                    background: isActive(to) ? 'rgba(255,255,255,0.08)' : 'transparent',
-                  }}
-                >
-                  <MisakaKanjiBlock char={kanji} size="sm" />
-                  <span className="font-kanji font-semibold text-white">{label}</span>
-                  {isActive(to) && (
-                    <span
-                      className="ml-auto w-1.5 h-1.5 rounded-full"
-                      style={{ background: 'var(--accent-cyan)' }}
-                    />
-                  )}
-                </div>
+                <MisakaKanjiBlock char={kanji} size="sm" />
+                <span className="font-kanji font-semibold text-white">{label}</span>
+                {isActive(to) && (
+                  <span
+                    className="ml-auto w-1.5 h-1.5 rounded-full"
+                    style={{ background: 'var(--accent-cyan)' }}
+                    aria-hidden="true"
+                  />
+                )}
               </Link>
             )
           })}
           {isConnected && (
-            <div className="flex gap-2 p-4">
+            <div className="flex flex-wrap gap-2 p-4">
               {installPrompt && (
-                <button className="nav-pill text-sm flex-1" onClick={() => { setMenuOpen(false); handleInstallApp() }}>
+                <button type="button" className="nav-pill text-sm flex-1 min-w-0" onClick={() => { setMenuOpen(false); handleInstallApp() }}>
                   ⬇ 安装应用
                 </button>
               )}
-              <button className="nav-pill text-sm flex-1" onClick={() => { setMenuOpen(false); setShowQR(true) }}>
+              <button type="button" className="nav-pill text-sm flex-1 min-w-0" onClick={() => { setMenuOpen(false); setShowQR(true) }}>
                 🔲 我的 QR
               </button>
-              <button className="nav-pill text-sm flex-1" onClick={() => { setMenuOpen(false); setShowScan(true) }}>
+              <button type="button" className="nav-pill text-sm flex-1 min-w-0" onClick={() => { setMenuOpen(false); setShowScan(true) }}>
                 📷 扫描
               </button>
             </div>
@@ -309,12 +347,14 @@ export default function TopNav() {
         <SettingsModal onClose={() => setShowSettings(false)} />
       )}
 
-      {/* P2: PWA install confirmation toast. Uses the same `misaka-toast`
-          positioning class as Network's toast so it reserves home-indicator
-          safe area on mobile. */}
+      {/* P2: PWA install confirmation toast.
+          UX-LAYOUT-009: moved onto the shared `.misaka-notify` layer so it
+          reserves the mobile action bar + home-indicator space and hides
+          itself while a dialog is open, instead of sitting at z-[120] over
+          everything including modals. */}
       {installToast && (
         <div
-          className="misaka-toast fixed left-1/2 -translate-x-1/2 z-[120] px-4 py-2 rounded-lg text-sm font-kanji shadow-lg"
+          className="misaka-notify px-4 py-2 rounded-lg text-sm font-kanji shadow-lg text-center"
           style={{ background: 'var(--bg-deep)', color: '#fff' }}
           role="status"
         >

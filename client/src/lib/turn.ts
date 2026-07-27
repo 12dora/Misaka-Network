@@ -282,6 +282,96 @@ export async function fetchTurnStatus(): Promise<TurnStatusResponse | null> {
   }
 }
 
+// ── BUG-026: typed TURN diagnostics ──────────────────────────────────
+// `testTurnServer` constructed an RTCPeerConnection and awaited
+// createOffer/setLocalDescription *outside* any try. A malformed URL (the
+// add-server form accepts free text) throws synchronously from the
+// constructor, and a WebRTC-disabled/hardened browser throws from
+// createOffer. Both rejections propagated to the caller's
+// `await testTurnServer(...)` with no catch, so `setTestingId(null)` never
+// ran and the row sat on "测试中…" forever with no explanation.
+
+export type TurnTestCode =
+  | 'RELAY_OK'          // a relay candidate was gathered — server works
+  | 'NO_RELAY'          // gathering finished/timed out with no relay candidate
+  | 'INVALID_URL'       // not a turn:/turns: URL we can hand to the browser
+  | 'WEBRTC_UNAVAILABLE'// RTCPeerConnection missing or blocked
+  | 'SETUP_FAILED'      // constructor / createOffer / setLocalDescription threw
+
+export interface TurnTestResult {
+  reachable: boolean
+  code: TurnTestCode
+  /** Localised, actionable message — safe to render directly. */
+  message: string
+  /** Raw error text for the "技术诊断" area / console only. */
+  detail?: string
+}
+
+const TURN_URL_RE = /^turns?:[^\s]+$/i
+
+const TEST_MESSAGES: Record<TurnTestCode, string> = {
+  RELAY_OK: '可达，已成功获取中继候选',
+  NO_RELAY: '未获取到中继候选。请检查地址、端口、用户名和密码，或确认服务器允许本网络访问。',
+  INVALID_URL: '地址格式无效。应形如 turn:example.com:3478?transport=udp。',
+  WEBRTC_UNAVAILABLE: '当前浏览器不可用 WebRTC，无法测试。请更换浏览器或关闭相关隐私屏蔽后重试。',
+  SETUP_FAILED: '测试无法启动。请检查地址格式后重试。',
+}
+
+export function describeTurnTest(code: TurnTestCode): string {
+  return TEST_MESSAGES[code]
+}
+
+/**
+ * Full diagnostic result. Never rejects — every failure path is a typed
+ * result the UI can turn into a recovery hint.
+ */
+export async function testTurnServerDetailed(server: TurnServer): Promise<TurnTestResult> {
+  if (!TURN_URL_RE.test((server.url ?? '').trim())) {
+    return { reachable: false, code: 'INVALID_URL', message: TEST_MESSAGES.INVALID_URL }
+  }
+  if (typeof RTCPeerConnection === 'undefined') {
+    return { reachable: false, code: 'WEBRTC_UNAVAILABLE', message: TEST_MESSAGES.WEBRTC_UNAVAILABLE }
+  }
+
+  let pc: RTCPeerConnection
+  try {
+    pc = new RTCPeerConnection({
+      iceServers: [{ urls: server.url, username: server.username, credential: server.credential }],
+      iceTransportPolicy: 'relay',
+    })
+  } catch (err) {
+    return {
+      reachable: false,
+      code: 'INVALID_URL',
+      message: TEST_MESSAGES.INVALID_URL,
+      detail: String(err),
+    }
+  }
+
+  try {
+    pc.createDataChannel('test')
+    const offer = await pc.createOffer()
+    await pc.setLocalDescription(offer)
+  } catch (err) {
+    try { pc.close() } catch { /* ignore */ }
+    return {
+      reachable: false,
+      code: 'SETUP_FAILED',
+      message: TEST_MESSAGES.SETUP_FAILED,
+      detail: String(err),
+    }
+  }
+
+  const reachable = await waitForRelayCandidate(pc)
+  return reachable
+    ? { reachable: true, code: 'RELAY_OK', message: TEST_MESSAGES.RELAY_OK }
+    : { reachable: false, code: 'NO_RELAY', message: TEST_MESSAGES.NO_RELAY }
+}
+
+/**
+ * Back-compatible boolean wrapper. Kept so existing callers and tests keep
+ * working; new code should prefer `testTurnServerDetailed`.
+ */
 export async function testTurnServer(server: TurnServer): Promise<boolean> {
   const pc = new RTCPeerConnection({
     iceServers: [{ urls: server.url, username: server.username, credential: server.credential }],
@@ -290,7 +380,10 @@ export async function testTurnServer(server: TurnServer): Promise<boolean> {
   pc.createDataChannel('test')
   const offer = await pc.createOffer()
   await pc.setLocalDescription(offer)
+  return waitForRelayCandidate(pc)
+}
 
+function waitForRelayCandidate(pc: RTCPeerConnection): Promise<boolean> {
   return new Promise(resolve => {
     // P2-7: detach every listener before close() so a late candidate event
     // doesn't keep the RTCPeerConnection (and its underlying ICE agent)

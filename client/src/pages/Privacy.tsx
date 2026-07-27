@@ -3,7 +3,7 @@ import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 
 export default function Privacy() {
   return (
-    <div className="pt-20 px-4" style={{ background: 'var(--bg-primary)', minHeight: '100dvh', paddingBottom: 'calc(5rem + env(safe-area-inset-bottom))' }}>
+    <div className="px-4" style={{ background: 'var(--bg-primary)', minHeight: '100dvh', paddingTop: 'calc(var(--nav-h-total) + 1rem)', paddingBottom: 'calc(5rem + var(--safe-bottom))' }}>
       <div className="max-w-2xl mx-auto">
         <div className="flex items-center gap-3 mb-8">
           <MisakaKanjiBlock char="秘" size="md" />
@@ -66,12 +66,11 @@ export default function Privacy() {
         </div>
 
         <div className="mt-6 flex flex-wrap items-center gap-2">
-          <Link to="/" className="inline-block">
-            <button className="nav-pill">← 返回首页</button>
-          </Link>
-          <Link to="/tos" className="inline-block">
-            <button className="nav-pill">查看服务条款</button>
-          </Link>
+          {/* A11Y-006: a <button> inside a <Link> nests two interactive
+              controls — two tab stops for one action, and browsers disagree
+              on which one Enter activates. Style the Link as the pill. */}
+          <Link to="/" className="nav-pill">← 返回首页</Link>
+          <Link to="/tos" className="nav-pill">查看服务条款</Link>
         </div>
       </div>
     </div>
