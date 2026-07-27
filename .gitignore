@@ -11,4 +11,8 @@ server/data/
 .vscode/
 .idea/
 test-results/
+playwright-report/
+client/playwright-report/
 client/coverage/
+# Output of the deployment-base smoke build (client `npm run build:subpath`).
+client/dist-subpath-smoke/

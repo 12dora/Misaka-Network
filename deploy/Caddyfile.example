@@ -1,18 +1,72 @@
 {
   # Replace with your email for ACME registration/expiry notices.
   email admin@example.com
+
+  # Caddy is the EDGE here: the only thing in front of it is the internet, so
+  # it must not trust any inbound forwarded header when deriving the client
+  # IP. Leaving `trusted_proxies` unset (the default) is exactly that. Only
+  # add a `servers { trusted_proxies ... }` block if you really do put a CDN
+  # or load balancer in front of Caddy — and then bump TRUST_PROXY in
+  # docker-compose.prod.yml to match the new hop count.
 }
 
 # HTTPS + WSS reverse proxy for Misaka signaling
 signal.example.com {
   encode zstd gzip
 
-  @ws {
-    path /ws*
-    header Connection *Upgrade*
-    header Upgrade websocket
+  # Access log includes `request.remote_ip` — the TCP peer Caddy sees. Use it
+  # to confirm real client IPs (and not the Docker gateway) reach the edge:
+  #   docker compose -f docker-compose.prod.yml logs -f caddy
+  log {
+    output stdout
+    format console
   }
 
-  reverse_proxy @ws signaling:9080
-  reverse_proxy signaling:9080
+  # ── Forwarded-header hygiene (CONFIG-001 / SECURITY-005) ──────────────
+  # Every per-IP defence in the signaling server (register IP cap,
+  # brute-force lock, API + qr-redeem rate limits, TURN byte/issue
+  # accounting) keys on the client IP, and the server derives that IP from
+  # X-Forwarded-For because it runs with TRUST_PROXY=1.
+  #
+  # So the edge — and ONLY the edge — is allowed to write those headers.
+  # Drop whatever the client sent before the proxy handler runs, otherwise
+  # Caddy's default "append" behaviour would leave an attacker-controlled
+  # value as the leftmost hop.
+  request_header -X-Forwarded-For
+  request_header -X-Forwarded-Host
+  request_header -X-Forwarded-Proto
+  request_header -X-Real-IP
+  request_header -Forwarded
+
+  # One upstream for both plain HTTP and the /ws upgrade — Caddy proxies
+  # WebSockets natively. Keeping it as a single block guarantees the header
+  # rewrites below apply to the WS handshake too; the signaling server reads
+  # the client IP off the upgrade request exactly like it does off an API
+  # request, so a WS-only hole would be just as exploitable.
+  reverse_proxy signaling:9080 {
+    # {http.request.remote.host} is the TCP peer address. Unlike {client_ip}
+    # it never consults X-Forwarded-For, so it cannot be influenced by the
+    # client. `header_up NAME value` SETS (replaces) the header, which is why
+    # the server sees exactly one hop and TRUST_PROXY=1 is correct.
+    header_up X-Forwarded-For {http.request.remote.host}
+    header_up X-Real-IP {http.request.remote.host}
+    header_up X-Forwarded-Proto {scheme}
+    header_up X-Forwarded-Host {host}
+  }
 }
+
+# ── Verifying the real client IP ────────────────────────────────────────
+# After `docker compose -f docker-compose.prod.yml up -d`, run:
+#
+#   ./verify-proxy-trust.sh https://signal.example.com
+#
+# It floods /api/health with distinct spoofed X-Forwarded-For values and
+# requires the per-IP rate limiter to still trip (429) — i.e. the header was
+# stripped. Then run the same script with --fresh from a DIFFERENT network
+# (phone hotspot, second VPS); it must get 200, proving users are not all
+# collapsing onto the Caddy container's IP. See the script header for detail.
+#
+# Docker note: published ports normally preserve the client source IP via
+# DNAT. If the Caddy access log shows a 172.x gateway address for every
+# request, your host is routing through the userland proxy or an extra NAT
+# hop — fix that before trusting per-IP enforcement.

@@ -1,8 +1,12 @@
 #!/usr/bin/env node
 // Standalone Playwright script for manual transfer testing.
-// Run: node tests/manual-test.mjs
+// Run: npm run test:manual   (from client/)
+//
+// `chromium` is imported from `@playwright/test` — the only Playwright package
+// this workspace declares. Importing bare `playwright` used to work only
+// because it happened to be hoisted as a transitive dependency.
 
-import { chromium } from 'playwright'
+import { chromium } from '@playwright/test'
 import { writeFileSync, mkdtempSync, rmSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'

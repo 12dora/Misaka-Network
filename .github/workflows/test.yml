@@ -49,13 +49,70 @@ jobs:
         working-directory: client
         run: npm ci
 
-      - name: Type check
+      - name: Type check (src)
         working-directory: client
         run: npm run typecheck
+
+      # tsconfig.json only includes src/, so vite/vitest/playwright configs
+      # were never type-checked and a broken build config could merge green.
+      - name: Type check (build + test configs)
+        working-directory: client
+        run: npm run typecheck:config
 
       - name: Run client unit + contract tests
         working-directory: client
         run: npm test
+
+  client-build:
+    name: Client (production bundle + deployment base)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install client deps
+        working-directory: client
+        run: npm ci
+
+      # PRs used to only typecheck + test; Vite/Rollup/PostCSS/Tailwind
+      # build-time regressions therefore only surfaced after merge, in the
+      # Pages deploy workflow (CONFIG-008).
+      - name: Build production bundle (default base)
+        working-directory: client
+        run: npm run build
+
+      # CONFIG-005: asset base, router base and the Pages 404 redirect all
+      # derive from one Vite `base`. Build under a subpath and prove they
+      # agree — a regression here is invisible in a root-hosted build.
+      - name: Subpath deployment smoke check
+        working-directory: client
+        env:
+          VITE_BASE: /subpath-smoke/
+        run: |
+          set -e
+          npm run build:subpath
+          out=dist-subpath-smoke
+          echo "-- 404 redirect target --"
+          grep -q "var base = '/subpath-smoke/'" "$out/404.html"
+          echo "-- no unsubstituted token --"
+          ! grep -q '%BASE_URL%' "$out/404.html"
+          echo "-- assets under the subpath --"
+          grep -q '"/subpath-smoke/assets/' "$out/index.html"
+          echo "-- manifest/icon under the subpath --"
+          grep -q '"/subpath-smoke/manifest.webmanifest"' "$out/index.html"
+          echo "-- no root-absolute leakage --"
+          if grep -oE '(href|src)="/[^"]*"' "$out/index.html" | grep -v '"/subpath-smoke/'; then
+            echo "::error::a root-absolute URL escaped the deployment base"
+            exit 1
+          fi
+          echo "-- runtime BASE_URL baked into the bundle --"
+          grep -rq '/subpath-smoke/' "$out/assets"
+          echo "subpath smoke check OK"
 
   e2e-tests:
     name: E2E (Playwright, two-peer transfer)

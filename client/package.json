@@ -6,13 +6,16 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:subpath": "vite build --outDir dist-subpath-smoke --emptyOutDir",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
+    "typecheck:config": "tsc --noEmit --strict --skipLibCheck --module ESNext --moduleResolution Bundler --target ES2022 --allowSyntheticDefaultImports --types node vite.config.ts vitest.config.ts playwright.config.ts",
     "test": "npm run test:unit && npm run test:contract",
     "test:unit": "vitest run",
     "test:unit:watch": "vitest",
     "test:contract": "node tests/ui-contract.test.mjs",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "test:manual": "node tests/manual-test.mjs"
   },
   "dependencies": {
     "idb": "^8.0.0",
