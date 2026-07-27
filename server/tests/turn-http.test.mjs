@@ -12,6 +12,7 @@ async function main() {
 
 const port = 19080 + Math.floor(Math.random() * 1000)
 const tmp = mkdtempSync(join(tmpdir(), 'misaka-turn-http-'))
+const OPERATOR_TOKEN = 'turn-http-operator-token'
 
 const env = {
   ...process.env,
@@ -25,6 +26,8 @@ const env = {
   TURN_PERSIST_INTERVAL_SEC: '1',
   TURN_GLOBAL_MONTHLY_BYTES_LIMIT: '1000000000',
   TURN_PESSIMISTIC_RATE_BPS: '800000',
+  // SECURITY-017: the detailed status view now sits behind an operator token.
+  TURN_OPERATOR_TOKEN: OPERATOR_TOKEN,
   NODE_OPTIONS: `--import ${new URL('./turn-fetch-stub.mjs', import.meta.url).pathname}`,
 }
 
@@ -53,9 +56,24 @@ try {
   await waitForHealth()
 
   await wait(2300)
-  const statusRes = await fetch(`http://127.0.0.1:${port}/api/turn-status`)
+
+  // SECURITY-017: the public shape is coarse availability only.
+  const publicRes = await fetch(`http://127.0.0.1:${port}/api/turn-status`)
+  assert.equal(publicRes.status, 200)
+  const publicStatus = await publicRes.json()
+  assert.equal(publicStatus.enabled, true)
+  assert.equal(publicStatus.configured, true)
+  assert.equal(publicStatus.available, true)
+  assert.equal(publicStatus.detailed, false)
+  assert.equal(Object.prototype.hasOwnProperty.call(publicStatus, 'monthlyBytesUsed'), false)
+
+  // The detailed counters require the operator token.
+  const statusRes = await fetch(`http://127.0.0.1:${port}/api/turn-status`, {
+    headers: { Authorization: `Bearer ${OPERATOR_TOKEN}` },
+  })
   assert.equal(statusRes.status, 200)
   const status = await statusRes.json()
+  assert.equal(status.detailed, true)
   assert.equal(status.enabled, true)
   assert.equal(status.configured, true)
   assert.equal(status.monthlyUsageSource, 'cloudflare')
