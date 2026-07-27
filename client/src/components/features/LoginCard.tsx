@@ -233,8 +233,10 @@ export default function LoginCard() {
           />
           <span className="font-kanji text-xs xs:text-sm text-[var(--text-on-white-2)] shrink-0">号</span>
           <button
+            type="button"
             onClick={() => { regenerateNodeId(); setNodeIdError(null) }}
-            className="w-8 h-8 rounded-full flex items-center justify-center transition-transform hover:rotate-180 duration-300 cursor-pointer shrink-0"
+            // A11Y-007: 32px visual, 44px hit area on coarse pointers.
+            className="tap-target w-8 h-8 rounded-full flex items-center justify-center transition-transform hover:rotate-180 duration-300 cursor-pointer shrink-0"
             style={{ background: 'var(--surface-tint)', color: 'var(--bg-deep)', border: 'none' }}
             title="重新生成"
             aria-label="重新生成"
@@ -245,7 +247,7 @@ export default function LoginCard() {
         {nodeIdError && (
           <p
             className="mt-1 text-[11px] font-kanji"
-            style={{ color: 'var(--state-warn)' }}
+            style={{ color: 'var(--state-warn-on-light)' }}
             role="alert"
           >
             ⚠ {nodeIdError}
@@ -307,7 +309,7 @@ export default function LoginCard() {
           ))}
           <button
             onClick={regeneratePassCode}
-            className="w-8 h-8 rounded-full flex items-center justify-center hover:rotate-180 duration-300 transition-transform cursor-pointer ml-1 shrink-0"
+            className="tap-target w-8 h-8 rounded-full flex items-center justify-center hover:rotate-180 duration-300 transition-transform cursor-pointer ml-1 shrink-0"
             style={{ background: 'var(--surface-tint)', color: 'var(--bg-deep)', border: 'none' }}
             title="重新生成"
             type="button"
@@ -320,7 +322,7 @@ export default function LoginCard() {
 
       {/* Error */}
       {error && (
-        <p className="text-xs text-[var(--state-danger)] mb-4 font-kanji">
+        <p className="text-xs mb-4 font-kanji" style={{ color: 'var(--state-danger-on-light)' }} role="alert">
           ⚠ {error}
         </p>
       )}

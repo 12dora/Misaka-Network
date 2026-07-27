@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 import QRCode from 'qrcode'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
+import MisakaDialog from '@/components/ui/MisakaDialog'
 import { useAuthStore } from '@/store/auth'
 import { authedFetch, AuthRequiredError } from '@/lib/api'
 import { playSound } from '@/lib/sound'
@@ -33,6 +34,13 @@ function buildURL(
   return `${base}?${params.toString()}`
 }
 
+// UX-LAYOUT-006: the QR was a hard 220 px inside 12 px of padding, giving a
+// 244 px frame against a ~232 px content box on a 320 px phone — it stuck
+// out of the modal. Render at a responsive size, keeping the quiet zone
+// (margin: 2 modules) intact so scanners still lock on.
+const QR_MAX_PX = 220
+const QR_RENDER_PX = 440   // render at 2× and downscale for crisp display
+
 export default function QRModal({ nodeId, passCode, qrType = 'node', fileSessionId, channelId, onClose }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [qrToken, setQrToken] = useState<string | null>(null)
@@ -42,8 +50,15 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
   const [qrError, setQrError] = useState<string | null>(null)
   const [qrImageUrl, setQrImageUrl] = useState<string | null>(null)
   const [copyToast, setCopyToast] = useState<string | null>(null)
+  const [copyFailed, setCopyFailed] = useState(false)
+  const [canShare, setCanShare] = useState(false)
+  const linkRef = useRef<HTMLInputElement>(null)
   const session = useAuthStore(s => s.session)
   const modal = useModalExit(onClose)
+
+  useEffect(() => {
+    setCanShare(typeof navigator !== 'undefined' && typeof navigator.share === 'function')
+  }, [])
 
   const fetchToken = useCallback(async () => {
     if (!session?.token) return
@@ -78,6 +93,10 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
     fetchToken()
   }, [fetchToken])
 
+  const shareUrl = qrToken
+    ? buildURL(qrType, nodeId, qrToken, includePass ? passCode : undefined, fileSessionId, channelId)
+    : ''
+
   // Draw QR
   useEffect(() => {
     const canvas = canvasRef.current
@@ -85,7 +104,7 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
     const url = buildURL(qrType, nodeId, qrToken, includePass ? passCode : undefined, fileSessionId, channelId)
     setQrError(null)
     QRCode.toCanvas(canvas, url, {
-      width: 220,
+      width: QR_RENDER_PX,
       margin: 2,
       color: { dark: '#0E2A6B', light: '#FFFFFF' },
     }, (err) => {
@@ -94,7 +113,7 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
         return
       }
       QRCode.toDataURL(url, {
-        width: 220,
+        width: QR_RENDER_PX,
         margin: 2,
         color: { dark: '#0E2A6B', light: '#FFFFFF' },
       })
@@ -103,20 +122,40 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
     })
   }, [qrToken, nodeId, passCode, includePass, qrType, fileSessionId, channelId])
 
-  function handleCopy() {
-    if (!qrToken) return
-    const url = buildURL(qrType, nodeId, qrToken, includePass ? passCode : undefined, fileSessionId, channelId)
-    // Clipboard API rejects in non-secure contexts and when permission is
-    // denied — surface that to the user instead of silently failing so they
-    // don't think they have a link they can paste.
-    navigator.clipboard.writeText(url)
-      .then(() => setCopyToast('链接已复制'))
-      .catch(() => setCopyToast('复制失败，请手动选取下方链接'))
-    window.setTimeout(() => setCopyToast(null), 2200)
+  // BUG-031: the old failure path told the user to "手动选取下方链接" — there
+  // was no link anywhere in the modal. And the feedback lived in an
+  // absolutely positioned `-bottom-10` div inside an `overflow-y: auto`
+  // panel, so on a short viewport it was clipped out of existence.
+  // The URL is now always rendered as a selectable read-only field, the
+  // feedback sits in normal flow, and we offer the system share sheet
+  // (which works in the WebView/iOS cases where clipboard is denied).
+  async function handleCopy() {
+    if (!shareUrl) return
+    setCopyFailed(false)
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('clipboard unavailable')
+      await navigator.clipboard.writeText(shareUrl)
+      setCopyToast('链接已复制')
+    } catch {
+      setCopyFailed(true)
+      setCopyToast('无法复制链接。请长按下方链接复制，或使用系统分享。')
+      // Select the text so a long-press / Ctrl+C lands on the whole URL.
+      try {
+        linkRef.current?.focus()
+        linkRef.current?.select()
+      } catch { /* ignore */ }
+    }
+    window.setTimeout(() => setCopyToast(null), 4000)
   }
 
-  function handleBackdrop(e: React.MouseEvent<HTMLDivElement>) {
-    if (e.target === e.currentTarget) modal.requestClose()
+  async function handleShare() {
+    if (!shareUrl) return
+    try {
+      await navigator.share({ url: shareUrl, title: '御坂网络接入链接' })
+    } catch {
+      // User cancelled the sheet, or share is unavailable — no error state,
+      // the link is still on screen and copy is still offered.
+    }
   }
 
   const qrLabel = {
@@ -126,155 +165,216 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
   }[qrType]
 
   return (
-    <div
-      className={`fixed inset-0 z-[100] flex items-center justify-center p-4 ${modal.backdropClass}`}
-      style={{ background: 'rgba(14,42,107,0.75)', backdropFilter: 'blur(10px)' }}
-      onClick={handleBackdrop}
-    >
-      <div
-        className={`relative flex flex-col items-center gap-5 rounded-2xl p-6 xs:p-8 ${modal.panelClass}`}
-        style={{
-          background: 'var(--surface)',
-          boxShadow: 'var(--shadow-float)',
-          // P0-2: drop the hard `minWidth: 300`. On a 320px-wide iPhone SE
-          // with the outer `p-4` (16px) backdrop padding, available content
-          // width is 288px — the old minWidth would force horizontal
-          // overflow. Use a clamp so the modal still tries to be 360px on
-          // wider screens but gracefully shrinks down on phones.
-          width: 'min(360px, 100% - 8px)',
-          // P1-13: previously had no maxHeight, so on iPhone landscape /
-          // iPad split-view the QR + node info + buttons stack ran off the
-          // viewport and the close / refresh / copy actions became
-          // unreachable. Cap to 90svh with internal scroll.
-          maxHeight: '90svh',
-          overflowY: 'auto',
-        }}
-        onClick={e => e.stopPropagation()}
-      >
-        {/* Close */}
-        <button
-          className="absolute top-4 right-4 w-7 h-7 flex items-center justify-center rounded-full cursor-pointer hover:opacity-70 transition-opacity"
-          style={{ border: 'none', background: 'var(--surface-tint)', color: 'var(--text-on-white)' }}
-          onClick={modal.requestClose}
-          aria-label="关闭"
-        >
-          ✕
-        </button>
-
-        {/* Header */}
-        <div className="flex items-center gap-2">
-          <MisakaKanjiBlock char="我" size="md" />
-          <div>
-            <div className="font-kanji font-bold text-base text-[var(--text-on-white)]">
-              我的接入 QR
-            </div>
-            <div className="font-kanji text-xs text-[var(--text-on-white-2)]">
-              用于让其他设备接入当前节点
-            </div>
-          </div>
-        </div>
-
-        {/* QR type badge */}
-        <span
-          className="font-kanji text-[11px] px-2 py-0.5 rounded-full"
-          style={{ background: 'var(--surface-tint)', color: 'var(--text-on-white-2)' }}
-        >
-          {qrLabel}
-        </span>
-
-        {/* QR canvas */}
-        <div
-          className="corner-frame relative"
-          style={{ padding: 12, background: '#FFFFFF', borderRadius: 8 }}
-        >
-          {loading && !qrToken ? (
-            <div className="w-[220px] h-[220px] flex items-center justify-center">
-              <span className="font-kanji text-sm text-[var(--text-muted)]">生成中…</span>
-            </div>
-          ) : qrError ? (
-            <div className="w-[220px] h-[220px] flex flex-col items-center justify-center gap-2 px-4 text-center">
-              <MisakaKanjiBlock char="失" size="lg" />
-              <span className="font-kanji text-sm text-[var(--state-danger)]">{qrError}</span>
-            </div>
-          ) : (
-            <>
-              <canvas ref={canvasRef} width={220} height={220} className={qrImageUrl ? 'hidden' : ''} />
-              {qrImageUrl && <img src={qrImageUrl} alt="接入 QR" width={220} height={220} />}
-              <div className="scan-line" />
-              <div
-                className="absolute inset-0 flex items-center justify-center pointer-events-none"
-                style={{ opacity: 0.12 }}
-              >
-                <MisakaKanjiBlock char="御" size="xl" />
-              </div>
-            </>
-          )}
-        </div>
-
-        {/* Node info */}
-        <div className="text-center">
-          <div className="font-kanji font-bold text-sm text-[var(--text-on-white)]">
-            御坂 {nodeId} 号
-          </div>
-          <div className="font-kanji text-xs text-[var(--text-on-white-2)]">
-            当前节点
-          </div>
-        </div>
-
-        {/* Pass code */}
-        <div className="text-center">
-          <div className="font-kanji text-xs text-[var(--text-on-white-2)] mb-1">通行码</div>
-          <div className="font-mono font-bold text-xl tracking-[0.25em] text-[var(--text-on-white)]">
-            {passCode}
-          </div>
-        </div>
-
-        {/* Toggle: include passcode in QR */}
-        <label className="flex items-center gap-2 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={includePass}
-            onChange={e => setIncludePass(e.target.checked)}
-            className="w-4 h-4 rounded accent-[--bg-deep]"
-          />
-          <span className="font-kanji text-xs text-[var(--text-on-white-2)]">
-            在 QR 中包含通行码（不安全）
-          </span>
-        </label>
-
-        {/* Expiry */}
-        {expiresAt > 0 && (
-          <div className="font-mono text-[10px] text-[var(--text-muted)]">
-            {new Date(expiresAt).toLocaleTimeString()} 前有效
-          </div>
-        )}
-
-        {/* Actions */}
-        <div className="flex gap-2 w-full">
-          {/* `loading` is set during BOTH first-fetch and refresh in fetchToken,
-              so disabling here also prevents spam-clicking during refresh. */}
-          <MisakaButton variant="pill" size="sm" fullWidth onClick={fetchToken} disabled={loading}>
-            {loading && qrToken ? '刷新中…' : '刷新 QR'}
-          </MisakaButton>
-          <MisakaButton variant="pill" size="sm" fullWidth onClick={handleCopy} disabled={!qrToken || loading}>
-            复制链接
-          </MisakaButton>
-        </div>
-
-        <MisakaButton variant="pill" size="sm" fullWidth onClick={modal.requestClose}>
-          关闭
-        </MisakaButton>
-
-        {copyToast && (
-          <div
-            className="absolute -bottom-10 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-md text-xs font-kanji whitespace-nowrap shadow-md"
-            style={{ background: 'var(--bg-deep)', color: '#fff' }}
-            role="status"
+    <MisakaDialog
+      title="我的接入 QR"
+      description="用于让其他设备接入当前节点"
+      onRequestClose={modal.requestClose}
+      backdropClass={modal.backdropClass}
+      panelClass={modal.panelClass}
+      backdropStyle={{ background: 'rgba(14,42,107,0.75)', backdropFilter: 'blur(10px)' }}
+      panelClassName="relative flex flex-col items-center gap-5 rounded-2xl p-6 xs:p-8"
+      panelStyle={{
+        background: 'var(--surface)',
+        boxShadow: 'var(--shadow-float)',
+        // P0-2: drop the hard `minWidth: 300`. On a 320px-wide iPhone SE
+        // with the outer `p-4` (16px) backdrop padding, available content
+        // width is 288px — the old minWidth would force horizontal
+        // overflow. Use a clamp so the modal still tries to be 360px on
+        // wider screens but gracefully shrinks down on phones.
+        width: 'min(360px, 100% - 8px)',
+        // P1-13: previously had no maxHeight, so on iPhone landscape /
+        // iPad split-view the QR + node info + buttons stack ran off the
+        // viewport and the close / refresh / copy actions became
+        // unreachable. Cap to 90svh with internal scroll.
+        maxHeight: '90svh',
+        overflowY: 'auto',
+      }}
+      renderHeader={({ titleId, descriptionId }) => (
+        <>
+          {/* Close */}
+          <button
+            className="tap-target absolute top-4 right-4 w-7 h-7 flex items-center justify-center rounded-full cursor-pointer hover:opacity-70 transition-opacity"
+            style={{ border: 'none', background: 'var(--surface-tint)', color: 'var(--text-on-white)' }}
+            onClick={modal.requestClose}
+            aria-label="关闭接入 QR"
           >
-            {copyToast}
+            ✕
+          </button>
+
+          {/* Header */}
+          <div className="flex items-center gap-2">
+            <MisakaKanjiBlock char="我" size="md" />
+            <div>
+              <h2 id={titleId} className="font-kanji font-bold text-base text-[var(--text-on-white)] m-0">
+                我的接入 QR
+              </h2>
+              <p id={descriptionId} className="font-kanji text-xs text-[var(--text-on-white-2)] m-0">
+                用于让其他设备接入当前节点
+              </p>
+            </div>
           </div>
+        </>
+      )}
+    >
+      {/* QR type badge */}
+      <span
+        className="font-kanji text-[11px] px-2 py-0.5 rounded-full"
+        style={{ background: 'var(--surface-tint)', color: 'var(--text-on-white-2)' }}
+      >
+        {qrLabel}
+      </span>
+
+      {/* QR canvas — UX-LAYOUT-006: never wider than the content box. */}
+      <div
+        className="corner-frame relative w-full"
+        style={{
+          padding: 12,
+          background: '#FFFFFF',
+          borderRadius: 8,
+          maxWidth: QR_MAX_PX + 24,
+          margin: '0 auto',
+        }}
+      >
+        {loading && !qrToken ? (
+          <div className="w-full aspect-square flex items-center justify-center" style={{ maxWidth: QR_MAX_PX }}>
+            <span className="font-kanji text-sm text-[var(--text-muted-on-light)]">生成中…</span>
+          </div>
+        ) : qrError ? (
+          <div className="w-full aspect-square flex flex-col items-center justify-center gap-2 px-4 text-center" style={{ maxWidth: QR_MAX_PX }}>
+            <MisakaKanjiBlock char="失" size="lg" />
+            <span className="font-kanji text-sm" style={{ color: 'var(--state-danger-on-light)' }}>{qrError}</span>
+          </div>
+        ) : (
+          <>
+            <canvas
+              ref={canvasRef}
+              width={QR_RENDER_PX}
+              height={QR_RENDER_PX}
+              className={qrImageUrl ? 'hidden' : 'block'}
+              style={{ width: '100%', maxWidth: QR_MAX_PX, height: 'auto' }}
+            />
+            {qrImageUrl && (
+              <img
+                src={qrImageUrl}
+                alt="接入 QR"
+                style={{ width: '100%', maxWidth: QR_MAX_PX, height: 'auto', display: 'block' }}
+              />
+            )}
+            {/* UX-MOTION-002: the animated scan line used to sweep across the
+                *displayed* QR. It is pure decoration and it obscures
+                machine-readable data — a scanner sampling mid-sweep sees a
+                2 px band of cyan across the modules. Removed here; the
+                scanner modal (where a sweep actually means something) keeps
+                it. */}
+            <div
+              className="absolute inset-0 flex items-center justify-center pointer-events-none"
+              style={{ opacity: 0.12 }}
+              aria-hidden="true"
+            >
+              <MisakaKanjiBlock char="御" size="xl" />
+            </div>
+          </>
         )}
       </div>
-    </div>
+
+      {/* Node info */}
+      <div className="text-center">
+        <div className="font-kanji font-bold text-sm text-[var(--text-on-white)]">
+          御坂 {nodeId} 号
+        </div>
+        <div className="font-kanji text-xs text-[var(--text-on-white-2)]">
+          当前节点
+        </div>
+      </div>
+
+      {/* Pass code */}
+      <div className="text-center">
+        <div className="font-kanji text-xs text-[var(--text-on-white-2)] mb-1">通行码</div>
+        <div className="font-mono font-bold text-xl tracking-[0.25em] text-[var(--text-on-white)]">
+          {passCode}
+        </div>
+      </div>
+
+      {/* Toggle: include passcode in QR.
+          UX-COPY-007: "（不安全）" told the user nothing — it named a risk
+          without naming the consequence. Say what actually changes: the
+          link alone is enough to join. */}
+      <label className="flex items-start gap-2 cursor-pointer w-full">
+        <input
+          type="checkbox"
+          checked={includePass}
+          onChange={e => setIncludePass(e.target.checked)}
+          className="w-4 h-4 rounded accent-[--bg-deep] mt-0.5 shrink-0"
+        />
+        <span className="font-kanji text-xs text-[var(--text-on-white-2)] leading-snug min-w-0">
+          在链接中包含通行码
+          <span className="block text-[11px] mt-0.5" style={{ color: 'var(--state-warn-on-light)' }}>
+            链接包含接入密码，获得链接的人可以直接加入。仅通过可信渠道分享。
+          </span>
+        </span>
+      </label>
+
+      {/* Expiry */}
+      {expiresAt > 0 && (
+        <div className="font-mono text-[10px] text-[var(--text-muted-on-light)]">
+          {new Date(expiresAt).toLocaleTimeString()} 前有效
+        </div>
+      )}
+
+      {/* BUG-031: the link is ALWAYS on screen and selectable, so "长按下方
+          链接复制" refers to something that exists. */}
+      {shareUrl && (
+        <div className="w-full flex flex-col gap-1">
+          <label htmlFor="qr-share-url" className="font-kanji text-[11px] text-[var(--text-on-white-2)]">
+            接入链接
+          </label>
+          <input
+            id="qr-share-url"
+            ref={linkRef}
+            readOnly
+            value={shareUrl}
+            onFocus={e => e.currentTarget.select()}
+            className="misaka-input font-mono"
+            style={{ fontSize: 12 }}
+          />
+        </div>
+      )}
+
+      {/* Actions */}
+      <div className="flex gap-2 w-full">
+        {/* `loading` is set during BOTH first-fetch and refresh in fetchToken,
+            so disabling here also prevents spam-clicking during refresh. */}
+        <MisakaButton variant="pill" size="sm" fullWidth onClick={fetchToken} disabled={loading}>
+          {loading && qrToken ? '刷新中…' : '刷新 QR'}
+        </MisakaButton>
+        <MisakaButton variant="pill" size="sm" fullWidth onClick={handleCopy} disabled={!qrToken || loading}>
+          复制链接
+        </MisakaButton>
+      </div>
+
+      {canShare && shareUrl && (
+        <MisakaButton variant="pill" size="sm" fullWidth onClick={handleShare}>
+          系统分享
+        </MisakaButton>
+      )}
+
+      {/* Feedback in normal flow — never clipped by the panel's overflow. */}
+      {copyToast && (
+        <p
+          className="w-full text-center px-3 py-1.5 rounded-md text-xs font-kanji leading-snug"
+          style={{
+            background: 'var(--surface-tint)',
+            color: copyFailed ? 'var(--state-warn-on-light)' : 'var(--text-on-white)',
+          }}
+          role="status"
+        >
+          {copyToast}
+        </p>
+      )}
+
+      <MisakaButton variant="pill" size="sm" fullWidth onClick={modal.requestClose}>
+        关闭
+      </MisakaButton>
+    </MisakaDialog>
   )
 }

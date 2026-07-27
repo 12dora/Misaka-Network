@@ -62,3 +62,65 @@ export const MAX_INMEMORY_RECEIVE_BYTES = 256 * 1024 * 1024  // 256 MB
 // ── Signaling / WebSocket ─────────────────────────────────────────────
 export const HEARTBEAT_INTERVAL_MS = 45_000
 export const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 16000]
+
+// ── A11Y-002 — verified colour pairings ───────────────────────────────
+// The semantic `--state-*` tokens are FILL colours (dots, badges, bars).
+// Using them as small-size text produced 1.58:1–4.05:1 across the app.
+// The table below is the single source of truth for which foreground token
+// may be painted on which background token, and is enforced by
+// `tests/unit/a11y-contrast.test.ts`, which parses the real hex values out
+// of `src/index.css` and recomputes the WCAG 2.1 ratios.
+//
+// `minRatio` is 4.5 (AA normal text) for everything the UI renders at
+// 10–14 px, and 3.0 (AA large / non-text) only for pure graphical fills.
+
+export interface ContrastPair {
+  /** CSS custom property name of the foreground (without `--`). */
+  fg: string
+  /** CSS custom property name of the background (without `--`). */
+  bg: string
+  /** Minimum WCAG 2.1 contrast ratio this pair must satisfy. */
+  minRatio: number
+  /** Where the pair is used — shown in the assertion message. */
+  usage: string
+}
+
+/** Light surfaces: white cards and the pale-blue tint panels. */
+export const LIGHT_BACKGROUNDS = ['surface', 'surface-tint'] as const
+/** Blue surfaces: the page background and the deep-blue chrome. */
+export const BLUE_BACKGROUNDS = ['bg-primary', 'bg-deep'] as const
+
+export const CONTRAST_PAIRS: ContrastPair[] = [
+  // ── Text on light surfaces ──────────────────────────────────────────
+  ...LIGHT_BACKGROUNDS.flatMap((bg): ContrastPair[] => [
+    { fg: 'text-on-white',           bg, minRatio: 4.5, usage: '卡片主文本' },
+    { fg: 'text-on-white-2',         bg, minRatio: 4.5, usage: '卡片次要文本' },
+    { fg: 'text-muted-on-light',     bg, minRatio: 4.5, usage: '卡片弱化文本 / 未测试状态' },
+    { fg: 'state-success-on-light',  bg, minRatio: 4.5, usage: '成功状态文本（可达 / 已下发）' },
+    { fg: 'state-warn-on-light',     bg, minRatio: 4.5, usage: '警告状态文本（配额 / 同步失败）' },
+    { fg: 'state-danger-on-light',   bg, minRatio: 4.5, usage: '错误状态文本（不可达 / 删除）' },
+  ]),
+  // ── Text on blue surfaces ───────────────────────────────────────────
+  ...BLUE_BACKGROUNDS.flatMap((bg): ContrastPair[] => [
+    { fg: 'text-on-blue',            bg, minRatio: 4.5, usage: '蓝底主文本' },
+    { fg: 'text-on-blue-2',          bg, minRatio: 4.5, usage: '蓝底次要文本' },
+    { fg: 'accent-cyan-on-blue',     bg, minRatio: 4.5, usage: '蓝底强调文本 / 链接' },
+    { fg: 'state-success-on-blue',   bg, minRatio: 4.5, usage: '蓝底成功状态文本' },
+    { fg: 'state-warn-on-blue',      bg, minRatio: 4.5, usage: '蓝底警告状态文本' },
+    { fg: 'state-danger-on-blue',    bg, minRatio: 4.5, usage: '蓝底错误状态文本' },
+  ]),
+  // ── Non-text fills (AA large / graphical objects, 3:1) ──────────────
+  { fg: 'state-success', bg: 'bg-deep',  minRatio: 3.0, usage: '状态圆点 / 进度条填充' },
+  { fg: 'state-warn',    bg: 'bg-deep',  minRatio: 3.0, usage: '状态圆点 / 进度条填充' },
+  { fg: 'accent-cyan',   bg: 'bg-deep',  minRatio: 3.0, usage: '强调线 / 图形填充' },
+  { fg: 'state-danger',  bg: 'surface',  minRatio: 3.0, usage: '错误边框 / 图形填充' },
+]
+
+/**
+ * Foreground tokens that must NEVER be used as a small-size text colour.
+ * They are graphical fills only. The contrast test asserts each of these
+ * fails AA somewhere, which is what makes the `*-on-light` / `*-on-blue`
+ * variants necessary in the first place — if one ever becomes AA-safe
+ * everywhere the guard should be revisited deliberately, not silently.
+ */
+export const FILL_ONLY_TOKENS = ['state-success', 'state-warn', 'text-muted'] as const

@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { useHomeStore } from '@/store/home'
+import { useHomeStore, isStatsStale, formatStatsTimestamp } from '@/store/home'
 import MisakaCard from '@/components/ui/MisakaCard'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 
@@ -39,15 +39,19 @@ const STAT_CARDS = [
 ]
 
 export default function StatsDashboard() {
-  const { stats, fetchStats } = useHomeStore()
+  const { stats, fetchStats, statsStatus, statsLastUpdated, statsHasData } = useHomeStore()
   const [visible, setVisible] = useState(false)
   const [animated, setAnimated] = useState(false)
+  // BUG-030: re-render on a timer so "数据更新于 HH:mm" flips to the stale
+  // notice without waiting for the next successful poll.
+  const [, setTick] = useState(0)
   const gridRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     fetchStats()
     const timer = setInterval(fetchStats, 10_000)
-    return () => clearInterval(timer)
+    const staleTimer = setInterval(() => setTick(t => t + 1), 10_000)
+    return () => { clearInterval(timer); clearInterval(staleTimer) }
   }, [fetchStats])
 
   useLayoutEffect(() => {
@@ -77,6 +81,14 @@ export default function StatsDashboard() {
 
   const cpuPct = Math.max(0, Math.min(100, stats.cpuLoadPercent))
 
+  // BUG-030: the four presentation states. `showSkeleton` covers both the
+  // first load and a first load that failed — in neither case do we have
+  // numbers, and printing zeros would read as "the network is empty".
+  const stale = isStatsStale(statsLastUpdated)
+  const showSkeleton = !statsHasData && statsStatus !== 'error'
+  const showFirstLoadError = !statsHasData && statsStatus === 'error'
+  const showStaleNotice = statsHasData && (statsStatus === 'error' || stale)
+
   return (
     <section className="px-8 py-14">
       {/* Section Header */}
@@ -85,9 +97,37 @@ export default function StatsDashboard() {
           <MisakaKanjiBlock char="観" size="lg" />
           <h2>网络运行情报</h2>
         </div>
-        <p className="furigana ml-[calc(2rem+0.6rem)]">实时服务状态</p>
+        <p className="furigana ml-[calc(2rem+0.6rem)]">
+          {showStaleNotice || showFirstLoadError ? '服务状态' : '实时服务状态'}
+        </p>
         <div className="accent-line" />
       </div>
+
+      {/* BUG-030: an explicit failure state with a retry, instead of a grid
+          of confident zeros. */}
+      {showFirstLoadError && (
+        <MisakaCard padding="md" className="max-w-5xl mb-5">
+          <div className="flex flex-wrap items-center justify-between gap-3" role="status">
+            <span className="font-kanji text-sm" style={{ color: 'var(--state-warn-on-light)' }}>
+              暂时无法获取服务状态
+            </span>
+            <button className="nav-pill text-sm" onClick={() => { void fetchStats() }}>
+              重试
+            </button>
+          </div>
+        </MisakaCard>
+      )}
+
+      {/* Last-known data that is no longer live. */}
+      {showStaleNotice && statsLastUpdated !== null && (
+        <p
+          className="font-kanji text-xs mb-4 max-w-5xl"
+          style={{ color: 'var(--state-warn-on-blue)' }}
+          role="status"
+        >
+          数据更新于 {formatStatsTimestamp(statsLastUpdated)}，当前可能已过期
+        </p>
+      )}
 
       {/* Stats Grid */}
       <div ref={gridRef} className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5 max-w-5xl">
@@ -107,8 +147,18 @@ export default function StatsDashboard() {
                 <MisakaKanjiBlock char={card.kanji} size="sm" />
                 <span className="font-kanji text-xs text-[var(--text-on-white-2)]">{card.hint}</span>
               </div>
-              <div className="font-kanji font-bold text-4xl tabular-nums text-[var(--text-on-white)] group-hover:text-[var(--accent-cyan)] transition-colors">
-                {card.format(value)}
+              <div className="font-kanji font-bold text-4xl tabular-nums text-[var(--text-on-white)] transition-colors">
+                {showSkeleton ? (
+                  <span
+                    className="inline-block w-24 h-9 rounded align-middle"
+                    style={{ background: 'var(--surface-tint)' }}
+                    aria-label="加载中"
+                  />
+                ) : showFirstLoadError ? (
+                  <span className="text-2xl" style={{ color: 'var(--text-muted-on-light)' }}>—</span>
+                ) : (
+                  card.format(value)
+                )}
               </div>
               {card.unit && (
                 <div className="font-kanji text-sm text-[var(--text-on-white-2)] mt-1">{card.unit}</div>
@@ -123,7 +173,9 @@ export default function StatsDashboard() {
       <div className="mt-8 max-w-5xl">
         <div className="flex items-center gap-3 mb-2">
           <span className="font-kanji text-xs text-[var(--text-on-blue-2)]">树形图运算负荷</span>
-          <span className="font-mono text-xs text-[var(--accent-cyan)]">{cpuPct}%</span>
+          <span className="font-mono text-xs text-[var(--accent-cyan-on-blue)]">
+            {statsHasData ? `${cpuPct}%` : '—'}
+          </span>
         </div>
         <div
           className="relative overflow-hidden rounded-full"
@@ -132,7 +184,7 @@ export default function StatsDashboard() {
           <div
             className="h-full rounded-full transition-all duration-1000"
             style={{
-              width: `${cpuPct}%`,
+              width: statsHasData ? `${cpuPct}%` : '0%',
               background: 'linear-gradient(90deg, var(--accent-cyan), #FFFFFF)',
             }}
           />

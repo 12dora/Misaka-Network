@@ -12,7 +12,8 @@ export default function Home() {
     <div className="min-h-screen" style={{ background: 'var(--bg-primary)' }}>
 
       {/* ── Mobile Hero ─────────────────────────────────────────────── */}
-      <section className="md:hidden relative overflow-hidden pt-16">
+      {/* UX-LAYOUT-007: pt-nav = 64px + top safe-area inset. */}
+      <section className="md:hidden relative overflow-hidden pt-nav">
         <div
           className="absolute inset-0 pointer-events-none dot-grid"
           style={{
@@ -23,10 +24,13 @@ export default function Home() {
         />
 
         {/* Character stage */}
+        {/* UX-LAYOUT-003: `.hero-stage` collapses the decorative character
+            stage on short phones (≤640×720) so the login card — the first
+            real action — is not pushed to ~y=534 and mistaken for a splash
+            screen. */}
         <div
-          className="relative w-full overflow-hidden"
+          className="hero-stage relative w-full overflow-hidden"
           style={{
-            height: 'clamp(310px, 50svh, 430px)',
             background: 'linear-gradient(180deg, rgba(14,42,107,0.18) 0%, rgba(255,255,255,0.08) 100%)',
           }}
         >
@@ -84,7 +88,7 @@ export default function Home() {
         style={{
           gridTemplateColumns: '44% 1fr',
           minHeight: 'min(100dvh, 820px)',
-          paddingTop: 64,
+          paddingTop: 'var(--nav-h-total)',
         }}
       >
         {/* Left: Character illustration */}
@@ -97,7 +101,7 @@ export default function Home() {
             fetchPriority="high"
             decoding="async"
             style={{
-              maxHeight: 'calc(min(100dvh, 820px) - 64px)',
+              maxHeight: 'calc(min(100dvh, 820px) - var(--nav-h-total))',
               width: '100%',
               objectFit: 'contain',
               objectPosition: 'bottom center',

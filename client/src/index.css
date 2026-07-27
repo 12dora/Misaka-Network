@@ -18,13 +18,33 @@
   --accent-cyan:   #5BB3FF;
   --accent-ribbon: #E8C5C0;
 
-  /* State */
+  /* State — these are FILL colours (badges, dots, progress bars, borders).
+     They are NOT safe as small-size text colours; see the *-on-light /
+     *-on-blue pairs below. */
   --state-success: #00C28A;
   --state-warn:    #FFB23D;
   /* P2: bumped from #FF5670 → #E83A5A for WCAG AA contrast against the
      primary blue (#1A4FC4) — previous ratio was ~3.5:1, below the 4.5:1
      required for normal-size error text. */
   --state-danger:  #E83A5A;
+
+  /* A11Y-002 — verified foreground/background pairs.
+     Every `*-on-light` token is ≥ 4.5:1 against BOTH --surface (#FFFFFF)
+     and --surface-tint (#EAF1FF). Every `*-on-blue` token is ≥ 4.5:1
+     against BOTH --bg-primary (#1A4FC4) and --bg-deep (#0E2A6B).
+     The raw --state-* fills above ran 1.58:1–4.05:1 as text, well below AA
+     at the 10–14 px sizes the status/diagnostic UI uses.
+     `tests/unit/a11y-contrast.test.ts` re-derives these ratios from this
+     file, so changing a hex here fails CI unless it still passes AA. */
+  --state-success-on-light: #07795A;  /* 5.40 on white · 4.76 on tint */
+  --state-warn-on-light:    #8A5200;  /* 6.39 on white · 5.63 on tint */
+  --state-danger-on-light:  #C2183F;  /* 6.01 on white · 5.30 on tint */
+  --text-muted-on-light:    #586A93;  /* 5.39 on white · 4.75 on tint */
+
+  --state-success-on-blue:  #7FF0CB;  /* 5.15 on primary · 9.75 on deep */
+  --state-warn-on-blue:     #FFD08A;  /* 4.95 on primary · 9.37 on deep */
+  --state-danger-on-blue:   #FFC3CD;  /* 4.71 on primary · 8.92 on deep */
+  --accent-cyan-on-blue:    #A9D6FF;  /* 4.65 on primary · 8.80 on deep */
 
   /* Text */
   --text-on-blue:    #FFFFFF;
@@ -39,8 +59,21 @@
   --shadow-card:   0 10px 30px -12px rgba(14, 42, 107, 0.25);
   --shadow-float:  0 20px 50px -20px rgba(14, 42, 107, 0.35);
 
-  /* Nav height */
+  /* Nav height.
+     UX-LAYOUT-007: standalone iOS (Home-Screen launch) draws under the
+     status bar / notch. Everything that offsets for the fixed nav must use
+     --nav-h-total, never the bare 64 px, or the first row of every page
+     lands behind the clock. */
   --nav-h: 64px;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --nav-h-total: calc(var(--nav-h) + var(--safe-top));
+
+  /* UX-LAYOUT-009 — one notification layer that knows about the nav, the
+     mobile action bar, the home-indicator safe area and open dialogs. */
+  --z-nav: 50;
+  --z-notify: 90;
+  --z-dialog: 100;
 }
 
 /* ── Base Reset ─────────────────────────────────────────────────── */
@@ -300,6 +333,75 @@ body {
     background-image: radial-gradient(circle, rgba(255,255,255,0.07) 1px, transparent 1px);
     background-size: 24px 24px;
   }
+
+  /* A11Y-007 — ≥44×44 CSS-px hit area on coarse pointers.
+     Icon-only controls (nav gear / hamburger, modal ✕, regenerate ↻, the
+     settings switches) measured 20–32 px. The glyph keeps its size; an
+     invisible pseudo-element grows the pointer target around it. It must
+     NOT be `pointer-events: none` — receiving the pointer is the entire
+     point, and since it is a child of the button the event still targets
+     the button. The 6 px of bleed on each side fits inside the existing
+     12 px gaps, so it can't steal a neighbour's taps.
+
+     NOTE: only apply `.tap-target` to elements that don't already own an
+     `::after` — `.btn-primary::after` drives the click sweep. Text buttons
+     get their 44 px from the min-height rule below instead. */
+  .tap-target { position: relative; }
+  @media (pointer: coarse) {
+    .tap-target::after {
+      content: '';
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: max(100%, 44px);
+      height: max(100%, 44px);
+      transform: translate(-50%, -50%);
+      background: transparent;
+    }
+    /* Text buttons and pills reach the minimum by growing themselves. */
+    .nav-pill, .btn-primary, .btn-ghost {
+      min-height: 44px;
+      min-width: 44px;
+    }
+  }
+
+  /* UX-LAYOUT-007 — every page's top offset for the fixed nav. */
+  .pt-nav { padding-top: var(--nav-h-total); }
+
+  /* A11Y-006 — skip link. Off-screen until focused, then it lands just
+     under the (safe-area aware) nav. */
+  .misaka-skip-link {
+    position: fixed;
+    left: 50%;
+    top: calc(var(--safe-top) + 8px);
+    transform: translate(-50%, -200%);
+    z-index: 200;
+    padding: 0.6rem 1.25rem;
+    border-radius: 9999px;
+    background: var(--surface);
+    color: var(--text-on-white);
+    font-family: 'Noto Sans JP', 'Noto Sans SC', sans-serif;
+    font-weight: 600;
+    font-size: 0.875rem;
+    text-decoration: none;
+    box-shadow: var(--shadow-float);
+    transition: transform 0.15s ease;
+  }
+  .misaka-skip-link:focus-visible,
+  .misaka-skip-link:focus {
+    transform: translate(-50%, 0);
+    outline: 3px solid var(--accent-cyan);
+    outline-offset: 2px;
+  }
+
+  /* UX-LAYOUT-003 — the onboarding hero eats the entire first screen on
+     short phones (320–390 px wide, ≤ 720 px tall), pushing the login card
+     to ~y=534 so it reads as a splash. Shrink the decorative stage there so
+     the first real action is above the fold. */
+  .hero-stage { height: clamp(310px, 50svh, 430px); }
+  @media (max-width: 640px) and (max-height: 720px) {
+    .hero-stage { height: clamp(150px, 26svh, 240px); }
+  }
 }
 
 /* ── Animations ─────────────────────────────────────────────────── */
@@ -418,14 +520,53 @@ body {
 .lore-log:focus-within > div {
   animation-play-state: paused;
 }
+/* A11Y-008 — explicit, keyboard/touch reachable pause. `data-paused` is
+   driven by the pause button in ACGN.tsx; hover/focus-within alone is
+   unreachable for keyboard-only and touch users. */
+.lore-log[data-paused="true"] > div { animation-play-state: paused; }
+/* Coarse pointers can't hover to pause, so default to static there. */
+@media (pointer: coarse) {
+  .lore-log > div { animation: none; transform: none; }
+}
 
+/* UX-MOTION-001 — reduced motion must clear transitions and delays too,
+   not just shorten animations. Otherwise every modal, nav pill, progress
+   bar and toggle still slides, and the lore stream keeps drifting. */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
     animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
     scroll-behavior: auto !important;
   }
+  html { scroll-behavior: auto !important; }
+  .lore-log > div { animation: none !important; transform: none !important; }
+  .scan-line { display: none !important; }
+  .animate-float, .pulse-dot { animation: none !important; }
 }
+
+/* ── Notification layer (UX-LAYOUT-009) ─────────────────────────────
+   One class for the update banner + toasts so they can never sit under the
+   fixed nav, over the mobile bottom action bar, inside the home-indicator
+   safe area, or above an open dialog. `--z-notify` (90) is deliberately
+   below `--z-dialog` (100). */
+.misaka-notify {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: var(--z-notify);
+  max-width: min(560px, calc(100% - 32px));
+  bottom: calc(96px + var(--safe-bottom) + 12px);
+}
+@media (min-width: 768px) {
+  .misaka-notify { bottom: calc(2rem + var(--safe-bottom)); }
+}
+/* Set on <body> while any MisakaDialog is open — suppresses the banner so
+   it can't cover a dialog's actions, and locks background scroll. */
+body[data-dialog-open="true"] .misaka-notify { display: none; }
+body[data-dialog-open="true"] { overflow: hidden; }
 
 /* ── Scrollbar ──────────────────────────────────────────────────── */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
@@ -441,7 +582,7 @@ body {
    and the home-indicator safe area. On desktop the bar is hidden, so 2rem
    from the bottom is enough. Lives in CSS so the inline `style` on the toast
    element doesn't have to fight Tailwind's `md:bottom-*` rules. */
-.misaka-toast { bottom: calc(96px + env(safe-area-inset-bottom) + 12px); }
+.misaka-toast { bottom: calc(96px + var(--safe-bottom) + 12px); }
 @media (min-width: 768px) {
-  .misaka-toast { bottom: 2rem; }
+  .misaka-toast { bottom: calc(2rem + var(--safe-bottom)); }
 }
