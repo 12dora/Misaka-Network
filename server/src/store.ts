@@ -1,6 +1,7 @@
-import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'crypto'
+import { createHash, randomBytes, scrypt, timingSafeEqual } from 'crypto'
+import type { WebSocket } from 'ws'
 import type { NodeSession, QrTokenRecord, ReportRecord } from './types.js'
-import { SERVER_SECRET } from './config.js'
+import { SERVER_SECRET, SCRYPT_MAX_CONCURRENT, SCRYPT_MAX_QUEUE } from './config.js'
 
 // ── customIdentifier derivation (P2-11) ─────────────────────────────
 //
@@ -71,16 +72,68 @@ export interface NodeFreeze {
 }
 export const nodeFreezes = new Map<number, NodeFreeze>()
 
+// ── Authenticated-socket index (SECURITY-014) ───────────────────────
+//
+// `activity.broadcast` used to answer "is this socket authenticated?" by
+// scanning every session for every connected client — O(n²) per event, tens
+// of millions of comparisons at a few thousand nodes, all on the event loop.
+// This map is the O(1) answer. It is written in exactly three places (WS
+// AUTH, WS close, supersede) so it cannot drift from `nodes`.
+const authedSockets = new Map<WebSocket, string>()
+
+export function markSocketAuthenticated(ws: WebSocket, sessionId: string) {
+  authedSockets.set(ws, sessionId)
+}
+
+/** Idempotent — safe to call from both the supersede path and 'close'. */
+export function unmarkSocket(ws: WebSocket) {
+  authedSockets.delete(ws)
+}
+
+export function authenticatedSockets(): IterableIterator<WebSocket> {
+  return authedSockets.keys()
+}
+
+export function isSocketAuthenticated(ws: WebSocket): boolean {
+  return authedSockets.has(ws)
+}
+
+export function authenticatedSocketCount(): number {
+  return authedSockets.size
+}
+
+// ── Session expiry (SECURITY-001) ───────────────────────────────────
+//
+// The advertised session TTL used to exist only as a number in the register
+// response body: nothing stored it and nothing enforced it, so a token stayed
+// valid for the lifetime of the process. `expiresAt` is now the single
+// absolute deadline and this predicate is the single place that reads it.
+export function isSessionExpired(session: NodeSession, now = Date.now()): boolean {
+  return session.expiresAt > 0 && now >= session.expiresAt
+}
+
+/**
+ * The one public token resolver. Every caller (HTTP bearer routes, WS AUTH,
+ * /api/release, TURN issuance) goes through here, so expiry is enforced in a
+ * single place instead of once per route. An expired session is reported as
+ * "not found" — the cleanup sweep is what actually evicts it and closes the
+ * socket.
+ */
 export function findSessionByToken(token: string): NodeSession | null {
+  const now = Date.now()
   for (const s of nodes.values()) {
-    if (s.token === token) return s
+    if (s.token !== token) continue
+    if (isSessionExpired(s, now)) return null
+    return s
   }
   return null
 }
 
 export function findSessionsByNodeAndHash(nodeId: number, passCodeHash: string): NodeSession[] {
+  const now = Date.now()
   const out: NodeSession[] = []
   for (const s of nodes.values()) {
+    if (isSessionExpired(s, now)) continue
     if (s.nodeId === nodeId && s.passCodeHash === passCodeHash) out.push(s)
   }
   return out
@@ -126,10 +179,61 @@ export function newPassCodeSalt(): string {
   return randomBytes(16).toString('hex')
 }
 
-export function hashPassCodeScrypt(code: string, saltHex: string): string {
-  const salt = Buffer.from(saltHex, 'hex')
-  const dk = scryptSync(code, salt, SCRYPT_DK_LEN, { N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P })
-  return dk.toString('hex')
+// ── Bounded async scrypt (SECURITY-013) ─────────────────────────────
+//
+// `scryptSync` is ~30-50 ms of pure CPU on the event loop. Ten concurrent
+// registrations therefore froze every WS frame, timer, cleanup pass and TURN
+// accounting call for half a second. The async form runs on the libuv
+// threadpool instead — but that pool is shared with fs (persistence) and dns,
+// so unbounded concurrency just moves the starvation. The semaphore below
+// caps in-flight hashes and refuses admissions past a bounded queue with
+// `ScryptBusyError`, which the routes translate to 503 SERVER_BUSY.
+
+export class ScryptBusyError extends Error {
+  constructor() {
+    super('SCRYPT_BUSY')
+    this.name = 'ScryptBusyError'
+  }
+}
+
+let scryptInFlight = 0
+const scryptWaiters: Array<() => void> = []
+
+async function acquireScryptSlot(): Promise<void> {
+  if (scryptInFlight < SCRYPT_MAX_CONCURRENT) {
+    scryptInFlight++
+    return
+  }
+  if (scryptWaiters.length >= SCRYPT_MAX_QUEUE) throw new ScryptBusyError()
+  // The releaser hands the slot over directly (it does NOT decrement), so no
+  // late arrival can slip past the limit between wake-up and resumption.
+  await new Promise<void>(resolve => scryptWaiters.push(resolve))
+}
+
+function releaseScryptSlot(): void {
+  const next = scryptWaiters.shift()
+  if (next) next()
+  else scryptInFlight--
+}
+
+/** Test/diagnostic hook — current semaphore occupancy. */
+export function scryptQueueDepth(): { inFlight: number; queued: number } {
+  return { inFlight: scryptInFlight, queued: scryptWaiters.length }
+}
+
+export async function hashPassCodeScrypt(code: string, saltHex: string): Promise<string> {
+  await acquireScryptSlot()
+  try {
+    const salt = Buffer.from(saltHex, 'hex')
+    return await new Promise<string>((resolve, reject) => {
+      scrypt(code, salt, SCRYPT_DK_LEN, { N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P, maxmem: 64 * 1024 * 1024 }, (err, dk) => {
+        if (err) reject(err)
+        else resolve(dk.toString('hex'))
+      })
+    })
+  } finally {
+    releaseScryptSlot()
+  }
 }
 
 interface PassCodeFields {
@@ -150,13 +254,13 @@ interface PassCodeFields {
  *   const { ok, upgrade } = verifyAndMaybeUpgrade(code, session)
  *   if (ok && upgrade) Object.assign(session, upgrade)
  */
-export function verifyAndMaybeUpgrade(
+export async function verifyAndMaybeUpgrade(
   candidate: string,
   stored: PassCodeFields,
-): { ok: boolean; upgrade?: PassCodeFields } {
+): Promise<{ ok: boolean; upgrade?: PassCodeFields }> {
   // Preferred path: scrypt+salt present.
   if (stored.passCodeAlgo === 'scrypt' && stored.passCodeSalt && stored.passCodeVerifyHash) {
-    const candidateHash = hashPassCodeScrypt(candidate, stored.passCodeSalt)
+    const candidateHash = await hashPassCodeScrypt(candidate, stored.passCodeSalt)
     return { ok: timingSafeEqualHex(candidateHash, stored.passCodeVerifyHash) }
   }
   // Legacy fall-back: only the sha256 identity hash is on disk. Verify and,
@@ -166,7 +270,7 @@ export function verifyAndMaybeUpgrade(
   const salt = newPassCodeSalt()
   const upgraded: PassCodeFields = {
     passCodeHash: stored.passCodeHash,          // unchanged; identity stays sha256
-    passCodeVerifyHash: hashPassCodeScrypt(candidate, salt),
+    passCodeVerifyHash: await hashPassCodeScrypt(candidate, salt),
     passCodeSalt: salt,
     passCodeAlgo: 'scrypt',
   }
@@ -178,16 +282,16 @@ export function verifyAndMaybeUpgrade(
  * the deterministic sha256 (used as identity key and for cluster id);
  * verify hash is scrypt with a fresh per-session salt.
  */
-export function newPassCodeRecord(code: string): {
+export async function newPassCodeRecord(code: string): Promise<{
   passCodeHash: string
   passCodeVerifyHash: string
   passCodeSalt: string
   passCodeAlgo: 'scrypt'
-} {
+}> {
   const salt = newPassCodeSalt()
   return {
     passCodeHash: hashPassCodeIdentity(code),
-    passCodeVerifyHash: hashPassCodeScrypt(code, salt),
+    passCodeVerifyHash: await hashPassCodeScrypt(code, salt),
     passCodeSalt: salt,
     passCodeAlgo: 'scrypt',
   }
