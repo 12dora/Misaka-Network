@@ -54,30 +54,29 @@ export function candidateType(candidate: RTCIceCandidate): ChannelType | null {
 }
 
 export async function getSelectedChannelType(pc: RTCPeerConnection): Promise<ChannelType | null> {
-  try {
-    const stats = await pc.getStats()
-    for (const report of stats.values()) {
-      if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.nominated) {
-        const local = stats.get(report.localCandidateId)
-        if (local?.candidateType === 'host') return 'direct'
-        if (local?.candidateType === 'srflx') return 'stun'
-        if (local?.candidateType === 'relay') return 'relay'
-        return null
-      }
-    }
-  } catch { /* stats may fail */ }
-  return null
+  return (await getSelectedIcePath(pc))?.channelType ?? null
 }
 
-function normalizeCandidateType(t?: string): 'host' | 'srflx' | 'relay' | 'unknown' {
+type CandidateKind = 'host' | 'srflx' | 'relay' | 'unknown'
+
+function normalizeCandidateType(t?: string): CandidateKind {
   if (t === 'host' || t === 'srflx' || t === 'relay') return t
+  // A peer-reflexive candidate is a NAT-mapped address discovered during
+  // connectivity checks — for reporting purposes it behaves like srflx, not
+  // like a directly reachable host address.
+  if (t === 'prflx') return 'srflx'
   return 'unknown'
 }
 
-function toChannelType(t: 'host' | 'srflx' | 'relay' | 'unknown'): ChannelType | null {
-  if (t === 'host') return 'direct'
-  if (t === 'srflx') return 'stun'
-  if (t === 'relay') return 'relay'
+// BUG-010: classify the candidate PAIR, not just our own side. A host/srflx
+// local candidate paired with a remote `relay` candidate is still a relayed
+// path: the bytes cross the TURN server, we still pay for them, and the
+// privacy statement ("your traffic is relayed") still applies. Reporting it
+// as "直接信道" misled users, cost attribution and support diagnosis alike.
+export function classifyCandidatePair(local: CandidateKind, remote: CandidateKind): ChannelType | null {
+  if (local === 'relay' || remote === 'relay') return 'relay'
+  if (local === 'srflx' || remote === 'srflx') return 'stun'
+  if (local === 'host' || remote === 'host') return 'direct'
   return null
 }
 
@@ -90,7 +89,7 @@ export async function getSelectedIcePath(pc: RTCPeerConnection): Promise<Selecte
       const remote = stats.get(report.remoteCandidateId)
       const localType = normalizeCandidateType(local?.candidateType)
       const remoteType = normalizeCandidateType(remote?.candidateType)
-      const channelType = toChannelType(localType)
+      const channelType = classifyCandidatePair(localType, remoteType)
       const localProto = local?.protocol || '?'
       const remoteProto = remote?.protocol || '?'
       return {
@@ -102,19 +101,66 @@ export async function getSelectedIcePath(pc: RTCPeerConnection): Promise<Selecte
   return null
 }
 
+// ── TURN master switch ───────────────────────────────────────────────
+// BUG-008: "启用 TURN 中继" is presented as a master switch, but only the
+// MANUAL server list honoured it — server-issued auto credentials were
+// injected unconditionally, so a user who turned relaying off kept relaying
+// (with whatever creds were already cached) until the tab was closed.
+//
+// The one nuance: `loadTurnSettings()` has no "unset" state and returns
+// `enabled: false` for a user who has simply never opened Settings. Treating
+// that struct default as an opt-out would disable server-issued TURN for
+// everybody out of the box. So: an explicitly persisted record is honoured
+// verbatim; the absence of a record leaves auto TURN on (the server remains
+// the canonical gate via its budget / kill-switch) and manual TURN off
+// (there are no manual servers before the record exists anyway).
+//
+// Mirrors turn.ts's STORAGE_KEY — duplicated rather than exported because
+// turn.ts owns the persistence format and we only need "has the user ever
+// expressed a preference".
+const TURN_SETTINGS_STORAGE_KEY = 'misaka.turnServers'
+
+function hasStoredTurnPreference(): boolean {
+  try { return localStorage.getItem(TURN_SETTINGS_STORAGE_KEY) !== null } catch { return false }
+}
+
+/** Whether ANY relay (auto or manual) may be attached to a peer connection. */
+export function isRelayAllowed(): boolean {
+  if (loadTurnSettings().enabled) return true
+  return !hasStoredTurnPreference()
+}
+
+function isTurnUrl(u: unknown): boolean {
+  return typeof u === 'string' && (u.startsWith('turn:') || u.startsWith('turns:'))
+}
+
+function containsTurn(servers: RTCIceServer[]): boolean {
+  return servers.some(s => (Array.isArray(s.urls) ? s.urls : [s.urls]).some(isTurnUrl))
+}
+
+/** True when the current settings would actually yield a relay candidate. */
+export function hasUsableTurnServer(): boolean {
+  return containsTurn(currentTurnServers())
+}
+
+function currentTurnServers(): RTCIceServer[] {
+  if (!isRelayAllowed()) return []
+  // getTurnIceServers() already returns [] unless the master switch is on.
+  return [...getAutoTurnIceServers(), ...getTurnIceServers()]
+}
+
 // Single source of truth for the RTCConfiguration derived from current TURN
 // state — used both for new PCs and to re-apply via `pc.setConfiguration()`
 // on existing PCs when creds rotate or the user flips force-relay.
 export function buildIceConfig(): RTCConfiguration {
   const turnSettings = loadTurnSettings()
-  // Order: STUN → server-issued auto TURN (always injected — server is the
-  // canonical gate via budget/killswitch) → manual user TURN (only when
-  // user opts in via the Settings toggle).
+  // Order: STUN → server-issued auto TURN → manual user TURN. Both TURN
+  // tiers sit behind the master switch (see isRelayAllowed above).
+  const turnServers = currentTurnServers()
   const iceServers: RTCIceServer[] = [
     ...DEFAULT_STUN,
     ...SUPPLEMENTAL_STUN,
-    ...getAutoTurnIceServers(),
-    ...(turnSettings.enabled ? getTurnIceServers() : []),
+    ...turnServers,
   ]
   // P1: when local NAT is symmetric, host candidates can't be reached and
   // srflx candidates won't match the peer's expectations either — only relay
@@ -122,13 +168,14 @@ export function buildIceConfig(): RTCConfiguration {
   // "强制使用 TURN" in Settings; now we do it automatically once
   // `detectNatType()` has marked us symmetric. The Settings toggle still
   // wins if it's already set.
+  //
+  // BUG-008 (second half): a 'relay' policy with no TURN entry can never
+  // produce a candidate — it guarantees connection failure. Refuse it,
+  // whichever side asked for it. `hasUsableTurnServer()` is exported so the
+  // Settings UI can refuse/clear the toggle instead of silently disagreeing
+  // with what we actually apply.
   const natIsSymmetric = getDetectedNatType() === 'symmetric'
-  const forceRelay = turnSettings.forceRelay || (natIsSymmetric && iceServers.some(s => {
-    // Only force relay if we actually have a TURN entry — otherwise we'd
-    // produce an unsatisfiable config (relay policy + STUN-only servers).
-    const urls = Array.isArray(s.urls) ? s.urls : [s.urls]
-    return urls.some(u => typeof u === 'string' && (u.startsWith('turn:') || u.startsWith('turns:')))
-  }))
+  const forceRelay = containsTurn(turnServers) && (turnSettings.forceRelay || natIsSymmetric)
   return {
     iceServers,
     iceTransportPolicy: forceRelay ? 'relay' : 'all',
@@ -142,14 +189,40 @@ export function createPeerConnection(): RTCPeerConnection {
   return new RTCPeerConnection(buildIceConfig())
 }
 
+// BUG-009: `setConfiguration()` re-arms the ICE agent for the NEXT gathering
+// round; it does not move an already-selected candidate pair. Flipping
+// force-relay on a live call therefore left the media path exactly where it
+// was while the UI claimed otherwise. We record the effective config per PC
+// and report the ones that materially changed so the caller (network.ts,
+// which owns signaling) can schedule an ICE restart at a safe moment.
+const appliedIceSignature = new WeakMap<RTCPeerConnection, string>()
+
+function iceConfigSignature(cfg: RTCConfiguration): string {
+  const urls = (cfg.iceServers ?? []).flatMap(s => {
+    const list = Array.isArray(s.urls) ? s.urls : [s.urls]
+    // Credentials matter too — a rotated username/password is a different
+    // relay session even when the URL is unchanged.
+    return list.map(u => `${u}|${s.username ?? ''}|${s.credential ?? ''}`)
+  })
+  return `${cfg.iceTransportPolicy ?? 'all'}::${urls.join(',')}`
+}
+
 // Re-apply the current TURN config to every live PC. Called when auto-TURN
 // creds refresh, when the user toggles force-relay, when manual servers are
 // added/removed, etc. Without this an existing connection keeps the original
 // (now stale) creds until it's torn down and re-created.
-export function applyIceConfigToAll(pcs: Iterable<RTCPeerConnection>) {
+//
+// Returns the PCs whose effective config changed since the last call (empty
+// on the first call for a given PC — that only establishes the baseline).
+export function applyIceConfigToAll(pcs: Iterable<RTCPeerConnection>): RTCPeerConnection[] {
   const cfg = buildIceConfig()
+  const signature = iceConfigSignature(cfg)
+  const changed: RTCPeerConnection[] = []
   for (const pc of pcs) {
     if (pc.connectionState === 'closed') continue
+    const previous = appliedIceSignature.get(pc)
+    appliedIceSignature.set(pc, signature)
+    if (previous !== undefined && previous !== signature) changed.push(pc)
     // P0: setConfiguration() throws InvalidModificationError on Chrome the
     // moment iceCandidatePoolSize differs from the pool size used at
     // construction time AND gathering has begun (iceGatheringState !=
@@ -171,6 +244,7 @@ export function applyIceConfigToAll(pcs: Iterable<RTCPeerConnection>) {
       wlog('webrtc', 'setConfiguration failed', err)
     }
   }
+  return changed
 }
 
 export function createDataChannel(pc: RTCPeerConnection, label = 'misaka'): RTCDataChannel {

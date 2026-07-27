@@ -12,6 +12,38 @@ export interface PassCodeKeyResult {
 
 const PASS_LEN = 6
 
+// ── Credential generation ────────────────────────────────────────────
+// SECURITY-019: the pass code is only ~20 bits of entropy to begin with, so
+// the generator must at least not be *predictable* on top of being small.
+// `Math.random()` is xorshift128+, seeded per tab and recoverable from a
+// handful of outputs — one observed regenerate is enough to guess the next.
+// Draw from the CSPRNG instead, and reject the tail of the 2^32 range that
+// wouldn't divide evenly so `% range` introduces no bias toward low values.
+
+const UINT32_SPACE = 0x1_0000_0000
+
+/** Uniform integer in [min, max] (inclusive) from `crypto.getRandomValues`. */
+export function secureRandomInt(min: number, max: number): number {
+  if (!Number.isInteger(min) || !Number.isInteger(max) || max < min) {
+    throw new RangeError(`secureRandomInt: invalid range ${min}..${max}`)
+  }
+  const range = max - min + 1
+  if (range === 1) return min
+  // Largest multiple of `range` that fits in 2^32; anything at or above it is
+  // re-drawn. The expected number of draws is < 2 for any sane range.
+  const limit = Math.floor(UINT32_SPACE / range) * range
+  const buf = new Uint32Array(1)
+  for (;;) {
+    crypto.getRandomValues(buf)
+    if (buf[0] < limit) return min + (buf[0] % range)
+  }
+}
+
+/** Six-digit, zero-padded pass code drawn from the CSPRNG. */
+export function generatePassCode(): string {
+  return String(secureRandomInt(0, 999999)).padStart(PASS_LEN, '0')
+}
+
 export function getPassChars(passCode: string, len: number = PASS_LEN): string[] {
   const chars: string[] = []
   for (let i = 0; i < len; i++) chars.push(passCode[i] ?? '')

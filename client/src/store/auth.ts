@@ -2,7 +2,8 @@ import { create } from 'zustand'
 import type { Identity, Session } from '@/types'
 import { apiUrl } from '@/config'
 import { NODE_ID_MIN, NODE_ID_MAX } from '@/constants'
-import { onAuthInvalid } from '@/lib/signaling'
+import { onAuthInvalid, endSession } from '@/lib/signaling'
+import { secureRandomInt, generatePassCode } from '@/lib/passcode'
 
 // Web Locks API mutex: hold this lock for the lifetime of the tab. If another
 // tab in the same origin tries to register the same nodeId, its `request()`
@@ -45,6 +46,15 @@ async function acquireNodeIdLock(nodeId: number): Promise<boolean> {
 // Lock (only one wins → the losers flash a bogus "another tab" error) and
 // double-register. A shared in-flight promise makes all callers await one run.
 let connectInFlight: Promise<void> | null = null
+
+// BUG-001: the same idempotency for logout. A double-click on Disconnect (or
+// a 4001 close racing the button) must not fire two /api/release calls, two
+// network teardowns, or interleave a re-register into the middle of a logout.
+let disconnectInFlight: Promise<void> | null = null
+
+function releaseNodeIdLock() {
+  if (nodeIdLockRelease) { nodeIdLockRelease(); nodeIdLockRelease = null; lockedNodeId = null }
+}
 
 type AuthGet = () => AuthState
 type AuthSet = (partial: Partial<AuthState>) => void
@@ -123,8 +133,12 @@ async function doConnect(get: AuthGet, set: AuthSet): Promise<void> {
   }
 }
 
+// SECURITY-019: identity material (node id + pass code) is drawn from the
+// CSPRNG with rejection sampling — see lib/passcode.ts. `Math.random()` is
+// predictable from a couple of observed outputs, which matters a lot for a
+// 6-digit code.
 function randomInt(min: number, max: number) {
-  return Math.floor(Math.random() * (max - min + 1)) + min
+  return secureRandomInt(min, max)
 }
 
 function generateIdentity(): Identity {
@@ -214,7 +228,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   regeneratePassCode() {
-    const passCode = String(randomInt(0, 999999)).padStart(6, '0')
+    const passCode = generatePassCode()
     const identity = { ...get().identity, passCode }
     persistIdentity(identity)
     set({ identity, error: null })
@@ -282,22 +296,40 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   clearSession() {
     sessionStorage.removeItem('misaka.session')
-    if (nodeIdLockRelease) { nodeIdLockRelease(); nodeIdLockRelease = null; lockedNodeId = null }
+    releaseNodeIdLock()
     set({ session: null, isConnected: false })
   },
 
   async disconnect() {
-    const { session } = get()
-    if (session) {
-      await fetch(apiUrl('/api/release'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: session.token }),
-      }).catch(() => {})
-    }
-    sessionStorage.removeItem('misaka.session')
-    if (nodeIdLockRelease) { nodeIdLockRelease(); nodeIdLockRelease = null; lockedNodeId = null }
-    set({ session: null, isConnected: false, error: null })
+    // BUG-001: an explicit Disconnect must end the whole network epoch, not
+    // just forget the token. Order matters:
+    //   1. stop signaling reconnects + destroy every session-scoped WebRTC
+    //      artefact (PC / DC / ECDH keys / in-flight transfers) so nothing
+    //      keeps living on a token we are about to release;
+    //   2. drop the local credentials so no background 401-retry can
+    //      re-register behind our back;
+    //   3. release the server-side session last — that is what makes the
+    //      server drop us from the cluster channel and tell peers PEER_LEFT.
+    if (disconnectInFlight) return disconnectInFlight
+    disconnectInFlight = (async () => {
+      try {
+        const { session } = get()
+        try { endSession() } catch (err) { console.warn('[auth] session teardown failed', err) }
+        sessionStorage.removeItem('misaka.session')
+        releaseNodeIdLock()
+        set({ session: null, isConnected: false, error: null })
+        if (session) {
+          await fetch(apiUrl('/api/release'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token: session.token }),
+          }).catch(() => {})
+        }
+      } finally {
+        disconnectInFlight = null
+      }
+    })()
+    return disconnectInFlight
   },
 }))
 

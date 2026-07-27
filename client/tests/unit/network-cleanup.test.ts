@@ -41,8 +41,12 @@ vi.mock('@/lib/signaling', () => ({
   onMessage: (h: (msg: unknown) => void) => { signalingHandlers.message.push(h); return () => {} },
   onConnect: (h: () => void) => { signalingHandlers.connect.push(h); return () => {} },
   onDisconnect: (h: () => void) => { signalingHandlers.disconnect.push(h); return () => {} },
+  // BUG-001: network.ts subscribes to the logout hook so an explicit
+  // Disconnect ends the network epoch. Stubbed here as a no-op registration.
+  onSessionEnd: () => () => {},
   connect: vi.fn(),
   disconnect: vi.fn(),
+  endSession: vi.fn(),
   send: (msg: unknown) => { signalingHandlers.sent.push(msg) },
   reconnectNow: vi.fn(),
 }))
