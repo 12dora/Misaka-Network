@@ -8,10 +8,17 @@
 | 批次 | 状态 | 覆盖 |
 |---|---|---|
 | Wave 1 | **已完成、已提交（5 个 commit）、全量测试绿** | 47 项 |
-| Wave 2 服务端（W2-B） | **已完成、已提交、server 测试绿** | 8 项 |
-| Wave 2 客户端（W2-A） | **中断，工作区未提交** | ~16 项 |
+| Wave 2 服务端（W2-B） | **已完成、已提交** | 8 项 |
+| Wave 2 客户端（W2-A） | **已完成、已提交** | 18 项 |
 | Wave 3 | 未开始 | ~25 项 |
 | Wave 4 | 未开始 | UX-COPY-001 + 收尾 |
+
+**当前 HEAD 全量测试绿：** `npm test` → server 38 个脚本 + client 63 文件 / 480 测试，exit 0。
+
+**⚠️ server 集成套件存在既有 flake（TEST-002/003，尚未修）：** 连续背靠背跑两遍 `npm test` 时，
+上一轮的服务器进程可能还没释放固定端口，下一轮就会连到那个**陈旧进程**上，
+表现为 `register-edge` 的 `/api/release-by-ip` 释放 0 个节点，或 `cleanup-with-active` 的 WS WELCOME 超时。
+两者单跑都稳定通过（各 3/3）。判断「是否真回归」时务必先单跑复核，不要被这个假红误导。
 
 **尚未 push。** 用户要求「分批 commit，最后 push」——push 必须等 codex 复核通过后再执行。
 
@@ -58,18 +65,27 @@ commit `bba4f16`，覆盖 SECURITY-008、009、010、017；BUG-022、023、024�
 
 已知既有 flake：`tests/trust-proxy.test.mjs` 偶发固定端口/`npx tsx` 启动超时，改动前的基线也会偶发，单跑通过。
 
-### W2-A 客户端传输完整性 —— **中断时仍在运行，产出可能不完整，未提交**
+### W2-A 客户端传输完整性 —— **已完成、已提交、全量测试绿**
 
-覆盖目标：SECURITY-007、015；BUG-011~021、027；QUALITY-001、002；TEST-006、009。
-涉及 `client/src/lib/{transfer,db,chunk-bitmap,cryptoPool,crypto}.ts`、`client/src/store/network.ts`、
-`client/src/pages/Network.tsx`（仅接线）、`client/tests/unit/**`。
-要求：BUG-013~017 必须**成组**发布并引入协议版本协商（审计 P0 第 9 条）。
+commit `ef545e1`，覆盖 SECURITY-007、015；BUG-011~021、027；QUALITY-001、002；TEST-006、009。
 
-**接续第一步：** `git status` + `npm --prefix client test`，判断工作区里的客户端改动是完整可用、
-需要补完、还是应当丢弃重做。服务端与 wave 1 都已提交，因此 `git diff HEAD` 的内容**就是** W2-A 的全部增量。
-中断时已观察到的 W2-A 产出：`client/tests/unit/_transfer-fixtures.ts`、
-`cryptopool-worker-replacement.test.ts` 等新文件，以及对 `transfer.ts`/`db.ts`/`cryptoPool.ts`/
-`store/network.ts` 和约 10 个既有 transfer 测试的修改。
+引入 `PROTOCOL_VERSION = 2`（hello 帧 + `meta.v`，双方取 `min`，v2↔v1 整体回落 v1）。
+**二进制块帧未变**——`CHUNK_FRAME_TAG`、帧布局、`makeChunkIv` 全部保持原样，只扩展了 JSON 控制面
+（`transfer-ready` / `transfer-reject` / `transfer-repair` / `transfer-done`）。
+完整契约已写进 `CLAUDE.md` 的 Key contracts 一节。
+
+**留给 Wave 3 UI 代理的接口：**
+- store 新导出 `getTransferDeliveryState(id)` → `'queued'|'delivered'|'saved'`。
+  完成的发送卡片只有在 `saved` 时才可以显示「已保存」；`delivered` 意为「已送达，等待对方确认」，
+  此时源文件仍被保留以便重试。W2-A 刻意没有改 `client/src/types.ts` 的 `TransferStatus`（不在其所有权内）。
+- `sendFilesToAll` 现在可能抛 `PartialFanoutError{failures:[{peerSessionId,fileName}]}`；
+  resume/retry 抛 `TransferResumeError{code}`。两者目前只接了一个 toast，需要更好的界面。
+
+**留给 Wave 3 E2E 代理的注意事项：**
+接收端现在会在任何 payload 之前 ACK `transfer-ready`，因此存储选择卡住会让整个传输在 30 秒屏障上停住
+（而不是静默损坏）；发送端只有收到 `transfer-done` 才报 `saved`。
+`finalizeReceive` 会校验大小并删除 OPFS 条目，所以 TEST-005 的字节级断言必须**在清理前读下载产物**，
+不能在之后去读 OPFS 文件。测试夹具必须几何自洽，用 `client/tests/unit/_transfer-fixtures.ts`。
 
 ## codex 复核结果
 
