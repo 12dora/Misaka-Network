@@ -1,22 +1,25 @@
 import { WebSocketServer, WebSocket } from 'ws'
 import { IncomingMessage } from 'http'
 import { z } from 'zod'
-import { nodes, channels, clusterChannelId, updatePeakConcurrent } from './store.js'
+import {
+  nodes, channels, clusterChannelId, updatePeakConcurrent,
+  markSocketAuthenticated, unmarkSocket, isSessionExpired,
+} from './store.js'
 import { broadcast } from './activity.js'
 import { authMiddleware } from './http.js'
-import { WS_AUTH_GRACE_MS, TRUST_PROXY_ENABLED } from './config.js'
+import {
+  WS_AUTH_GRACE_MS, TRUST_PROXY_ENABLED,
+  WS_MAX_MESSAGE_BYTES, WS_MAX_OVERSIZE_STRIKES,
+  WS_MSG_BURST, WS_MSG_RATE_PER_SEC, WS_MAX_RATE_VIOLATIONS,
+  WS_MAX_BUFFERED_BYTES, WS_MAX_BUFFERED_HARD_BYTES, WS_SLOW_CONSUMER_GRACE_MS,
+} from './config.js'
 import type { NodeSession } from './types.js'
 
-const MAX_MESSAGE_SIZE = 64 * 1024
 // Upper bound on how many peers a single session may block. Without a cap a
 // hostile authenticated client can stream unbounded BLOCK frames each carrying
-// a fresh 64-char id and grow this Set until the process OOMs — there is no
-// per-message WS rate limit. A few thousand is far above any legitimate use.
+// a fresh 64-char id and grow this Set until the process OOMs. A few thousand
+// is far above any legitimate use.
 const MAX_BLOCKED_IDS = 2000
-// After this many oversize messages, drop the socket — the client is buggy or
-// abusing the connection. The ERROR-only loop used to let an attacker hold a
-// slot forever at zero cost.
-const MAX_OVERSIZE_VIOLATIONS = 3
 
 const wsMessageSchema = z.discriminatedUnion('t', [
   z.object({ t: z.literal('AUTH'),         token:           z.string() }),
@@ -29,10 +32,64 @@ const wsMessageSchema = z.discriminatedUnion('t', [
   z.object({ t: z.literal('BLOCK'),        sessionId:       z.string().min(1).max(64) }),
 ])
 
-function send(ws: WebSocket, msg: object) {
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(msg))
+/**
+ * Outbound backpressure (SECURITY-003).
+ *
+ * `ws.send()` never blocks: anything the peer isn't reading piles up in the
+ * socket's send queue, and `bufferedAmount` is the only signal that it is
+ * happening. A peer that stops draining (mobile going through a tunnel, a
+ * deliberately-paused attacker socket) therefore used to make the server
+ * accumulate every forwarded SDP/ICE frame and every activity broadcast for
+ * it, without limit.
+ *
+ * Three marks:
+ *   - soft (WS_MAX_BUFFERED_BYTES): stop enqueueing for this socket, drop the
+ *     frame. Signaling frames are re-sent by the peers' own retry paths and a
+ *     stale ICE candidate is worthless anyway.
+ *   - stuck (WS_SLOW_CONSUMER_GRACE_MS above the soft mark): the peer is not
+ *     recovering. Dropping frames is what keeps the queue from growing, so
+ *     without this clock a permanently-stuck socket would never trip the hard
+ *     mark and would hold its slot forever.
+ *   - hard (WS_MAX_BUFFERED_HARD_BYTES): one burst already blew past the soft
+ *     mark by a wide margin — don't wait out the grace period.
+ *
+ * A shed socket gets a courtesy 1008 close frame, then is terminated: a peer
+ * that isn't reading will never answer the closing handshake, and `ws` would
+ * otherwise hold the connection for its full 30 s close timeout.
+ *
+ * Returns whether the frame was actually enqueued.
+ */
+const slowConsumerSince = new WeakMap<WebSocket, number>()
+
+function shedSlowConsumer(ws: WebSocket) {
+  slowConsumerSince.delete(ws)
+  try { ws.close(1008, 'SLOW_CONSUMER') } catch { /* already gone */ }
+  const t = setTimeout(() => {
+    try { ws.terminate() } catch { /* already gone */ }
+  }, 1000)
+  t.unref?.()
+}
+
+export function sendWithBackpressure(ws: WebSocket, payload: string): boolean {
+  if (ws.readyState !== WebSocket.OPEN) return false
+  const buffered = ws.bufferedAmount
+  if (buffered >= WS_MAX_BUFFERED_BYTES) {
+    const now = Date.now()
+    const since = slowConsumerSince.get(ws)
+    if (since === undefined) {
+      slowConsumerSince.set(ws, now)
+    } else if (buffered >= WS_MAX_BUFFERED_HARD_BYTES || now - since >= WS_SLOW_CONSUMER_GRACE_MS) {
+      shedSlowConsumer(ws)
+    }
+    return false
   }
+  slowConsumerSince.delete(ws)
+  ws.send(payload)
+  return true
+}
+
+function send(ws: WebSocket, msg: object): boolean {
+  return sendWithBackpressure(ws, JSON.stringify(msg))
 }
 
 /**
@@ -60,24 +117,90 @@ function forwardToSession(
   send(target.socket, msg)
 }
 
-// Canonical client-IP extractor for WS — mirrors http.getClientIP semantics
-// but operates on the upgrade request. We only honour X-Forwarded-For when the
-// operator has opted into trusting a proxy (TRUST_PROXY); otherwise a client
-// could spoof its source IP on a directly internet-facing deployment and defeat
-// per-IP defences. Falls back to the raw socket address. Exported for tests.
+// Express' compiled `trust proxy fn`, installed from index.ts right after
+// `app.set('trust proxy', …)`. Keeping the *same* predicate object on both
+// sides is the point: HTTP and the WS upgrade must never disagree about which
+// hop is trusted (SECURITY-005).
+type TrustFn = (addr: string, hopIndex: number) => boolean
+let trustProxyFn: TrustFn | null = null
+
+export function setTrustProxyFn(fn: TrustFn) {
+  trustProxyFn = fn
+}
+
+/**
+ * Canonical client-IP extractor for WS upgrades — now with the same
+ * proxy-addr semantics Express applies to `req.ip`.
+ *
+ * The old implementation took the LEFT-MOST X-Forwarded-For entry whenever
+ * TRUST_PROXY was on. That is the attacker-controlled end of the chain: a
+ * proxy *appends* the peer it saw, so with `XFF: <forged>, <real>` the server
+ * picked `<forged>` and stamped it onto the session — poisoning the per-IP
+ * node cap, the brute-force lock, rate limits and TURN byte attribution, and
+ * disagreeing with `req.ip` for the very same client.
+ *
+ * The correct walk starts at the socket address and steps left through the
+ * header only while each hop is trusted, i.e. from the trusted side inward.
+ * This mirrors proxy-addr's algorithm (address list = [socket, ...XFF
+ * right-to-left]) using Express' own compiled trust predicate, so hop counts,
+ * CIDRs and presets like `loopback` behave identically on both transports.
+ */
 export function getWSIP(req: IncomingMessage): string {
-  if (TRUST_PROXY_ENABLED) {
-    const xff = req.headers['x-forwarded-for']
-    if (typeof xff === 'string') return xff.split(',')[0].trim()
-    if (Array.isArray(xff) && xff.length > 0) return xff[0].split(',')[0].trim()
+  const socketAddr = req.socket.remoteAddress ?? 'unknown'
+  if (!TRUST_PROXY_ENABLED || !trustProxyFn) return socketAddr
+
+  const raw = req.headers['x-forwarded-for']
+  const header = Array.isArray(raw) ? raw.join(',') : (raw ?? '')
+  const forwarded = header.split(',').map(s => s.trim()).filter(s => s.length > 0).reverse()
+
+  const chain = [socketAddr, ...forwarded]
+  let addr = chain[0]
+  for (let i = 0; i < chain.length - 1; i++) {
+    if (!trustProxyFn(addr, i)) break
+    addr = chain[i + 1]
   }
-  return req.socket.remoteAddress ?? 'unknown'
+  return addr
+}
+
+/**
+ * Per-socket inbound token bucket (SECURITY-003).
+ *
+ * Even with a payload ceiling, a registered node could stream well-formed
+ * SDP/ICE frames as fast as the kernel would deliver them: every one costs a
+ * JSON.parse, a zod discriminated-union parse and a map lookup, and every
+ * forwarded one costs a serialize plus an enqueue on someone else's socket.
+ * There was no budget of any kind. Over-budget frames are dropped (dropping a
+ * signaling frame is safe — the peers retry), and a socket that keeps
+ * overrunning is closed.
+ */
+class RateBucket {
+  private tokens = WS_MSG_BURST
+  private last = Date.now()
+  violations = 0
+
+  take(now = Date.now()): boolean {
+    const elapsedSec = (now - this.last) / 1000
+    if (elapsedSec > 0) {
+      this.tokens = Math.min(WS_MSG_BURST, this.tokens + elapsedSec * WS_MSG_RATE_PER_SEC)
+      this.last = now
+    }
+    if (this.tokens < 1) {
+      this.violations++
+      return false
+    }
+    this.tokens -= 1
+    return true
+  }
 }
 
 export function setupWS(wss: WebSocketServer) {
   wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
     let session: NodeSession | null = null
     let oversizeViolations = 0
+    const bucket = new RateBucket()
+    // Only one ERROR reply per second while a socket is over budget — the
+    // reply itself must not become the amplification.
+    let lastRateNoticeAt = 0
 
     // AUTH grace timer: a freshly-opened WS has WS_AUTH_GRACE_MS to send a
     // valid AUTH frame. If it doesn't, we close 4001 AUTH_TIMEOUT. This
@@ -89,11 +212,30 @@ export function setupWS(wss: WebSocketServer) {
     authTimer.unref?.()
 
     ws.on('message', (raw) => {
+      const now = Date.now()
+
+      // Inbound budget first: it must gate the JSON/zod work, not follow it.
+      if (!bucket.take(now)) {
+        if (bucket.violations >= WS_MAX_RATE_VIOLATIONS) {
+          try { ws.close(1008, 'RATE_LIMITED') } catch { /* already gone */ }
+          return
+        }
+        if (now - lastRateNoticeAt >= 1000) {
+          lastRateNoticeAt = now
+          send(ws, { t: 'ERROR', code: 'RATE_LIMITED', message: '消息发送过于频繁' })
+        }
+        return
+      }
+
+      // Defence-in-depth size check. The transport `maxPayload` (SECURITY-002,
+      // set in index.ts) already aborts anything larger before it is buffered,
+      // so this only fires when an operator raised WS_MAX_PAYLOAD_BYTES above
+      // the application policy limit.
       const rawStr = raw.toString()
-      if (Buffer.byteLength(rawStr) > MAX_MESSAGE_SIZE) {
+      if (Buffer.byteLength(rawStr) > WS_MAX_MESSAGE_BYTES) {
         oversizeViolations++
         send(ws, { t: 'ERROR', code: 'MESSAGE_TOO_LARGE', message: '消息过大' })
-        if (oversizeViolations >= MAX_OVERSIZE_VIOLATIONS) {
+        if (oversizeViolations >= WS_MAX_OVERSIZE_STRIKES) {
           ws.close(1009, 'TOO_MANY_OVERSIZE')
         }
         return
@@ -126,29 +268,45 @@ export function setupWS(wss: WebSocketServer) {
         // old socket lingers until an OS TCP timeout and its late 'close' event
         // would tear down this now-live session (see the guard in ws.on('close')).
         if (s.socket && s.socket !== ws) {
+          unmarkSocket(s.socket)
           try { s.socket.close(1000, 'SUPERSEDED') } catch { /* already gone */ }
         }
         s.socket = ws
-        s.lastSeen = Date.now()
+        s.lastSeen = now
         s.ip = getWSIP(req)
         session = s
+        markSocketAuthenticated(ws, s.sessionId)
 
         send(ws, {
           t: 'WELCOME',
           sessionId: session.sessionId,
           myNodeId: session.nodeId,
-          sessionExpiresAt: Date.now() + 30 * 60 * 1000,
+          // SECURITY-001: the real stored deadline, not a fresh 30 minutes
+          // computed at connect time (which silently renewed on every
+          // reconnect and never matched what the server enforced).
+          sessionExpiresAt: session.expiresAt,
         })
         updatePeakConcurrent()
         return
       }
 
-      session.lastSeen = Date.now()
+      // The session may have expired while this socket was connected. Close
+      // with 4002 so the client's existing onAuthInvalid path clears the
+      // cached session and re-registers.
+      if (isSessionExpired(session, now)) {
+        try { ws.close(4002, 'SESSION_EXPIRED') } catch { /* already gone */ }
+        return
+      }
+
+      session.lastSeen = now
       handleMessage(ws, session, msg)
     })
 
     ws.on('close', () => {
       clearTimeout(authTimer)
+      // Always drop the index entry, even on a superseded socket — the guard
+      // below returns early for those and would otherwise leak them.
+      unmarkSocket(ws)
       if (!session) return
       // A superseded socket (a reconnect already re-attached a newer ws to this
       // shared session) must NOT tear the session down. Without this guard the

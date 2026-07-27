@@ -1,6 +1,8 @@
 import { WebSocketServer, WebSocket } from 'ws'
 import { nanoid } from 'nanoid'
-import { nodes } from './store.js'
+import { authenticatedSockets } from './store.js'
+import { sendWithBackpressure } from './ws.js'
+import { ACTIVITY_MAX_PER_SEC } from './config.js'
 import type { ActivityEvent } from './types.js'
 
 let wss: WebSocketServer | null = null
@@ -9,15 +11,29 @@ export function setWSS(server: WebSocketServer) {
   wss = server
 }
 
-// Resolve the session a given WebSocket currently belongs to. We don't keep
-// a reverse map because the auth path on the same socket already stores the
-// socket onto the session — walking the (small) sessions map per broadcast
-// is cheap and avoids two sources of truth getting out of sync.
-function isAuthenticated(client: WebSocket): boolean {
-  for (const s of nodes.values()) {
-    if (s.socket === client) return true
+// Broadcast budget (SECURITY-014). Every event fans out to every
+// authenticated socket, so a join/leave/report storm multiplies straight into
+// serialize-and-send work. Events above the per-second budget are dropped —
+// activity is a decorative live feed, not a protocol guarantee.
+let windowStartedAt = 0
+let windowCount = 0
+let droppedSinceLastLog = 0
+
+function withinBudget(now: number): boolean {
+  if (now - windowStartedAt >= 1000) {
+    if (droppedSinceLastLog > 0) {
+      console.warn(`[activity] 丢弃 ${droppedSinceLastLog} 条广播（超过 ${ACTIVITY_MAX_PER_SEC}/秒 预算）`)
+      droppedSinceLastLog = 0
+    }
+    windowStartedAt = now
+    windowCount = 0
   }
-  return false
+  if (windowCount >= ACTIVITY_MAX_PER_SEC) {
+    droppedSinceLastLog++
+    return false
+  }
+  windowCount++
+  return true
 }
 
 /**
@@ -26,18 +42,28 @@ function isAuthenticated(client: WebSocket): boolean {
  * frames — they have no business knowing about the active membership, and
  * a quick reconnect-loop probe could otherwise sample the network without
  * ever proving an identity.
+ *
+ * SECURITY-014: membership used to be answered by re-scanning every session
+ * for every connected client, making one broadcast O(clients × sessions) —
+ * tens of millions of comparisons at a few thousand nodes, all on the event
+ * loop. `authenticatedSockets()` is the O(1)-per-socket index maintained by
+ * the WS AUTH/close paths, so a broadcast is now O(n) and iterates only the
+ * sockets that are actually eligible.
  */
 export function broadcast(event: Omit<ActivityEvent, 'id' | 'timestamp'>) {
   if (!wss) return
+  const now = Date.now()
+  if (!withinBudget(now)) return
+
   const msg: ActivityEvent = {
     ...event,
     id: nanoid(8),
-    timestamp: Date.now(),
+    timestamp: now,
   }
   const payload = JSON.stringify({ t: 'ACTIVITY', event: msg })
-  for (const client of wss.clients) {
+  for (const client of authenticatedSockets()) {
     if (client.readyState !== WebSocket.OPEN) continue
-    if (!isAuthenticated(client)) continue
-    client.send(payload)
+    // Slow readers must not accumulate the whole feed (SECURITY-003).
+    sendWithBackpressure(client, payload)
   }
 }

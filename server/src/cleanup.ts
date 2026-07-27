@@ -1,4 +1,5 @@
-import { nodes, channels, qrTokens, reports, attemptLocks, nodeFreezes } from './store.js'
+import { nodes, channels, qrTokens, reports, attemptLocks, nodeFreezes, isSessionExpired, unmarkSocket } from './store.js'
+import { broadcast } from './activity.js'
 import { cleanupRateLimitWindows } from './ratelimit.js'
 import {
   CLEANUP_INTERVAL_MS, DISCONNECTED_TTL_MS, LOCK_DURATION_MS, REPORT_TTL_MS,
@@ -12,14 +13,28 @@ export function startCleanupTask() {
   cleanupTimer = setInterval(() => {
     const now = Date.now()
 
-    // --- Session cleanup: any session whose socket is gone AND has been idle
-    //     past DISCONNECTED_TTL_MS gets purged, regardless of whether other
-    //     users are still online. The old "only when activeCount === 0" gate
-    //     meant a single long-lived user pinned every zombie session in the
-    //     map indefinitely, eating per-IP slots on shared egress IPs.
+    // --- Session cleanup. Two independent reasons to purge:
+    //
+    //   1. Expiry (SECURITY-001). The advertised absolute TTL is enforced
+    //      here, for CONNECTED sessions too: the socket is closed with 4002
+    //      (which the client already treats as "drop the cached session and
+    //      re-register") and the session leaves the map, so its nodeId, its
+    //      per-IP slot and every token-derived permission stop together.
+    //   2. Idle-after-disconnect: socket gone AND untouched past
+    //      DISCONNECTED_TTL_MS. The old "only when activeCount === 0" gate
+    //      meant a single long-lived user pinned every zombie session in the
+    //      map indefinitely, eating per-IP slots on shared egress IPs.
     for (const [sessionId, session] of nodes) {
-      if (session.socket !== null) continue
-      if (now - session.lastSeen < DISCONNECTED_TTL_MS) continue
+      const expired = isSessionExpired(session, now)
+      if (!expired) {
+        if (session.socket !== null) continue
+        if (now - session.lastSeen < DISCONNECTED_TTL_MS) continue
+      }
+      if (session.socket) {
+        unmarkSocket(session.socket)
+        try { session.socket.close(4002, 'SESSION_EXPIRED') } catch { /* already gone */ }
+        session.socket = null
+      }
       nodes.delete(sessionId)
       if (session.channelId) {
         const ch = channels.get(session.channelId)
@@ -27,6 +42,9 @@ export function startCleanupTask() {
           ch.delete(sessionId)
           if (ch.size === 0) channels.delete(session.channelId)
         }
+      }
+      if (expired) {
+        broadcast({ type: 'leave', nodeId: session.nodeId, message: `御坂 ${session.nodeId} 号通信终止` })
       }
     }
 

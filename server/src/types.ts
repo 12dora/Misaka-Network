@@ -15,6 +15,12 @@ export interface NodeSession {
   failedAttempts: number
   lockedUntil: number
   joinedAt: number
+  // Absolute session expiry (SECURITY-001). Stamped once at register time
+  // from SESSION_TTL_MS and never extended — reconnecting with the same token
+  // does not buy more time. Every token resolution, WS frame and cleanup pass
+  // compares against this, so HTTP, WS, QR, TURN and release permissions all
+  // stop at the same instant.
+  expiresAt: number
   ip: string
 }
 
