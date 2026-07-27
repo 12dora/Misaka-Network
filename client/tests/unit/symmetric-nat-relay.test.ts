@@ -74,7 +74,19 @@ describe('symmetric NAT → auto force-relay', () => {
   })
 
   it('manual forceRelay still wins even when NAT is unknown', () => {
-    saveTurnSettings({ enabled: false, forceRelay: true, servers: [] })
+    // BUG-008: force-relay is only satisfiable when a TURN server is actually
+    // reachable, so the fixture now seeds one. (Relay policy with a STUN-only
+    // list guarantees ICE failure and is refused — see
+    // turn-config-propagation.test.ts.) The point of THIS case is unchanged:
+    // an explicit user toggle is not overridden by the NAT verdict.
+    saveTurnSettings({
+      enabled: true,
+      forceRelay: true,
+      servers: [{
+        id: 's1', url: 'turn:turn.example.com:3478',
+        username: 'u', credential: 'c', enabled: true,
+      }],
+    })
     setDetectedNatType('unknown')
 
     expect(buildIceConfig().iceTransportPolicy).toBe('relay')

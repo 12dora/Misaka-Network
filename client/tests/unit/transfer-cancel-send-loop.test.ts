@@ -35,9 +35,19 @@ vi.mock('../../src/lib/crypto', async () => {
 
 import { sendFileParallel, cancelTransfer, cancelReceive, TransferCancelledError, CHUNK_SIZE } from '../../src/lib/transfer'
 
+// TEST-001: the cancel used to be scheduled off a fixed `setTimeout(25)`, which
+// races the scheduler — under a loaded parallel suite the send loop had not
+// shipped a single chunk yet and the "sent > 0" assertion failed on a correct
+// implementation. The fake channel now exposes a barrier that resolves the
+// moment a real chunk is observed on the wire, so the cancel is ordered by the
+// thing it actually depends on rather than by wall-clock luck.
 function makeFakeDc() {
   const sent: ArrayBuffer[] = []
   const strings: string[] = []
+  let signalFirstChunk: () => void
+  const firstChunkSent = new Promise<void>(resolve => {
+    signalFirstChunk = resolve
+  })
   return {
     readyState: 'open' as RTCDataChannelState,
     bufferedAmount: 0,
@@ -46,13 +56,27 @@ function makeFakeDc() {
     label: 'misaka-transfer-0',
     send: vi.fn((p: ArrayBuffer | string) => {
       if (typeof p === 'string') strings.push(p)
-      else sent.push(p)
+      else {
+        sent.push(p)
+        signalFirstChunk()
+      }
     }),
     addEventListener() {},
     removeEventListener() {},
     _sent: sent,
     _strings: strings,
+    _firstChunkSent: firstChunkSent,
   }
+}
+
+// Bounded wait: a hang must fail loudly as a hang, not time out the whole file.
+function withDeadline<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`timed out after ${ms}ms waiting for ${what}`)), ms),
+    ),
+  ])
 }
 
 describe('cancelTransfer actually stops the send loop', () => {
@@ -71,11 +95,12 @@ describe('cancelTransfer actually stops the send loop', () => {
       undefined,
     )
 
-    // Let a few chunks go out, then cancel exactly as cancelTransferAction does:
-    // engineCancelTransfer(id) followed immediately by cancelReceive(id). The
-    // latter must NOT delete the send transfer's signal, or the loop would never
-    // observe the cancel (the original bug, in a different disguise).
-    await new Promise(r => setTimeout(r, 25))
+    // Wait until the loop has demonstrably shipped a chunk, then cancel exactly
+    // as cancelTransferAction does: engineCancelTransfer(id) followed immediately
+    // by cancelReceive(id). The latter must NOT delete the send transfer's
+    // signal, or the loop would never observe the cancel (the original bug, in a
+    // different disguise).
+    await withDeadline(dc._firstChunkSent, 5_000, 'the first chunk to reach the channel')
     cancelTransfer('tid-cancel')
     void cancelReceive('tid-cancel')
 

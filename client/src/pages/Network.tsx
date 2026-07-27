@@ -7,7 +7,10 @@ import MisakaProgressBar from '@/components/ui/MisakaProgressBar'
 import AppFooter from '@/components/ui/AppFooter'
 import QRModal from '@/components/features/QRModal'
 import SettingsModal from '@/components/features/SettingsModal'
-import { useNetworkStore, isLikelyUnreachable } from '@/store/network'
+import {
+  useNetworkStore, isLikelyUnreachable,
+  deriveNetworkStatus, networkStatusLabel, peerDisplayStatus,
+} from '@/store/network'
 import { useAuthStore } from '@/store/auth'
 import { appUrl } from '@/lib/appBase'
 import { authedFetch, AuthRequiredError } from '@/lib/api'
@@ -60,12 +63,23 @@ function NodeRadar({ peers, selected, unreadByPeer, onSelect, onShowQR, onCopyLi
   onShowQR: () => void
   onCopyLink: () => void
 }) {
+  // UX-COPY-003: the badge shows peer TRANSPORT state; "正在传输" is a fact
+  // about the transfer layer, so it is derived here rather than baked into
+  // `Peer.status` by the store.
+  const transfers = useNetworkStore(s => s.transfers)
+  const signalingStatus = useNetworkStore(s => s.signalingStatus)
+  const status = deriveNetworkStatus({ signalingStatus, peers, transfers })
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center gap-2 mb-1">
         <MisakaKanjiBlock char="点" size="sm" />
         <span className="font-kanji font-bold text-white text-sm">节点雷达</span>
-        <span className="font-kanji text-xs text-[var(--text-on-blue-2)] ml-1">发现同身份设备</span>
+        {/* UX-COPY-003: one honest status, derived from the layer that
+            actually explains it (signaling → peer transport → transfer)
+            instead of a blanket "已接入". */}
+        <span className="font-kanji text-xs text-[var(--text-on-blue-2)] ml-1">
+          发现同身份设备 · {networkStatusLabel(status)}
+        </span>
       </div>
       <div className="w-12 h-0.5 ml-[calc(1.25rem+0.5rem)]" style={{ background: 'var(--accent-cyan)' }} />
 
@@ -114,7 +128,7 @@ function NodeRadar({ peers, selected, unreadByPeer, onSelect, onShowQR, onCopyLi
                 <div className="absolute left-0 top-3 bottom-3 w-1 rounded-r" style={{ background: 'var(--bg-deep)' }} />
               )}
               <div className="flex items-center gap-2 mb-2 pl-2">
-                <MisakaStatusBadge status={peer.status} />
+                <MisakaStatusBadge status={peerDisplayStatus(peer, transfers)} />
                 <span className="font-kanji font-bold text-sm text-[var(--text-on-white)] ml-auto">
                   御坂 {peer.nodeId} 号
                   <span className="ml-1 font-mono text-[10px] text-[var(--text-muted)]">#{sidTag}</span>
@@ -173,6 +187,11 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
   const clearPendingFiles = useNetworkStore(s => s.clearPendingFiles)
   const retryChatMessage = useNetworkStore(s => s.retryChatMessage)
   const isSending = useNetworkStore(s => s.sendingPeers.has(peerSessionId))
+  // UX-COPY-003: the empty-channel line used to claim "[已连接] 人格连接已建立"
+  // regardless of whether the peer transport was actually up. Read the real
+  // per-peer transport state and say what is true.
+  const peerStatus = useNetworkStore(s =>
+    s.peers.find(p => p.sessionId === peerSessionId)?.status ?? 'offline')
   const bottomRef = useRef<HTMLDivElement>(null)
   const [downloadedIds, setDownloadedIds] = useState<Set<string>>(new Set())
 
@@ -209,7 +228,13 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
       {messages.length === 0 && recvTransfers.length === 0 && pendingFiles.length === 0 && (
         <div className="font-kanji text-xs text-[var(--text-on-white-2)]">
           <span className="font-mono mr-2 text-[var(--accent-cyan)]">▸</span>
-          [已连接] 人格连接已建立
+          {peerStatus === 'online' || peerStatus === 'transferring'
+            ? '连接成功。现在可以发送消息或文件。'
+            : peerStatus === 'reconnecting'
+              ? '正在重新连接，稍后即可发送消息或文件。'
+              : peerStatus === 'offline'
+                ? '尚未连接。请检查网络，或点击上方的重连。'
+                : '正在连接…'}
         </div>
       )}
       {messages.map(m => {
@@ -889,9 +914,19 @@ export default function Network() {
   const store = useNetworkStore()
 
   useEffect(() => {
-    if (auth.session?.token && !store.wsConnected) {
-      store.init(auth.session.token)
+    const token = auth.session?.token
+    if (!token) {
+      // BUG-001 / BUG-002: the auth session ended (explicit Disconnect, or a
+      // 4001/4002 invalidation) — the network epoch must end with it instead
+      // of keeping peer connections, keys and transfers alive on a dead
+      // identity. destroy() is idempotent.
+      useNetworkStore.getState().destroy()
+      return
     }
+    // init() handles "same token, already running" itself. It used to be
+    // skipped whenever the OLD socket still reported wsConnected, which is
+    // exactly how a fresh token failed to start a fresh epoch.
+    useNetworkStore.getState().init(token)
   }, [auth.session?.token])
 
   useEffect(() => {

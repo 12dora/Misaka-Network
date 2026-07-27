@@ -30,18 +30,58 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
   Object.defineProperty(window, 'localStorage', { value: shim, configurable: true, writable: true })
 })()
 
+// TEST-008: the "TURN disabled" contract used to be asserted with only a
+// MANUAL server seeded, which `getTurnIceServers()` filters out on its own —
+// the test passed without ever exercising the auto-TURN path that production
+// always injected. Mock the credential endpoint so we can put real
+// server-issued creds in the cache and prove the master switch kills those
+// too.
+vi.mock('@/lib/api', () => ({
+  AuthRequiredError: class AuthRequiredError extends Error {},
+  authedFetch: vi.fn(async () => autoTurnResponse()),
+}))
+
+const AUTO_TURN_URL = 'turn:auto.example.com:3478'
+
+function autoTurnResponse(): Response {
+  return {
+    ok: true,
+    status: 200,
+    json: async () => ({
+      enabled: true,
+      iceServers: [{ urls: AUTO_TURN_URL, username: 'auto-u', credential: 'auto-c' }],
+      expiresAt: Date.now() + 600_000,
+    }),
+  } as unknown as Response
+}
+
 import {
   loadTurnSettings, saveTurnSettings,
-  onTurnConfigChange,
+  onTurnConfigChange, refreshAutoTurn, clearAutoTurn, getAutoTurnIceServers,
 } from '../../src/lib/turn'
-import { buildIceConfig, applyIceConfigToAll } from '../../src/lib/webrtc'
+import { buildIceConfig, applyIceConfigToAll, isRelayAllowed, hasUsableTurnServer } from '../../src/lib/webrtc'
+import { setDetectedNatType } from '../../src/lib/nat'
+
+function turnUrlsIn(cfg: RTCConfiguration): string[] {
+  return (cfg.iceServers ?? [])
+    .flatMap(s => Array.isArray(s.urls) ? s.urls : [s.urls])
+    .map(String)
+    .filter(u => u.startsWith('turn:') || u.startsWith('turns:'))
+}
 
 beforeEach(() => {
   localStorage.clear()
+  clearAutoTurn()
+  setDetectedNatType('unknown')
 })
 
 describe('turnSettings.enabled = false (CLAUDE.md contract)', () => {
-  it('omits both auto and manual TURN servers from the ICE config', () => {
+  it('omits both auto and manual TURN servers from the ICE config', async () => {
+    // Seed a real, unexpired auto-TURN credential first — this is the case
+    // the old test never covered (TEST-008).
+    await refreshAutoTurn()
+    expect(getAutoTurnIceServers().length).toBe(1)
+
     saveTurnSettings({
       enabled: false,
       forceRelay: false,
@@ -58,6 +98,25 @@ describe('turnSettings.enabled = false (CLAUDE.md contract)', () => {
     // STUN may still be present — only TURN must be excluded.
     expect(urls.some(u => String(u).startsWith('turn:'))).toBe(false)
     expect(urls.some(u => String(u).startsWith('turns:'))).toBe(false)
+    expect(isRelayAllowed()).toBe(false)
+  })
+
+  it('keeps server-issued auto TURN when the user has never opened Settings', async () => {
+    // No stored record at all: `enabled:false` is only the struct default, not
+    // an opt-out. The server is the canonical gate for auto TURN (budget +
+    // kill-switch), so it must still reach the ICE config out of the box.
+    await refreshAutoTurn()
+    expect(turnUrlsIn(buildIceConfig())).toEqual([AUTO_TURN_URL])
+    expect(isRelayAllowed()).toBe(true)
+  })
+
+  it('re-enabling the master switch brings auto TURN back', async () => {
+    await refreshAutoTurn()
+    saveTurnSettings({ enabled: false, forceRelay: false, servers: [] })
+    expect(turnUrlsIn(buildIceConfig())).toEqual([])
+
+    saveTurnSettings({ enabled: true, forceRelay: false, servers: [] })
+    expect(turnUrlsIn(buildIceConfig())).toEqual([AUTO_TURN_URL])
   })
 
   it('includes manual TURN when enabled = true', () => {
@@ -75,12 +134,39 @@ describe('turnSettings.enabled = false (CLAUDE.md contract)', () => {
   })
 })
 
+describe('force-relay is refused when there is no reachable TURN (BUG-008)', () => {
+  it('relay-only + zero TURN servers is downgraded to iceTransportPolicy=all', () => {
+    // A 'relay' policy with a STUN-only server list can never produce a
+    // candidate — every connection would be guaranteed to fail. Refuse it.
+    saveTurnSettings({ enabled: true, forceRelay: true, servers: [] })
+    expect(hasUsableTurnServer()).toBe(false)
+    expect(buildIceConfig().iceTransportPolicy).toBe('all')
+  })
+
+  it('force-relay is also refused when the master switch hid the only TURN', async () => {
+    await refreshAutoTurn()
+    saveTurnSettings({ enabled: false, forceRelay: true, servers: [] })
+    expect(hasUsableTurnServer()).toBe(false)
+    expect(buildIceConfig().iceTransportPolicy).toBe('all')
+  })
+
+  it('force-relay is honoured once a usable TURN exists', () => {
+    saveTurnSettings({
+      enabled: true, forceRelay: true,
+      servers: [{ id: 'm1', url: 'turn:t.example.com:3478', username: 'u', credential: 'c', enabled: true }],
+    })
+    expect(hasUsableTurnServer()).toBe(true)
+    expect(buildIceConfig().iceTransportPolicy).toBe('relay')
+  })
+})
+
 describe('force-relay toggle propagates to live PCs', () => {
-  it('saveTurnSettings → buildIceConfig reflects forceRelay immediately', () => {
-    saveTurnSettings({ enabled: false, forceRelay: false, servers: [] })
+  it('saveTurnSettings → buildIceConfig reflects forceRelay immediately', async () => {
+    await refreshAutoTurn()
+    saveTurnSettings({ enabled: true, forceRelay: false, servers: [] })
     expect(buildIceConfig().iceTransportPolicy).toBe('all')
 
-    saveTurnSettings({ enabled: false, forceRelay: true, servers: [] })
+    saveTurnSettings({ enabled: true, forceRelay: true, servers: [] })
     expect(buildIceConfig().iceTransportPolicy).toBe('relay')
   })
 
@@ -99,8 +185,9 @@ describe('force-relay toggle propagates to live PCs', () => {
     off()
   })
 
-  it('applyIceConfigToAll calls setConfiguration on every non-closed PC with the current config', () => {
-    saveTurnSettings({ enabled: false, forceRelay: false, servers: [] })
+  it('applyIceConfigToAll calls setConfiguration on every non-closed PC with the current config', async () => {
+    await refreshAutoTurn()
+    saveTurnSettings({ enabled: true, forceRelay: false, servers: [] })
 
     const pcOpen: any = {
       connectionState: 'connected',
@@ -111,13 +198,45 @@ describe('force-relay toggle propagates to live PCs', () => {
       setConfiguration: vi.fn(),
     }
 
-    saveTurnSettings({ enabled: false, forceRelay: true, servers: [] })
+    saveTurnSettings({ enabled: true, forceRelay: true, servers: [] })
     applyIceConfigToAll([pcOpen, pcClosed])
 
     expect(pcOpen.setConfiguration).toHaveBeenCalledTimes(1)
     const passed = pcOpen.setConfiguration.mock.calls[0][0] as RTCConfiguration
     expect(passed.iceTransportPolicy).toBe('relay')
     expect(pcClosed.setConfiguration).not.toHaveBeenCalled()
+  })
+
+  // BUG-009: `setConfiguration()` alone never migrates the *already selected*
+  // candidate pair — the peers keep using the old path until something else
+  // restarts ICE. applyIceConfigToAll therefore reports which live PCs saw a
+  // materially different config so the caller can schedule an ICE restart.
+  it('reports the PCs whose effective ICE config actually changed', async () => {
+    await refreshAutoTurn()
+    saveTurnSettings({ enabled: true, forceRelay: false, servers: [] })
+
+    const pc: any = { connectionState: 'connected', setConfiguration: vi.fn() }
+
+    // First application only records a baseline — nothing to migrate yet.
+    expect(applyIceConfigToAll([pc])).toEqual([])
+
+    saveTurnSettings({ enabled: true, forceRelay: true, servers: [] })
+    expect(applyIceConfigToAll([pc])).toEqual([pc])
+
+    // Re-applying the same config is a no-op for migration purposes.
+    expect(applyIceConfigToAll([pc])).toEqual([])
+  })
+
+  it('reports a change when the TURN server set rotates but the policy does not', async () => {
+    saveTurnSettings({ enabled: true, forceRelay: false, servers: [] })
+    const pc: any = { connectionState: 'connected', setConfiguration: vi.fn() }
+    applyIceConfigToAll([pc])
+
+    saveTurnSettings({
+      enabled: true, forceRelay: false,
+      servers: [{ id: 'm1', url: 'turn:new.example.com:3478', username: 'u', credential: 'c', enabled: true }],
+    })
+    expect(applyIceConfigToAll([pc])).toEqual([pc])
   })
 
   it('swallows setConfiguration errors so one bad PC does not stop the others', () => {
