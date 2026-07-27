@@ -166,7 +166,7 @@ describe('AES-GCM round-trip with makeChunkIv', () => {
 
     for (let i = 0; i < plaintexts.length; i++) {
       const iv = makeChunkIv(prefix, i)
-      const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plaintexts[i])
+      const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, Uint8Array.from(plaintexts[i]))
       const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct)
       // Compare via plain arrays — vitest's toEqual treats Uint8Arrays from
       // different ArrayBuffer realms (jsdom global vs Node global) as

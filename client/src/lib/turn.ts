@@ -1,5 +1,6 @@
 import { apiUrl } from '@/config'
 import { authedFetch, AuthRequiredError } from '@/lib/api'
+import { isE2eHostIceOnly } from './e2e-ice'
 
 const STORAGE_KEY = 'misaka.turnServers'
 
@@ -44,23 +45,14 @@ interface AutoTurnResponse {
   reason?: string
 }
 
-interface TurnStatusResponse {
+export interface TurnStatusResponse {
   enabled: boolean
   configured: boolean
   provider: string
   credentialTtlSec: number
-  monthKey: string
-  monthlyBytesUsed: number
-  monthlyBytesEffective: number
-  monthlyUsageSource: 'cloudflare' | 'pessimistic'
-  lastCfSyncError?: string
-  monthlyBytesLimit: number
-  percentUsed: number
-  thresholdPct: number
-  killSwitchActive: boolean
-  killSwitchTriggeredAt: number
-  lastCfSyncAt: number
-  activeCredentials: number
+  available: boolean
+  reason?: string
+  detailed: false
 }
 
 let autoTurn: AutoTurnState | null = null
@@ -126,7 +118,12 @@ export function getTurnIceServers(): RTCIceServer[] {
   const t = loadTurnSettings()
   if (!t.enabled) return []
   return t.servers
-    .filter(s => s.enabled)
+    .filter(s =>
+      s.enabled
+      && isValidTurnUrl(s.url)
+      && s.username.trim().length > 0
+      && s.credential.length > 0,
+    )
     .map(s => ({
       urls: s.url,
       username: s.username || undefined,
@@ -197,6 +194,9 @@ async function fetchAutoTurnOnce(): Promise<AutoTurnState | null> {
 }
 
 export async function refreshAutoTurn(): Promise<RTCIceServer[]> {
+  // Playwright's paired Chromium contexts are intentionally host-only. Do
+  // not hit /turn-credentials or arm background retries in that environment.
+  if (isE2eHostIceOnly()) return []
   if (inFlight) return (await inFlight)?.iceServers ?? []
 
   inFlight = fetchAutoTurnOnce()
@@ -297,6 +297,7 @@ export type TurnTestCode =
   | 'INVALID_URL'       // not a turn:/turns: URL we can hand to the browser
   | 'WEBRTC_UNAVAILABLE'// RTCPeerConnection missing or blocked
   | 'SETUP_FAILED'      // constructor / createOffer / setLocalDescription threw
+  | 'TEST_MODE_BLOCKED' // deterministic host-only E2E refuses external relay probes
 
 export interface TurnTestResult {
   reachable: boolean
@@ -307,7 +308,7 @@ export interface TurnTestResult {
   detail?: string
 }
 
-const TURN_URL_RE = /^turns?:[^\s]+$/i
+const DIAGNOSTIC_DEADLINE_MS = 5_000
 
 const TEST_MESSAGES: Record<TurnTestCode, string> = {
   RELAY_OK: '可达，已成功获取中继候选',
@@ -315,10 +316,93 @@ const TEST_MESSAGES: Record<TurnTestCode, string> = {
   INVALID_URL: '地址格式无效。应形如 turn:example.com:3478?transport=udp。',
   WEBRTC_UNAVAILABLE: '当前浏览器不可用 WebRTC，无法测试。请更换浏览器或关闭相关隐私屏蔽后重试。',
   SETUP_FAILED: '测试无法启动。请检查地址格式后重试。',
+  TEST_MODE_BLOCKED: '端到端测试模式已禁用外部 TURN 诊断，以保持同机连接测试确定性。',
 }
 
 export function describeTurnTest(code: TurnTestCode): string {
   return TEST_MESSAGES[code]
+}
+
+export function isValidTurnUrl(value: string): boolean {
+  const input = value.trim()
+  const match = /^(turn|turns):(.+)$/i.exec(input)
+  if (!match) return false
+
+  const target = match[2]
+  if (
+    target.startsWith('//')
+    || /[\s/@#\\%]/.test(target)
+    || target.split('?').length > 2
+  ) return false
+
+  const [hostPort, rawQuery] = target.split('?')
+  if (!hostPort) return false
+  if (rawQuery !== undefined) {
+    // Accept one exact supported parameter. URLSearchParams would otherwise
+    // hide empty segments (`&&` or trailing `&`) during normalization.
+    if (!/^transport=(udp|tcp)$/i.test(rawQuery)) return false
+  }
+
+  let host: string
+  let portText: string | undefined
+  if (hostPort.startsWith('[')) {
+    const ipv6 = /^\[([0-9a-f:.]+)\](?::(\d+))?$/i.exec(hostPort)
+    if (!ipv6) return false
+    host = `[${ipv6[1]}]`
+    portText = ipv6[2]
+    try {
+      const parsed = new URL(`http://${host}`)
+      // WHATWG canonicalizes equivalent IPv6 spellings (zero compression,
+      // leading zeros, and dotted IPv4 tails). Parseability is the security
+      // boundary here; textual equality would reject those legal forms.
+      // The authority regex and the global `%/@#\\` rejection above already
+      // exclude credentials, encoded delimiters, paths and zone identifiers.
+      if (
+        parsed.protocol !== 'http:'
+        || !parsed.hostname.startsWith('[')
+        || !parsed.hostname.endsWith(']')
+        || parsed.username
+        || parsed.password
+        || parsed.port
+        || parsed.pathname !== '/'
+        || parsed.search
+        || parsed.hash
+      ) return false
+    } catch {
+      return false
+    }
+  } else {
+    const authority = /^([^:]+)(?::(\d+))?$/.exec(hostPort)
+    if (!authority) return false
+    host = authority[1]
+    portText = authority[2]
+    if (host.length > 253 || host.startsWith('.') || host.endsWith('.')) return false
+    const labels = host.split('.')
+    if (labels.some(label =>
+      label.length < 1
+      || label.length > 63
+      || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label),
+    )) return false
+    if (labels.every(label => /^\d+$/.test(label))) {
+      if (labels.length !== 4 || labels.some(label => Number(label) > 255)) return false
+    }
+  }
+
+  if (portText !== undefined) {
+    const port = Number(portText)
+    if (!Number.isInteger(port) || port < 1 || port > 65_535) return false
+  }
+  return true
+}
+
+function deadline<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('DIAGNOSTIC_TIMEOUT')), ms)
+    promise.then(
+      value => { clearTimeout(timer); resolve(value) },
+      error => { clearTimeout(timer); reject(error) },
+    )
+  })
 }
 
 /**
@@ -326,13 +410,21 @@ export function describeTurnTest(code: TurnTestCode): string {
  * result the UI can turn into a recovery hint.
  */
 export async function testTurnServerDetailed(server: TurnServer): Promise<TurnTestResult> {
-  if (!TURN_URL_RE.test((server.url ?? '').trim())) {
+  if (isE2eHostIceOnly()) {
+    return {
+      reachable: false,
+      code: 'TEST_MODE_BLOCKED',
+      message: TEST_MESSAGES.TEST_MODE_BLOCKED,
+    }
+  }
+  if (!isValidTurnUrl(server.url ?? '')) {
     return { reachable: false, code: 'INVALID_URL', message: TEST_MESSAGES.INVALID_URL }
   }
   if (typeof RTCPeerConnection === 'undefined') {
     return { reachable: false, code: 'WEBRTC_UNAVAILABLE', message: TEST_MESSAGES.WEBRTC_UNAVAILABLE }
   }
 
+  const expiresAt = Date.now() + DIAGNOSTIC_DEADLINE_MS
   let pc: RTCPeerConnection
   try {
     pc = new RTCPeerConnection({
@@ -350,8 +442,10 @@ export async function testTurnServerDetailed(server: TurnServer): Promise<TurnTe
 
   try {
     pc.createDataChannel('test')
-    const offer = await pc.createOffer()
-    await pc.setLocalDescription(offer)
+    await deadline((async () => {
+      const offer = await pc.createOffer()
+      await pc.setLocalDescription(offer)
+    })(), Math.max(0, expiresAt - Date.now()))
   } catch (err) {
     try { pc.close() } catch { /* ignore */ }
     return {
@@ -362,7 +456,7 @@ export async function testTurnServerDetailed(server: TurnServer): Promise<TurnTe
     }
   }
 
-  const reachable = await waitForRelayCandidate(pc)
+  const reachable = await waitForRelayCandidate(pc, expiresAt)
   return reachable
     ? { reachable: true, code: 'RELAY_OK', message: TEST_MESSAGES.RELAY_OK }
     : { reachable: false, code: 'NO_RELAY', message: TEST_MESSAGES.NO_RELAY }
@@ -373,17 +467,10 @@ export async function testTurnServerDetailed(server: TurnServer): Promise<TurnTe
  * working; new code should prefer `testTurnServerDetailed`.
  */
 export async function testTurnServer(server: TurnServer): Promise<boolean> {
-  const pc = new RTCPeerConnection({
-    iceServers: [{ urls: server.url, username: server.username, credential: server.credential }],
-    iceTransportPolicy: 'relay',
-  })
-  pc.createDataChannel('test')
-  const offer = await pc.createOffer()
-  await pc.setLocalDescription(offer)
-  return waitForRelayCandidate(pc)
+  return (await testTurnServerDetailed(server)).reachable
 }
 
-function waitForRelayCandidate(pc: RTCPeerConnection): Promise<boolean> {
+function waitForRelayCandidate(pc: RTCPeerConnection, expiresAt: number): Promise<boolean> {
   return new Promise(resolve => {
     // P2-7: detach every listener before close() so a late candidate event
     // doesn't keep the RTCPeerConnection (and its underlying ICE agent)
@@ -400,7 +487,7 @@ function waitForRelayCandidate(pc: RTCPeerConnection): Promise<boolean> {
       try { pc.close() } catch { /* ignore */ }
       resolve(verdict)
     }
-    const timeout = setTimeout(() => teardown(false), 5000)
+    const timeout = setTimeout(() => teardown(false), Math.max(0, expiresAt - Date.now()))
     pc.onicecandidate = e => {
       if (e.candidate?.candidate.includes(' typ relay ')) {
         clearTimeout(timeout)

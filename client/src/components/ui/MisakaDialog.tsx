@@ -80,18 +80,29 @@ function focusableWithin(root: HTMLElement): HTMLElement[] {
 // than toggled per-dialog — otherwise closing the inner dialog would
 // un-hide the page while the outer one is still open.
 const dialogStack: HTMLElement[] = []
+const backgroundState = new Map<HTMLElement, { inert: string | null; ariaHidden: string | null }>()
 
 function setInert(el: HTMLElement, on: boolean) {
   if (on) {
-    if (el.getAttribute('inert') !== null && el.getAttribute('aria-hidden') === 'true') return
+    if (!backgroundState.has(el)) {
+      backgroundState.set(el, {
+        inert: el.getAttribute('inert'),
+        ariaHidden: el.getAttribute('aria-hidden'),
+      })
+    }
     el.setAttribute('aria-hidden', 'true')
     // `inert` also removes the subtree from the tab order and from hit
     // testing in browsers that ship it; aria-hidden alone leaves the
     // background keyboard-reachable.
     el.setAttribute('inert', '')
   } else {
-    el.removeAttribute('aria-hidden')
-    el.removeAttribute('inert')
+    const original = backgroundState.get(el)
+    if (!original) return
+    if (original.ariaHidden === null) el.removeAttribute('aria-hidden')
+    else el.setAttribute('aria-hidden', original.ariaHidden)
+    if (original.inert === null) el.removeAttribute('inert')
+    else el.setAttribute('inert', original.inert)
+    backgroundState.delete(el)
   }
 }
 
@@ -150,8 +161,11 @@ export default function MisakaDialog({
     return () => {
       const idx = dialogStack.indexOf(host)
       if (idx >= 0) dialogStack.splice(idx, 1)
-      host.remove()
       syncBackground()
+      // A host being removed may still have been inert while another dialog
+      // was above it. Restore and forget its snapshot before detaching.
+      setInert(host, false)
+      host.remove()
       // Focus restoration — without this the user is dumped at the top of
       // the (previously inert) page with no idea where they were.
       const restore = restoreFocusRef.current
@@ -173,10 +187,18 @@ export default function MisakaDialog({
     return () => cancelAnimationFrame(id)
   }, [initialFocusRef])
 
-  // Focus containment. Escape is handled by `useModalExit` in the consumer
-  // (it owns the exit animation), so we only deal with Tab here.
+  // Focus containment + top-of-stack Escape. Handling Escape here gives
+  // direct consumers (IpFullPrompt) the same behavior as animated modals and
+  // prevents one keypress reaching every window listener in a dialog stack.
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
+      if (e.key === 'Escape') {
+        if (dialogStack[dialogStack.length - 1] !== hostRef.current) return
+        e.preventDefault()
+        e.stopImmediatePropagation()
+        onRequestClose()
+        return
+      }
       if (e.key !== 'Tab') return
       const panel = panelRef.current
       if (!panel) return
@@ -208,7 +230,7 @@ export default function MisakaDialog({
     }
     document.addEventListener('keydown', onKeyDown, true)
     return () => document.removeEventListener('keydown', onKeyDown, true)
-  }, [])
+  }, [onRequestClose])
 
   const host = hostRef.current
   if (!host) return null

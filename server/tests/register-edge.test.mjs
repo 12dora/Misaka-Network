@@ -23,10 +23,9 @@
  * Usage:  node tests/register-edge.test.mjs
  */
 
-import { spawn } from 'child_process'
 import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
-import { runTest, killChild } from './_harness.mjs'
+import { runTest, killChild, spawn, waitForTestServer } from './_harness.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const SERVER_DIR = join(__dirname, '..')
@@ -152,7 +151,7 @@ async function testBearerProtected() {
   assert(reg.token, '注册成功')
 
   const endpoints = [
-    ['GET',  '/qr-token'],
+    ['POST', '/qr-token'],
     ['GET',  '/turn-credentials'],
   ]
   for (const [method, path] of endpoints) {
@@ -201,10 +200,8 @@ function assertEq(actual, expected, msg) {
   if (actual !== expected) throw new Error(`${msg}: 期望 ${JSON.stringify(expected)}, 实际 ${JSON.stringify(actual)}`)
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
-
 function startServer() {
-  const proc = spawn('npx', ['tsx', 'src/index.ts'], {
+  const proc = spawn('node', ['dist/index.js'], {
     cwd: SERVER_DIR,
     env: { ...process.env, PORT: String(PORT), MAX_NODES: '200', TURN_AUTO_ENABLED: 'false' },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -217,12 +214,5 @@ function startServer() {
 }
 
 async function waitForServer() {
-  for (let i = 0; i < 25; i++) {
-    try {
-      const res = await fetch(`${BASE}/health`)
-      if (res.ok) return
-    } catch { /* not ready */ }
-    await sleep(300)
-  }
-  throw new Error('服务器启动超时')
+  await waitForTestServer(serverProcess, `${BASE}/health`, { timeoutMs: 7_500 })
 }

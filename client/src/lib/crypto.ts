@@ -24,13 +24,17 @@ function stateFor(peerSessionId: string): PeerCryptoState {
 
 export async function generateECDHKeyPair(peerSessionId: string): Promise<CryptoKeyPair> {
   const state = stateFor(peerSessionId)
-  state.myKeyPair = await crypto.subtle.generateKey(
+  const keyPair = await crypto.subtle.generateKey(
     { name: 'ECDH', namedCurve: 'P-256' },
     false,
     ['deriveKey'],
   )
+  // resetCrypto(peer) may have ended this generation while generateKey was
+  // in flight. Never publish a keypair into a detached state object.
+  if (peerStates.get(peerSessionId) !== state) return keyPair
+  state.myKeyPair = keyPair
   state.aesKey = null
-  return state.myKeyPair
+  return keyPair
 }
 
 export async function getMyPublicKey(peerSessionId: string): Promise<string> {
@@ -43,15 +47,20 @@ export async function getMyPublicKey(peerSessionId: string): Promise<string> {
 export async function setPeerPublicKey(peerSessionId: string, peerPubBase64: string) {
   const state = stateFor(peerSessionId)
   if (!state.myKeyPair) throw new Error('ECDH keypair not generated')
+  const keyPair = state.myKeyPair
+  const stillCurrent = () =>
+    peerStates.get(peerSessionId) === state
+    && state.myKeyPair === keyPair
   const buf = Uint8Array.from(atob(peerPubBase64), c => c.charCodeAt(0)) as unknown as Uint8Array<ArrayBuffer>
   const peerPub = await crypto.subtle.importKey(
     'raw', buf,
     { name: 'ECDH', namedCurve: 'P-256' },
     false, [],
   )
-  state.aesKey = await crypto.subtle.deriveKey(
+  if (!stillCurrent()) return
+  const aesKey = await crypto.subtle.deriveKey(
     { name: 'ECDH', public: peerPub },
-    state.myKeyPair.privateKey,
+    keyPair.privateKey,
     { name: 'AES-GCM', length: 256 },
     // CryptoKey must be extractable=false but workers receive a structured
     // clone, which preserves the same usage flags. extractable=true would
@@ -59,7 +68,13 @@ export async function setPeerPublicKey(peerSessionId: string, peerPubBase64: str
     false,
     ['encrypt', 'decrypt'],
   )
-  registerPeerKey(peerSessionId, state.aesKey)
+  if (!stillCurrent()) return
+  state.aesKey = aesKey
+  // No await separates the state commit and pool registration, but keep the
+  // identity check adjacent to the external side effect so a later refactor
+  // cannot accidentally publish a detached generation.
+  if (!stillCurrent() || state.aesKey !== aesKey) return
+  registerPeerKey(peerSessionId, aesKey)
 }
 
 export function hasAESKey(peerSessionId: string): boolean {

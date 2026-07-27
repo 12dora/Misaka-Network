@@ -10,7 +10,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 // Avoid pulling in the real signaling module (WebSocket side effects on import).
 vi.mock('../../src/lib/signaling', () => ({ onAuthInvalid: vi.fn() }))
 
-const fetchSpy = vi.fn(async () => new Response(
+const fetchSpy = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(
   JSON.stringify({ token: 't-1', sessionId: 's-1', expiresAt: Date.now() + 60_000, resumed: false }),
   { status: 200, headers: { 'Content-Type': 'application/json' } },
 ))
@@ -42,5 +42,15 @@ describe('connect() dedupes concurrent callers', () => {
     await store.connect()
     const registerCalls = fetchSpy.mock.calls.filter(([url]) => String(url).includes('/api/register'))
     expect(registerCalls.length).toBe(1)
+  })
+
+  it('forwards a QR admission grant only on the registration that commits it', async () => {
+    const store = useAuthStore.getState()
+    await store.connect({ admissionGrant: 'g'.repeat(64) })
+
+    const [, init] = fetchSpy.mock.calls.find(([url]) => String(url).includes('/api/register'))!
+    expect(JSON.parse(String(init?.body))).toMatchObject({
+      admissionGrant: 'g'.repeat(64),
+    })
   })
 })

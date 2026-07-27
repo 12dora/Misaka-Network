@@ -6,6 +6,7 @@
 
 import { DEFAULT_STUN, NAT_DETECTION_TIMEOUT_MS } from '@/constants'
 import { SUPPLEMENTAL_STUN } from './turn'
+import { isE2eHostIceOnly } from './e2e-ice'
 import { classifyNat, parseCandidate, type NatDetectionResult, type NatType, type ParsedCandidate } from './nat-classify'
 
 export type { NatType, NatDetectionResult, ParsedCandidate } from './nat-classify'
@@ -64,7 +65,12 @@ export async function detectNatType(
     }
   }
 
-  const pc = new RTCPeerConnection({ iceServers: stunServers })
+  // Same-host Playwright peers need no external discovery. Keeping the NAT
+  // probe host-only prevents a supposedly deterministic test run from
+  // quietly issuing public STUN DNS requests before the real peer is built.
+  const pc = new RTCPeerConnection({
+    iceServers: isE2eHostIceOnly() ? [] : stunServers,
+  })
   // Need at least one m-line so the browser actually gathers.
   pc.createDataChannel('nat-probe')
 
@@ -87,9 +93,22 @@ export async function detectNatType(
   })
 
   try {
-    const offer = await pc.createOffer()
-    await pc.setLocalDescription(offer)
-    await done
+    let timeout: ReturnType<typeof setTimeout> | null = null
+    const deadline = new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => reject(new Error('NAT_DETECTION_TIMEOUT')), NAT_DETECTION_TIMEOUT_MS)
+    })
+    try {
+      await Promise.race([
+        (async () => {
+          const offer = await pc.createOffer()
+          await pc.setLocalDescription(offer)
+          await done
+        })(),
+        deadline,
+      ])
+    } finally {
+      if (timeout) clearTimeout(timeout)
+    }
     const result = classifyNat(candidates)
     // P1: stash the latest type so buildIceConfig can switch to relay
     // automatically when we're behind a symmetric NAT — without this the

@@ -5,7 +5,7 @@
 // fallback, scrapes the local SDP) before signaling end-of-candidates.
 
 import { describe, it, expect } from 'vitest'
-import { endOfCandidatesFor } from '../../src/lib/webrtc'
+import { endOfCandidateMarkersFor, endOfCandidatesFor } from '../../src/lib/webrtc'
 
 function pcWithTransceivers(mids: (string | null)[]) {
   return {
@@ -59,5 +59,39 @@ describe('endOfCandidatesFor', () => {
     // The whole point: at least one of these is a real, non-null value.
     expect(out.sdpMid !== null || out.sdpMLineIndex !== null).toBe(true)
     expect(out.sdpMid).toBe('audio')
+  })
+
+  it('preserves an explicit media locator instead of falling back to the first transceiver', () => {
+    const pc = pcWithTransceivers(['audio', 'video'])
+    expect(endOfCandidatesFor(pc, {
+      candidate: '',
+      sdpMid: 'video',
+      sdpMLineIndex: 1,
+      usernameFragment: 'video-generation',
+    })).toEqual({
+      candidate: '',
+      sdpMid: 'video',
+      sdpMLineIndex: 1,
+      usernameFragment: 'video-generation',
+    })
+  })
+
+  it('builds one located marker for every local media description', () => {
+    const pc = pcWithLocalSdp([
+      'v=0',
+      'a=group:BUNDLE audio video',
+      'a=ice-ufrag:session-A',
+      'm=audio 9 UDP/TLS/RTP/SAVPF 111',
+      'a=mid:audio',
+      'm=video 9 UDP/TLS/RTP/SAVPF 96',
+      'a=mid:video',
+      'a=ice-ufrag:media-B',
+      '',
+    ].join('\r\n'))
+
+    expect(endOfCandidateMarkersFor(pc)).toEqual([
+      { candidate: '', sdpMid: 'audio', sdpMLineIndex: 0, usernameFragment: 'session-A' },
+      { candidate: '', sdpMid: 'video', sdpMLineIndex: 1, usernameFragment: 'media-B' },
+    ])
   })
 })

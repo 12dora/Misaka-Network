@@ -27,7 +27,8 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true
 
 const autoTurnState = { active: false, expiresAt: null as number | null, lastFailReason: null as string | null }
 
-vi.mock('@/lib/turn', () => ({
+vi.mock('@/lib/turn', async importOriginal => ({
+  ...await importOriginal<typeof import('@/lib/turn')>(),
   loadTurnSettings: () => loaded,
   saveTurnSettings: (s: unknown) => { saved.push(JSON.parse(JSON.stringify(s))) },
   testTurnServerDetailed: vi.fn(async () => ({ reachable: false, code: 'NO_RELAY', message: 'x' })),
@@ -162,6 +163,22 @@ describe('BUG-008 (UI): the master switch is the single gate', () => {
     expect(document.body.textContent).toContain('当前没有可用的中继服务器')
   })
 
+  it.each([
+    ['missing username', { username: '' }],
+    ['missing credential', { credential: '' }],
+  ])('EDGE — %s does not enable relay-only mode', (_label, patch) => {
+    loaded = {
+      servers: [{ ...MANUAL_SERVER, ...patch }],
+      enabled: true,
+      forceRelay: true,
+    }
+    render()
+
+    const force = switchByName('强制使用 TURN（仅测试）')
+    expect(force.disabled).toBe(true)
+    expect(force.getAttribute('aria-checked')).toBe('false')
+  })
+
   it('EDGE — a manual server with a blank URL does not count as available', () => {
     loaded = {
       servers: [{ ...MANUAL_SERVER, url: '   ' }],
@@ -171,6 +188,53 @@ describe('BUG-008 (UI): the master switch is the single gate', () => {
     render()
 
     expect(switchByName('强制使用 TURN（仅测试）').disabled).toBe(true)
+  })
+
+  it('REGRESSION — arbitrary text such as "foo" is not a usable relay', () => {
+    loaded = {
+      servers: [{ ...MANUAL_SERVER, url: 'foo' }],
+      enabled: true,
+      forceRelay: true,
+    }
+    render()
+
+    expect(switchByName('强制使用 TURN（仅测试）').disabled).toBe(true)
+    expect(switchByName('强制使用 TURN（仅测试）').getAttribute('aria-checked')).toBe('false')
+  })
+
+  it.each([
+    'turn:relay..example:3478',
+    'turn:relay_example:3478',
+    'turn:relay.example:3478?transport=udp&',
+    'turn:relay.example%40attacker.test:3478',
+    'turn:[2001:::1]:3478',
+    'turn:[::ffff:999.0.2.1]:3478',
+  ])('EDGE — malformed relay URI does not enable relay-only mode: %s', url => {
+    loaded = {
+      servers: [{ ...MANUAL_SERVER, url }],
+      enabled: true,
+      forceRelay: true,
+    }
+    render()
+
+    const force = switchByName('强制使用 TURN（仅测试）')
+    expect(force.disabled).toBe(true)
+    expect(force.getAttribute('aria-checked')).toBe('false')
+  })
+
+  it.each([
+    'turn:[2001:0db8::1]:3478',
+    'turn:[0:0:0:0:0:0:0:1]:3478',
+    'turn:[::ffff:192.0.2.1]:3478',
+  ])('EDGE — semantically valid bracketed IPv6 enables relay-only mode: %s', url => {
+    loaded = {
+      servers: [{ ...MANUAL_SERVER, url }],
+      enabled: true,
+      forceRelay: false,
+    }
+    render()
+
+    expect(switchByName('强制使用 TURN（仅测试）').disabled).toBe(false)
   })
 
   it('the copy states that the master switch governs auto issuance too', () => {

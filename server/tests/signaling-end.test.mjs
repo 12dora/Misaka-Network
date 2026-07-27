@@ -11,11 +11,10 @@
  * Usage: cd server && npx tsx tests/signaling-end.test.mjs
  */
 
-import { spawn } from 'child_process'
 import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
 import { WebSocket } from 'ws'
-import { runTest, killChild } from './_harness.mjs'
+import { runTest, killChild, spawn } from './_harness.mjs'
 
 runTest(main)
 
@@ -65,13 +64,42 @@ async function testEndToPeer() {
 
   // A → SIGNAL_ICE_END → server forwards to B
   const recv = nextMessageMatching(b, m => m.t === 'SIGNAL_ICE_END', 'SIGNAL_ICE_END@B')
-  a.ws.send(JSON.stringify({ t: 'SIGNAL_ICE_END', targetSessionId: b.sessionId }))
+  const candidate = {
+    candidate: '',
+    sdpMid: 'video',
+    sdpMLineIndex: 1,
+    usernameFragment: 'videoB+/9',
+  }
+  a.ws.send(JSON.stringify({
+    t: 'SIGNAL_ICE_END',
+    targetSessionId: b.sessionId,
+    candidate,
+  }))
   const msg = await withTimeout(recv, 1500, 'B 未在 1.5s 内收到 SIGNAL_ICE_END')
 
   assertEq(msg.t, 'SIGNAL_ICE_END', '消息类型')
   assertEq(msg.fromSessionId, a.sessionId, 'fromSessionId 应等于 A')
   assertEq(msg.fromNodeId, nodeId, 'fromNodeId 应正确')
-  console.log('   ✓ B 收到 { t: SIGNAL_ICE_END, fromSessionId: A, fromNodeId }')
+  assertEq(msg.candidate?.candidate, '', 'EOC candidate 应为空')
+  assertEq(msg.candidate?.sdpMid, 'video', 'EOC sdpMid 应保留')
+  assertEq(msg.candidate?.sdpMLineIndex, 1, 'EOC m-line 应保留')
+  assertEq(msg.candidate?.usernameFragment, 'videoB+/9', 'EOC ufrag 应保留')
+  console.log('   ✓ B 收到带原始 media locator 的 SIGNAL_ICE_END')
+
+  b.buf.clear()
+  a.ws.send(JSON.stringify({
+    t: 'SIGNAL_ICE_END',
+    targetSessionId: b.sessionId,
+    candidate: {
+      candidate: '',
+      sdpMid: 'video',
+      sdpMLineIndex: 1,
+      usernameFragment: 'B evil\r\ninjected',
+    },
+  }))
+  const invalid = (await collectMessagesFor(b, 250))
+    .find(m => m.t === 'SIGNAL_ICE_END')
+  assert(!invalid, '非法 ICE ufrag 不应被转发')
 
   a.ws.close()
   b.ws.close()
@@ -229,9 +257,9 @@ function sleep(ms) {
 }
 
 function startServer() {
-  const proc = spawn('npx', ['tsx', 'src/index.ts'], {
+  const proc = spawn('node', ['dist/index.js'], {
     cwd: SERVER_DIR,
-    env: { ...process.env, PORT: String(PORT), MAX_NODES: '200' },
+    env: { ...process.env, PORT: String(PORT), MAX_NODES: '200', TURN_AUTO_ENABLED: 'false' },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   proc.stderr.on('data', (d) => {

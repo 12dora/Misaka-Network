@@ -6,8 +6,8 @@
   # it must not trust any inbound forwarded header when deriving the client
   # IP. Leaving `trusted_proxies` unset (the default) is exactly that. Only
   # add a `servers { trusted_proxies ... }` block if you really do put a CDN
-  # or load balancer in front of Caddy — and then bump TRUST_PROXY in
-  # docker-compose.prod.yml to match the new hop count.
+  # or load balancer in front of Caddy. Follow docs/CDN_PROXY_TOPOLOGY.md:
+  # trust only published proxy CIDRs and forward validated {client_ip}.
 }
 
 # HTTPS + WSS reverse proxy for Misaka signaling
@@ -21,6 +21,9 @@ signal.example.com {
     output stdout
     format console
   }
+  # docker-compose.prod.yml rotates this stdout log at 10 MiB and retains at
+  # most seven files. It contains source IPs; copy it elsewhere only under a
+  # documented access and deletion policy.
 
   # ── Forwarded-header hygiene (CONFIG-001 / SECURITY-005) ──────────────
   # Every per-IP defence in the signaling server (register IP cap,

@@ -45,11 +45,10 @@ describe('SECURITY-006 happy path', () => {
     })
   })
 
-  it('accepts an embedded base64 passcode', () => {
+  it('rejects an embedded reusable passcode even when it is valid base64', () => {
     const c = Buffer.from('123456').toString('base64')
     const r = link(`${ORIGIN}${JOIN}?type=node&id=7&t=${TOKEN}&c=${c}`)
-    expect(r.ok).toBe(true)
-    expect(r.ok && r.path).toContain(`c=${encodeURIComponent(c)}`.replace(/%3D/g, '='))
+    expect(r).toEqual({ ok: false, reason: 'BAD_PARAM' })
   })
 
   it('rewrites the misaka:// app scheme onto our own origin', () => {

@@ -11,17 +11,18 @@
  *     behind a bounded semaphore instead of blocking the event loop.)
  *     i.e. salts ARE used. Without this, a stolen dump of one node's hash
  *     could be replayed against every other node's hash.
- *   - newPassCodeRecord returns BOTH a deterministic sha256 identity hash
+ *   - newPassCodeRecord returns BOTH a deterministic keyed identity hash
  *     AND a per-call scrypt verify hash; the same plaintext registered
  *     twice gets the same identity hash (cluster routing relies on this)
  *     but different verify hashes (per-session salt).
- *   - verifyAndMaybeUpgrade accepts a legacy { passCodeHash: sha256(code) }
+ *   - verifyAndMaybeUpgrade accepts an identity-only legacy record
  *     shape, returns ok=true, and emits the scrypt-upgraded fields in
  *     `upgrade` so the caller can persist the upgrade.
  */
 
 import { runTest } from './_harness.mjs'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 
 runTest(main, { timeoutMs: 30_000 })
 
@@ -49,6 +50,11 @@ async function main() {
   const rec1 = await newPassCodeRecord(code)
   const rec2 = await newPassCodeRecord(code)
   assert.equal(rec1.passCodeHash, rec2.passCodeHash, '同 plaintext 的 identity hash 必须一致 (cluster 依赖)')
+  assert.notEqual(
+    rec1.passCodeHash,
+    createHash('sha256').update(code).digest('hex'),
+    'identity representation must be keyed; a six-digit passcode cannot be recoverable from a salt-free SHA-256 table',
+  )
   assert.notEqual(rec1.passCodeSalt, rec2.passCodeSalt, 'salt 应每次新生成')
   assert.notEqual(rec1.passCodeVerifyHash, rec2.passCodeVerifyHash, 'verify hash 应每次不同')
   assert.equal(rec1.passCodeAlgo, 'scrypt')
@@ -62,11 +68,11 @@ async function main() {
   assert.equal(bad.ok, false, '错误 plaintext 应被拒')
   console.log('  ✓ scrypt 路径正确接受/拒绝')
 
-  console.log('[4] verifyAndMaybeUpgrade: legacy sha256 path returns ok + upgrade')
-  // Legacy shape: ONLY the sha256 identity hash; no salt, no verify hash.
+  console.log('[4] verifyAndMaybeUpgrade: identity-only path returns ok + upgrade')
+  // Legacy shape: ONLY the keyed identity representation; no salt or verifier.
   const legacy = { passCodeHash: hashPassCodeIdentity(code) }
   const upgraded = await verifyAndMaybeUpgrade(code, legacy)
-  assert.equal(upgraded.ok, true, '老 sha256 hash 在首次校验时应通过')
+  assert.equal(upgraded.ok, true, '旧 identity-only record 在首次校验时应通过')
   assert.ok(upgraded.upgrade, 'upgrade 字段必须返回，让 caller 持久化')
   assert.equal(upgraded.upgrade.passCodeAlgo, 'scrypt')
   assert.ok(upgraded.upgrade.passCodeSalt && upgraded.upgrade.passCodeSalt.length === 32, 'salt 32 hex chars (16 bytes)')
@@ -79,7 +85,7 @@ async function main() {
   const second = await verifyAndMaybeUpgrade(code, stored)
   assert.equal(second.ok, true)
   assert.equal(second.upgrade, undefined, '已 upgrade 的会话不应再次 upgrade')
-  console.log('  ✓ 老 sha256 → scrypt 一次性迁移')
+  console.log('  ✓ identity-only → scrypt 一次性迁移')
 
   console.log('[5] verifyAndMaybeUpgrade: legacy path rejects wrong passcode and returns no upgrade')
   const wrong = await verifyAndMaybeUpgrade('111111', legacy)

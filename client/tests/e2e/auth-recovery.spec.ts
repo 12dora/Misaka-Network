@@ -10,6 +10,7 @@
 // pipeline actually work end-to-end.
 
 import { test, expect, type Page } from '@playwright/test'
+import { assertE2eHostIceConfig } from './helpers'
 
 async function login(page: Page) {
   const NODE_ID = '20001'
@@ -29,7 +30,7 @@ async function login(page: Page) {
 }
 
 test.describe('401 self-heal (QR path)', () => {
-  test('QR recovers after 401 on first API call', async ({ browser }) => {
+  test('QR recovers after 401 on first API call', async ({ browser, request }) => {
     const ctx = await browser.newContext()
     const page = await ctx.newPage()
 
@@ -48,6 +49,9 @@ test.describe('401 self-heal (QR path)', () => {
 
     try {
       await login(page)
+      // Prove this browser bundle and the signaling backend share the exact
+      // test nonce, and that the real peer factory has no public ICE URLs.
+      await assertE2eHostIceConfig(page, request)
 
       await page.locator('button:has-text("显示我的 QR")').first().click()
 

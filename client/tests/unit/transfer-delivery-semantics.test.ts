@@ -14,7 +14,8 @@
 //            delivered a sparse file.
 //   BUG-018  successful streaming receives had no authoritative terminal
 //            cleanup: the OPFS file, the `active` DB row, the receive session
-//            and the bitmap all survived.
+//            and the bitmap all survived. The OPFS entry must remain until
+//            the lazy File has been consumed, then its cleanup removes it.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
@@ -341,7 +342,7 @@ describe('BUG-018: one terminal completion API', () => {
     await cleanupOPFS(id).catch(() => {})
   })
 
-  it('a successful OPFS finalize closes the backend, removes the entry, retires the row and drops the session', async () => {
+  it('a successful OPFS finalize retires state and defers entry removal until the lazy file is consumed', async () => {
     const removed: string[] = []
     const stored = new Uint8Array(CHUNK_SIZE)
     const stream = { write: vi.fn(async () => {}), close: vi.fn(async () => {}), seek: async () => {}, truncate: async () => {} }
@@ -373,13 +374,16 @@ describe('BUG-018: one terminal completion API', () => {
     expect(result.bytes).toBe(meta.fileSize)
     expect(result.file.name).toBe('done.bin')
 
-    // Everything the old code leaked:
-    expect(stream.close).toHaveBeenCalled()             // backend closed
-    expect(removed).toContain(`${id}-done.bin`)          // exact OPFS entry gone
-    expect(getOPFSHandle(id)).toBeUndefined()            // handle dropped
-    expect(getReceiveSession(id)).toBeUndefined()        // session dropped
-    expect(persistOrder).toContain('delete-chunks')      // chunk rows reaped
+    expect(stream.close).toHaveBeenCalled()              // backend closed
+    expect(removed).not.toContain(`${id}-done.bin`)      // lazy File still readable
+    await expect(result.file.arrayBuffer()).resolves.toHaveProperty('byteLength', meta.fileSize)
+    expect(getOPFSHandle(id)).toBeUndefined()             // handle dropped
+    expect(getReceiveSession(id)).toBeUndefined()         // session dropped
+    expect(persistOrder).toContain('delete-chunks')       // chunk rows reaped
     expect(((db as any).__records as Map<string, any>).get(id)?.status).toBe('completed')
+
+    await result.cleanup?.()
+    expect(removed).toContain(`${id}-done.bin`)           // exact OPFS entry gone
 
     // Second finalize is refused rather than double-delivering.
     await expect(finalizeReceive(id)).rejects.toThrow(/No receive session/)

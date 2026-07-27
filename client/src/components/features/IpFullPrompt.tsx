@@ -1,4 +1,4 @@
-import { useRef } from 'react'
+import { useRef, useState } from 'react'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
 import MisakaDialog from '@/components/ui/MisakaDialog'
@@ -23,13 +23,26 @@ interface Props {
  * rather than the viewport) and gains focus containment, an inert
  * background, scroll lock and focus restoration.
  *
- * NOTE: the recovery *wording* here is UX-COPY-002 and is owned by the
- * cross-stack fix that also changes the release semantics. Do not adjust the
- * copy in isolation — the current text overstates the deletion scope, and
- * correcting it requires the server-side released-count change too.
+ * The unauthenticated recovery proof is intentionally identity-scoped:
+ * nodeId + passcode can release only matching sessions on this IP. The
+ * actual server count is displayed below, including zero.
  */
 export default function IpFullPrompt({ onConfirm, onCancel, busy = false }: Props) {
   const confirmRef = useRef<HTMLButtonElement>(null)
+  const [confirming, setConfirming] = useState(false)
+  const [releaseResult, setReleaseResult] = useState<number | null>(null)
+  const isBusy = busy || confirming
+
+  async function confirmScopedRelease() {
+    if (isBusy) return
+    setConfirming(true)
+    setReleaseResult(null)
+    try {
+      setReleaseResult(await onConfirm())
+    } finally {
+      setConfirming(false)
+    }
+  }
 
   return (
     <MisakaDialog
@@ -56,19 +69,31 @@ export default function IpFullPrompt({ onConfirm, onCancel, busy = false }: Prop
       )}
     >
       <p className="font-kanji text-sm text-[var(--text-on-white)] mb-5">
-        本机 IP 同时最多允许 10 个节点。是否销毁本机所有已注册节点后重新接入？
+        本机 IP 同时最多允许 10 个节点。可验证当前节点编号与通行码，并仅释放此 IP 上同一身份的会话；
+        其他身份的节点不会被删除。
       </p>
+      {releaseResult !== null && (
+        <p
+          role="status"
+          className="font-kanji text-xs mb-3"
+          style={{ color: releaseResult > 0 ? 'var(--state-success-on-light)' : 'var(--state-warn-on-light)' }}
+        >
+          {releaseResult > 0
+            ? `已释放同一身份的 ${releaseResult} 个节点，正在重试接入。`
+            : '未释放任何节点，因此没有自动重试。请确认节点编号和通行码，或稍后再试。'}
+        </p>
+      )}
       <div className="flex gap-2">
         <MisakaButton
           ref={confirmRef}
           variant="primary"
           fullWidth
-          disabled={busy}
-          onClick={() => { void onConfirm() }}
+          disabled={isBusy}
+          onClick={() => { void confirmScopedRelease() }}
         >
-          {busy ? '释放中…' : '全部销毁并重试'}
+          {isBusy ? '释放中…' : '释放同一身份并重试'}
         </MisakaButton>
-        <MisakaButton variant="pill" fullWidth disabled={busy} onClick={onCancel}>
+        <MisakaButton variant="pill" fullWidth disabled={isBusy} onClick={onCancel}>
           取消
         </MisakaButton>
       </div>

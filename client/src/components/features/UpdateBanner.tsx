@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { useActiveWork } from '@/hooks/activeWork'
+import { hasActiveWork, useActiveWork } from '@/hooks/activeWork'
 
 /**
  * Listens for a {type:'sw-updated'} postMessage from the service worker and
@@ -24,12 +24,38 @@ import { useActiveWork } from '@/hooks/activeWork'
 
 const ACTIVATION_TIMEOUT_MS = 3_000
 
-export default function UpdateBanner() {
+export function waitForWorkerActivation(
+  serviceWorker: ServiceWorkerContainer,
+  timeoutMs = ACTIVATION_TIMEOUT_MS,
+): Promise<boolean> {
+  return new Promise(resolve => {
+    let settled = false
+    const onControllerChange = () => done(true)
+    const done = (activated: boolean) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      serviceWorker.removeEventListener('controllerchange', onControllerChange)
+      resolve(activated)
+    }
+    const timer = setTimeout(() => done(false), timeoutMs)
+    serviceWorker.addEventListener('controllerchange', onControllerChange, { once: true })
+  })
+}
+
+interface Props {
+  /** Test seam for the final browser navigation; production uses reload(). */
+  onReload?: () => void
+}
+
+export default function UpdateBanner({ onReload = () => window.location.reload() }: Props = {}) {
   const [available, setAvailable] = useState(false)
   const [dismissed, setDismissed] = useState(false)
   const [reloading, setReloading] = useState(false)
+  const [activationError, setActivationError] = useState(false)
   const busy = useActiveWork()
   const mounted = useRef(true)
+  const reloadGuard = useRef(false)
 
   useEffect(() => {
     mounted.current = true
@@ -57,45 +83,33 @@ export default function UpdateBanner() {
     }
   }, [])
 
-  /** Resolve once the waiting worker has taken control, or on timeout. */
-  function waitForActivation(): Promise<void> {
-    return new Promise(resolve => {
-      let settled = false
-      const done = () => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        try {
-          navigator.serviceWorker.removeEventListener('controllerchange', done)
-        } catch { /* ignore */ }
-        resolve()
-      }
-      const timer = setTimeout(done, ACTIVATION_TIMEOUT_MS)
-      try {
-        navigator.serviceWorker.addEventListener('controllerchange', done, { once: true })
-      } catch {
-        done()
-      }
-    })
-  }
-
   async function reload() {
-    if (busy || reloading) return
+    // Read the registry at click time; React state may be one render behind a
+    // transfer that started in the same event turn.
+    if (hasActiveWork() || reloadGuard.current) return
+    reloadGuard.current = true
     setReloading(true)
+    setActivationError(false)
     try {
       const reg = await navigator.serviceWorker?.getRegistration?.()
       if (reg?.waiting) {
-        const activated = waitForActivation()
+        const activated = waitForWorkerActivation(navigator.serviceWorker)
         reg.waiting.postMessage({ type: 'skip-waiting' })
         // Wait for the new worker to control the page BEFORE reloading, so
         // the reloaded document is served by the version we just installed.
-        await activated
+        if (!await activated) {
+          setActivationError(true)
+          return
+        }
       }
     } catch {
-      // Some browsers don't expose getRegistration when no worker controls
-      // the page yet — just reload.
+      setActivationError(true)
+      return
+    } finally {
+      reloadGuard.current = false
+      if (mounted.current) setReloading(false)
     }
-    window.location.reload()
+    onReload()
   }
 
   if (!available || dismissed) return null
@@ -123,6 +137,11 @@ export default function UpdateBanner() {
       {busy && (
         <span className="text-[11px] w-full" style={{ color: 'var(--state-warn-on-blue)' }}>
           正在传输中，完成后再刷新
+        </span>
+      )}
+      {activationError && (
+        <span className="text-[11px] w-full" style={{ color: 'var(--state-warn-on-blue)' }} role="alert">
+          新版本尚未接管页面，请稍后再次尝试
         </span>
       )}
       <button

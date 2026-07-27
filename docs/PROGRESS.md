@@ -51,7 +51,7 @@
 - ☑ 续传从对端真实 chunk bitmap 拉取（sender 接收 ResumeRequest 后使用 peerReceivedChunks）
 - ☑ 取消 / 暂停 / 恢复 三按钮 + 传输信号机
 - ☑ 大文件流式写盘（File System Access API + Blob 拼接降级）
-- ◐ 1 GiB 文件内存压测脚本存在（`server/tests/stress-1gb.test.mjs`，通过 `npm --prefix server run test:stress` 手动跑，不在默认 CI 内）。结论方向为「sender 与流式接收路径为常数级内存，Blob 组装降级路径峰值随文件大小线性增长」；具体数值随脚本改版会变，请以本机最近一次运行输出为准，不要引用历史数字
+- ◐ 1 GiB 文件压测脚本存在（`server/tests/stress-1gb.test.mjs`，通过 `npm --prefix server run test:stress` 手动跑）：现已断言精确字节数、SHA-256 一致性和流式 RSS 预算；独立月度 CI 以 256 MiB 夹具运行，完整 1 GiB 仍由发布前手工执行
 
 ### 2.4 信令服务器加固
 - ◐ 自托管部署（已补 Caddy + docker-compose 生产模板、/api/health、一跳 proxy-trust 配置与 `deploy/verify-proxy-trust.sh`；实际服务器部署与真实拓扑验证未做）
@@ -109,7 +109,7 @@
 
 ## 当前会话焦点
 
-TURN 自动下发落地：服务端按 sessionId 申请 Cloudflare 短时效凭证（默认 5 min TTL），客户端 prefetch + 自动续期。所有防滥用 enforcement 在服务端（deny list / 每 IP 字节 + 频率 / 1T 月度熔断 / CF revoke），客户端只是消费方。状态持久化到 `data/turn-state.json`（原子写）。Settings 中继 tab 顶部展示自动 TURN 状态 + 月度用量进度条；手工 TURN 列表保留。待完成：CF Token 真实配置 + 端到端流量验证。
+TURN 自动下发落地：服务端按 sessionId 申请 Cloudflare 短时效凭证（默认 5 min TTL），客户端 prefetch + 自动续期。所有防滥用 enforcement 在服务端（deny list / 每 IP 字节 + 频率 / 1T 月度熔断 / CF revoke），客户端只是消费方。状态持久化到 `data/turn-state.json`（原子写）。Settings 只展示粗粒度可用性，详细额度需 operator Bearer token；手工 TURN 列表保留。待完成：CF Token 真实配置 + 端到端流量验证。
 
 ## 已知问题
 
@@ -132,7 +132,7 @@ TURN 自动下发落地：服务端按 sessionId 申请 Cloudflare 短时效凭�
 - 服务端以内存为主，但**不是完全无持久化**：TURN 状态（`turn-state.json`）与暴破锁/冻结快照（`auth-locks.json`）会原子落盘到 `TURN_PERSIST_DIR`；节点 / 会话 / 频道 / QR token / 上报仍然纯内存，进程重启即清空。速率限制滑动窗口；上报保留 1h
 - chunk 加密：iv(12B) + ciphertext 单帧；DataChannel 文本头 + 二进制体双消息
 - ECDH 在 DataChannel open 后第一帧交换，30s 超时
-- 对等发现：identity-scoped cluster — channelId = `cluster-<nodeId>-<SHA-256(passcode).slice(0,16)>`，仅同 nodeId+passcode 的设备相互可见。允许多设备共享同一身份（手机/电脑同时在线）
+- 对等发现：identity-scoped cluster — channelId 使用 `nodeId` 与部署密钥派生的 HMAC-SHA-256 身份表示，仅同 nodeId+passcode 的设备相互可见；公开的六位数字 SHA-256 表不能在没有部署密钥时直接反查。允许多设备共享同一身份（手机/电脑同时在线）
 - 路由身份分离：每个 WS session 持有唯一 sessionId（nanoid 16），nodeId 用于显示与聚类，sessionId 用于 WebRTC 信令与 DataChannel 路由
 - 自动建链：WELCOME 后客户端自动发 JOIN_CLUSTER；服务端在 PEER_JOINED 中标记 shouldInitiate，仅"新到达者"主动发 SDP offer，避免 glare
 - 取消 CONNECT_REQ / verify-passcode：cluster 内成员同身份天然互信，不再二次握手
@@ -152,10 +152,10 @@ TURN 自动下发落地：服务端按 sessionId 申请 Cloudflare 短时效凭�
 - 大文件写入：优先 File System Access API 流式写盘 → OPFS 磁盘缓存（Chrome 86+/Safari 15.2+/Firefox 111+）→ 老旧浏览器降级 IndexedDB + Blob 组装
 - 网络切换重连：监听 window.online 事件直接调用 doConnect()，复用现有指数退避
 - 信令关闭通知：SERVER_SHUTDOWN 消息 + WS 1001 关闭码，客户端标记 serverShutdown 阻止重连
-- 1 GiB 压测（手动脚本，非 CI 门禁）：sender 流式路径与接收端流式写盘为常数级内存；Blob 组装降级路径（仅老旧浏览器回退）峰值随文件大小线性增长，是已知的降级代价。具体数字以最近一次本机运行为准
+- 1 GiB 压测：sender / receiver 流式路径有可执行 RSS 预算和 byte/checksum 完整性断言；独立定时 CI 跑 256 MiB 版本，Blob 组装降级路径的线性内存仍是已知代价
 - OPFS 磁盘缓存：利用 navigator.storage.getDirectory() 在接收时逐 chunk 落盘，完成后 getFile() 获取引用而非常驻内存。OPFS 所有现代浏览器均支持，替换了 IndexedDB + Blob 全量组装的降级路径，避免 10GB 文件撑爆 JS heap
 - 接收文件手动下载：deliverCompletedFile 不再调用 triggerDownload，改为在 chatMessages 插入 type='file' 的消息（含 fileName/fileSize/downloadUrl 字段）；ChannelChat 对 type='file' 消息渲染文件卡片 + "↓ 下载"按钮；点击后触发下载并 revokeObjectURL，按钮变为"✓ 已下载"
-- v3 沉浸：特殊节点 9982 / 10032 / 20001 在登录卡展示 lore hint；ActivityStream 每 45s 注入一条妹妹语录；设置面板增加音效开关，扫码 / 完成 / 错误音效由 WebAudio 合成且默认开启
+- v3 沉浸：特殊节点 9982 / 10032 / 20001 在登录卡展示 lore hint；ActivityStream 可显式暂停，reduced-motion/coarse-pointer 默认静态；设置面板增加音效开关，扫码 / 完成 / 错误音效由 WebAudio 合成且默认开启
 - v3 性能：路由改 React.lazy + Suspense；Vite manualChunks 拆出 react / qr / hash；整文件 SHA-256 优先交给 module worker，失败时降级主线程分块 hash
 - ICE 观测增强：连接成功后从 `pc.getStats()` 读取 nominated `candidate-pair`，在 Network 信息栏展示 `localType/proto → remoteType/proto`（如 `host/udp → host/udp`、`srflx/udp → srflx/udp`、`relay/tcp → relay/tcp`），用于 host → srflx → relay 实测留痕
 - PWA 起步：新增 `public/sw.js` 并在 `main.tsx` 注册；采用 app shell 缓存与导航离线回退（`index.html`），静态资源走缓存优先，`/api` 与 `/ws` 始终直连网络
@@ -170,7 +170,7 @@ TURN 自动下发落地：服务端按 sessionId 申请 Cloudflare 短时效凭�
 - 重连系统消息策略：ICE disconnected（前状态 transferring）→ 在 chatMessages 插入 "⚠ 连接中断" 系统消息；DC onopen（有历史聊天记录）→ 插入 "✓ 连接已恢复"；ICE restart 耗尽 → 插入 "连接已断开" + failPendingMessages
 - NAT 纯逻辑分层：nat.ts（浏览器入口，依赖 RTCPeerConnection）与 nat-classify.ts（纯函数，无 DOM 依赖，可在 Node 测试环境中直接 import）分开，解决 tsx 无法解析 @/ alias 的测试限制
 - SIGNAL_ICE_END：候选收集结束（onicecandidate e.candidate === null）时通过信令服务器转发给 peer；接收方调用 `pc.addIceCandidate({ candidate: '' })` 通知 ICE agent 对端已停止收集，加快连接性检测收敛
-- QR join：`/join` 以链接 `id` 覆盖本机 nodeId，`c` 存在时 base64 解码为通行码并自动注册；`c` 缺失或错误时停在通行码输入卡片，不再要求先返回首页注册
+- QR join：`/join` 只接受 `id` 与不透明短时效 token；任何 `c` 通行码参数都会被拒绝。扫码设备单独输入通行码，兑换 transactional single-use admission grant 后注册，不再要求先返回首页
 - 接收卡片去重：`deliverCompletedFile` 以 `transferId` 去重，防止同一传输在并发回调下重复插入 file 消息
 - 未读与通知：`unreadByPeer` 记录每节点消息/文件未读数；收到文件时若页面在后台且通知权限已授权，触发系统 Notification
 - 部署标准化：根目录新增 `docker-compose.yml`，后端新增多阶段 `server/Dockerfile`；README 统一提供前后端部署步骤与 `config.json` 运行时后端地址配置方案

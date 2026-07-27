@@ -59,6 +59,10 @@ jobs:
         working-directory: client
         run: npm run typecheck:config
 
+      - name: Type check (unit + E2E tests)
+        working-directory: client
+        run: npm run typecheck:tests
+
       - name: Run client unit + contract tests
         working-directory: client
         run: npm test

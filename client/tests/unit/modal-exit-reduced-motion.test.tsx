@@ -16,6 +16,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act } from 'react-dom/test-utils'
 import { createRoot, type Root } from 'react-dom/client'
 import { useModalExit } from '../../src/hooks/useModalExit'
+import MisakaDialog from '../../src/components/ui/MisakaDialog'
 
 declare global {
   // eslint-disable-next-line no-var
@@ -45,6 +46,15 @@ let api: ReturnType<typeof useModalExit>
 function Probe({ onClose }: { onClose: () => void }) {
   api = useModalExit(onClose)
   return <div className={api.panelClass} />
+}
+
+function DialogProbe({ onClose }: { onClose: () => void }) {
+  api = useModalExit(onClose)
+  return (
+    <MisakaDialog title="Test dialog" onRequestClose={api.requestClose}>
+      <button>inside</button>
+    </MisakaDialog>
+  )
 }
 
 beforeEach(() => {
@@ -91,10 +101,10 @@ describe('UX-MOTION-001: modal exit timing', () => {
   it('Escape closes the dialog', () => {
     setReducedMotion(true)
     const onClose = vi.fn()
-    act(() => { root.render(<Probe onClose={onClose} />) })
+    act(() => { root.render(<DialogProbe onClose={onClose} />) })
 
     act(() => {
-      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
     })
 
     expect(onClose).toHaveBeenCalledTimes(1)

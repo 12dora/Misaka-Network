@@ -36,20 +36,6 @@ export function useModalExit(onClose: () => void) {
     if (timerRef.current !== null) window.clearTimeout(timerRef.current)
   }, [])
 
-  // Global Escape-to-close. Each mounted modal owns its own listener; React
-  // tears it down when the modal unmounts, so stacking dialogs still works.
-  // We guard against double-fire via `closedRef` inside requestClose.
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if (e.key !== 'Escape') return
-      if (closedRef.current) return
-      e.stopPropagation()
-      requestClose()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [requestClose])
-
   return {
     closing,
     requestClose,

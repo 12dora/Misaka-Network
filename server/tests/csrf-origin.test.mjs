@@ -15,10 +15,9 @@
  * Usage: node tests/csrf-origin.test.mjs
  */
 
-import { spawn } from 'child_process'
 import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
-import { runTest, killChild } from './_harness.mjs'
+import { runTest, killChild, spawn } from './_harness.mjs'
 
 runTest(main, { timeoutMs: 30_000 })
 
@@ -133,7 +132,7 @@ async function testQrRedeemBadOrigin() {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
 
 function startServer() {
-  const proc = spawn('npx', ['tsx', 'src/index.ts'], {
+  const proc = spawn('node', ['dist/index.js'], {
     cwd: SERVER_DIR,
     env: {
       ...process.env,

@@ -8,10 +8,10 @@ services:
     # Secrets live in a gitignored root `.env` (see .env.example):
     #   TURN_CF_KEY_ID / TURN_CF_API_TOKEN / TURN_CF_ACCOUNT_TAG / SERVER_SECRET
     #
-    # The file is OPTIONAL so `docker compose up -d --build` works on a clean
-    # checkout: without it the stack still starts, just with auto-TURN
-    # unconfigured and a random per-process SERVER_SECRET. Create it before
-    # you rely on Cloudflare TURN or on identifiers surviving a restart:
+    # The file is OPTIONAL so the quick local/evaluation stack works on a
+    # clean checkout. This stack explicitly runs in development mode, disables
+    # auto-TURN by default, and may use a random per-process SERVER_SECRET.
+    # Create `.env` before relying on stable identities or Cloudflare TURN:
     #   cp .env.example .env
     #
     # Public knobs stay inline in `environment:` so `docker compose config`
@@ -20,6 +20,7 @@ services:
       - path: .env
         required: false
     environment:
+      NODE_ENV: development
       PORT: 9080
       MAX_NODES: 10000
       RATE_LIMIT_PER_MIN: 60
@@ -32,7 +33,7 @@ services:
       # ── TURN auto-provisioning (Cloudflare) ─────────────────────────
       # Master switch. Set to "false" to disable server-side TURN delivery
       # entirely; clients then rely only on manual TURN in Settings.
-      TURN_AUTO_ENABLED: "true"
+      TURN_AUTO_ENABLED: ${TURN_AUTO_ENABLED:-false}
       TURN_PROVIDER: cloudflare
 
       # Credential lifetime (seconds). Short on purpose — bounds the abuse

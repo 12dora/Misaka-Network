@@ -55,7 +55,7 @@ export interface IssuanceRecord {
 
 // SECURITY-010: durable denial. Keys are `ip:<ip>` and `cid:<customIdentifier>`
 // so both axes survive a restart (sessionIds do not, customIdentifiers do —
-// they are derived from sessionId + SERVER_SECRET).
+// they are derived by HMAC from sessionId with SERVER_SECRET).
 export interface DenyEntry {
   until: number
   reason: string

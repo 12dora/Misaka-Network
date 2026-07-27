@@ -7,11 +7,6 @@
 // in vite.config.ts. CI sets it from the real Pages base path — see
 // .github/workflows/deploy.yml.
 //
-// Precedence:
-//   1. window.__MISAKA_CONFIG__.APP_BASE  — host override via config.json
-//   2. VITE_APP_BASE                      — build-time override
-//   3. import.meta.env.BASE_URL           — the build's deployment base
-//
 // A relative base ('./', the default) means "served from the origin root"
 // as far as routing goes, and normalizes to ''.
 
@@ -23,17 +18,12 @@ function normalizeBase(base?: string): string {
   return withLeading.replace(/\/+$/, '')
 }
 
-function configuredBase(): string {
-  const runtime = window.__MISAKA_CONFIG__?.APP_BASE
-  return normalizeBase(runtime || import.meta.env.VITE_APP_BASE)
-}
-
 function buildBase(): string {
   return normalizeBase(import.meta.env.BASE_URL)
 }
 
 export function appBasePath(): string {
-  return configuredBase() || buildBase()
+  return buildBase()
 }
 
 export function appPath(path: string): string {

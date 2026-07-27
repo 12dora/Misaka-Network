@@ -16,11 +16,10 @@
  * Usage: node tests/ws-auth.test.mjs
  */
 
-import { spawn } from 'child_process'
 import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
 import { WebSocket } from 'ws'
-import { runTest, killChild } from './_harness.mjs'
+import { runTest, killChild, spawn } from './_harness.mjs'
 
 runTest(main)
 
@@ -178,7 +177,7 @@ function assertEq(actual, expected, msg) {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
 
 function startServer() {
-  const proc = spawn('npx', ['tsx', 'src/index.ts'], {
+  const proc = spawn('node', ['dist/index.js'], {
     cwd: SERVER_DIR,
     env: { ...process.env, PORT: String(PORT), MAX_NODES: '200', TURN_AUTO_ENABLED: 'false' },
     stdio: ['ignore', 'pipe', 'pipe'],

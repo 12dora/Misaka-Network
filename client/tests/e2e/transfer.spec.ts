@@ -5,9 +5,11 @@
 // peers) all live in the unmocked path.
 
 import { test, expect, type Page, type BrowserContext } from '@playwright/test'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { cleanupE2eSessions } from './helpers'
 
 const NODE_ID = '10001'
 const PASS_CODE = '123456'
@@ -19,7 +21,7 @@ const PASS_CODE = '123456'
 // to register. Clear our IP slate before each test so test order can't
 // poison the next one.
 test.beforeEach(async ({ request }) => {
-  await request.post('http://localhost:19180/api/release-by-ip').catch(() => {})
+  await cleanupE2eSessions(request)
 })
 
 function createTempFile(name: string, sizeBytes: number) {
@@ -84,6 +86,20 @@ async function selectPeer(page: Page, nodeId: string) {
   await page.getByText(`御坂 ${nodeId} 号`, { exact: false }).first().click()
 }
 
+async function waitForSelectedChannelReady(page: Page) {
+  const ready = page.getByText('连接成功。现在可以发送消息或文件。', { exact: false }).first()
+  const retry = page.locator('button:has-text("立即重连")').first()
+  await expect.poll(async () => {
+    if (await ready.isVisible().catch(() => false)) return 'ready'
+    if (await retry.isVisible().catch(() => false)) return 'retry'
+    return 'waiting'
+  }, { timeout: 35_000, intervals: [250, 500, 1_000] }).not.toBe('waiting')
+  if (!await ready.isVisible().catch(() => false)) {
+    await retry.click()
+    await expect(ready).toBeVisible({ timeout: 30_000 })
+  }
+}
+
 async function uploadFiles(page: Page, paths: string[]) {
   const [chooser] = await Promise.all([
     page.waitForEvent('filechooser'),
@@ -114,20 +130,90 @@ async function clickSend(page: Page) {
 }
 
 async function expectTransferComplete(page: Page, atLeast = 1) {
-  // Multiple "已完成" badges can appear (sender + receiver, multiple cards);
-  // we just require at least `atLeast` of them.
+  // The product deliberately distinguishes sender durability ("已保存") from
+  // receiver availability ("接收完成"); the old generic "已完成" wording was
+  // removed because it could not say what had actually happened.
   await expect.poll(
-    async () => await page.getByText('已完成', { exact: false }).count(),
+    async () => await page.getByText(/已保存|接收完成/).count(),
     { timeout: 60_000, intervals: [500, 1_000, 2_000] },
   ).toBeGreaterThanOrEqual(atLeast)
+}
+
+async function installConnectionFailureObserver(page: Page) {
+  await page.evaluate(() => {
+    const state = window as Window & { __misakaConnectionFailureSeen?: boolean; __misakaConnectionObserver?: MutationObserver }
+    state.__misakaConnectionFailureSeen = false
+    state.__misakaConnectionObserver?.disconnect()
+    const inspect = () => {
+      const text = document.body.innerText
+      if (text.includes('正在尝试重新协商连接') || text.includes('连接已断开')) {
+        state.__misakaConnectionFailureSeen = true
+      }
+    }
+    const observer = new MutationObserver(inspect)
+    observer.observe(document.body, { subtree: true, childList: true, characterData: true })
+    state.__misakaConnectionObserver = observer
+    inspect()
+  })
+}
+
+async function installArtifactCapture(page: Page) {
+  await page.evaluate(() => {
+    const state = window as Window & { __misakaCapturedBlobs?: Blob[]; __misakaOriginalCreateObjectURL?: typeof URL.createObjectURL }
+    state.__misakaCapturedBlobs = []
+    if (!state.__misakaOriginalCreateObjectURL) state.__misakaOriginalCreateObjectURL = URL.createObjectURL.bind(URL)
+    const original = state.__misakaOriginalCreateObjectURL
+    URL.createObjectURL = (blob: Blob | MediaSource) => {
+      if (blob instanceof Blob) state.__misakaCapturedBlobs!.push(blob)
+      return original!(blob)
+    }
+  })
+}
+
+interface CapturedArtifact {
+  name: string
+  size: number
+  sha256: string
+}
+
+async function capturedArtifacts(page: Page, count: number): Promise<CapturedArtifact[]> {
+  await expect.poll(
+    async () => page.evaluate(() =>
+      ((window as Window & { __misakaCapturedBlobs?: Blob[] }).__misakaCapturedBlobs ?? []).length,
+    ),
+    { timeout: 30_000 },
+  ).toBeGreaterThanOrEqual(count)
+  return page.evaluate(async () => {
+    const blobs = (window as Window & { __misakaCapturedBlobs?: Blob[] }).__misakaCapturedBlobs ?? []
+    return Promise.all(blobs.map(async blob => {
+      const digest = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer())
+      return {
+        name: blob instanceof File ? blob.name : '',
+        size: blob.size,
+        sha256: Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join(''),
+      }
+    }))
+  })
+}
+
+function expectedArtifact(path: string, name?: string): CapturedArtifact {
+  const bytes = readFileSync(path)
+  return {
+    name: name ?? path.split('/').pop() ?? '',
+    size: bytes.byteLength,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+  }
 }
 
 async function expectNoReconnectingBanner(page: Page) {
   // The bug under test: a stray cleanup on the WebRTC PC fired dc.onclose
   // → attemptIceRestart → status='reconnecting' → "正在尝试重新协商连接…"
-  // banner appears for a peer that's actually healthy. Assert the banner
-  // never shows during the run.
-  await expect(page.getByText('正在尝试重新协商连接')).toHaveCount(0)
+  // banner appears for a peer that's actually healthy. Read the observer
+  // installed before transfer so a transient error cannot disappear between
+  // two point-in-time assertions.
+  expect(await page.evaluate(() =>
+    (window as Window & { __misakaConnectionFailureSeen?: boolean }).__misakaConnectionFailureSeen,
+  )).toBe(false)
 }
 
 test.describe('two-peer file transfer (happy path)', () => {
@@ -142,14 +228,19 @@ test.describe('two-peer file transfer (happy path)', () => {
       await login(pageB, NODE_ID, PASS_CODE)
       await waitForPeer(pageA, NODE_ID)
       await waitForPeer(pageB, NODE_ID)
+      await installArtifactCapture(pageB)
 
       const file = createTempFile('hello.txt', 256 * 1024)
       try {
         await selectPeer(pageA, NODE_ID)
+        await waitForSelectedChannelReady(pageA)
+        await installConnectionFailureObserver(pageA)
+        await installConnectionFailureObserver(pageB)
         await uploadFiles(pageA, [file.path])
         await clickSend(pageA)
         await expectTransferComplete(pageA)
         await expectTransferComplete(pageB)
+        expect(await capturedArtifacts(pageB, 1)).toEqual([expectedArtifact(file.path)])
         await expectNoReconnectingBanner(pageA)
         await expectNoReconnectingBanner(pageB)
       } finally {
@@ -172,6 +263,7 @@ test.describe('two-peer file transfer (happy path)', () => {
       await login(pageB, NODE_ID, PASS_CODE)
       await waitForPeer(pageA, NODE_ID)
       await waitForPeer(pageB, NODE_ID)
+      await installArtifactCapture(pageB)
 
       const files = [
         createTempFile('report.pdf', 256 * 1024),
@@ -180,10 +272,16 @@ test.describe('two-peer file transfer (happy path)', () => {
       ]
       try {
         await selectPeer(pageA, NODE_ID)
+        await waitForSelectedChannelReady(pageA)
+        await installConnectionFailureObserver(pageA)
+        await installConnectionFailureObserver(pageB)
         await uploadFiles(pageA, files.map(f => f.path))
         await clickSend(pageA)
         await expectTransferComplete(pageA, 3)
         await expectTransferComplete(pageB, 3)
+        expect(await capturedArtifacts(pageB, 3)).toEqual(
+          files.map(file => expectedArtifact(file.path)),
+        )
         await expectNoReconnectingBanner(pageA)
         await expectNoReconnectingBanner(pageB)
       } finally {
@@ -208,6 +306,7 @@ test.describe('folder transfer', () => {
       await login(pageB, NODE_ID, PASS_CODE)
       await waitForPeer(pageA, NODE_ID)
       await waitForPeer(pageB, NODE_ID)
+      await installArtifactCapture(pageB)
 
       const folder = createTempFolder('photos', [
         { name: 'a.bin', size: 128 * 1024 },
@@ -216,11 +315,23 @@ test.describe('folder transfer', () => {
       ])
       try {
         await selectPeer(pageA, NODE_ID)
+        await waitForSelectedChannelReady(pageA)
+        await installConnectionFailureObserver(pageA)
+        await installConnectionFailureObserver(pageB)
         await uploadFolder(pageA, folder.folderPath)
         await clickSend(pageA)
         // Each file in the folder becomes its own transfer card on both sides.
         await expectTransferComplete(pageA, folder.paths.length)
         await expectTransferComplete(pageB, folder.paths.length)
+        // Folder relative paths are flattened at the storage boundary so a
+        // peer cannot create directories. Assert the ordered path→safe-name
+        // mapping as well as every artifact's bytes.
+        const folderName = folder.folderPath.split('/').pop()
+        expect(await capturedArtifacts(pageB, folder.paths.length)).toEqual(
+          folder.paths.map(path =>
+            expectedArtifact(path, `${folderName}_${path.split('/').pop()}`),
+          ),
+        )
         await expectNoReconnectingBanner(pageA)
         await expectNoReconnectingBanner(pageB)
       } finally {
@@ -234,7 +345,7 @@ test.describe('folder transfer', () => {
 })
 
 test.describe('broadcast to all peers', () => {
-  test('"群发文件到全部节点" fans the same file out to every connected peer', async ({ browser }) => {
+  test('"群发文件到全部节点" preserves every file at every connected peer', async ({ browser }) => {
     // Three nodes in the same identity cluster: A broadcasts, B and C both receive.
     const ctxs: BrowserContext[] = []
     const pages: Page[] = []
@@ -250,23 +361,35 @@ test.describe('broadcast to all peers', () => {
       await waitForPeerCount(pageA, NODE_ID, 2)
       await waitForPeer(pageB, NODE_ID)
       await waitForPeer(pageC, NODE_ID)
+      await installArtifactCapture(pageB)
+      await installArtifactCapture(pageC)
 
-      const file = createTempFile('broadcast.bin', 128 * 1024)
+      const files = [
+        createTempFile('broadcast-first.bin', 160 * 1024),
+        createTempFile('broadcast-second.json', 96 * 1024),
+      ]
       try {
         // Broadcast does not require selecting a peer; the broadcast button is
         // mounted on the empty TransferChannel as well as the per-peer view.
         // Selecting a peer just makes the button reachable via the same DOM
         // path the test helper uses.
-        await selectPeer(pageA, NODE_ID)
-        await broadcastFiles(pageA, [file.path])
-        // Sender card per recipient (2) + receiver card on each recipient (2) = 4
-        // "已完成" entries minimum.
-        await expectTransferComplete(pageA, 2)
-        await expectTransferComplete(pageB, 1)
-        await expectTransferComplete(pageC, 1)
+        for (let peerIndex = 0; peerIndex < 2; peerIndex++) {
+          await pageA.getByText(`御坂 ${NODE_ID} 号`, { exact: false }).nth(peerIndex).click()
+          await waitForSelectedChannelReady(pageA)
+        }
+        for (const page of pages) await installConnectionFailureObserver(page)
+        await broadcastFiles(pageA, files.map(file => file.path))
+        // Two ordered files × two recipients produce four independent sender
+        // outcomes; each receiver must expose both complete artifacts.
+        await expectTransferComplete(pageA, 4)
+        await expectTransferComplete(pageB, 2)
+        await expectTransferComplete(pageC, 2)
+        const expected = files.map(file => expectedArtifact(file.path))
+        expect(await capturedArtifacts(pageB, 2)).toEqual(expected)
+        expect(await capturedArtifacts(pageC, 2)).toEqual(expected)
         for (const p of pages) await expectNoReconnectingBanner(p)
       } finally {
-        rmSync(file.dir, { recursive: true, force: true })
+        files.forEach(file => rmSync(file.dir, { recursive: true, force: true }))
       }
     } finally {
       for (const c of ctxs) await c.close()

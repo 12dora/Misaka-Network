@@ -230,7 +230,7 @@ function TimelineSection() {
       <div className="max-w-4xl grid grid-cols-1 md:grid-cols-2 gap-5">
         {LORE_TIMELINE.map(item => (
           <MisakaCard key={item.title} padding="md">
-            <div className="font-mono text-xs text-[var(--accent-cyan)] mb-2">{item.date}</div>
+            <div className="font-mono text-xs text-[var(--bg-deep)] mb-2">{item.date}</div>
             <h3 className="font-kanji font-bold text-base text-[var(--text-on-white)] mb-2">{item.title}</h3>
             <p className="font-kanji text-sm leading-relaxed text-[var(--text-on-white-2)]">{item.body}</p>
           </MisakaCard>
@@ -379,14 +379,14 @@ export default function ACGN() {
           <div className="font-kanji text-base text-[var(--text-on-white)] leading-[1.85] space-y-4">
             <p>
               <strong style={{ color: 'var(--bg-deep)' }}>御坂网络</strong>是连接全部御坂妹妹的
-              <span style={{ color: 'var(--accent-cyan)' }}>脑量子波</span>
+              <span style={{ color: 'var(--bg-deep)' }}>脑量子波</span>
               共享网络。
             </p>
             <p>
               在《某科学的超电磁炮》设定中，约 20,000 名
-              <span style={{ color: 'var(--accent-cyan)' }}>实验体</span>
+              <span style={{ color: 'var(--bg-deep)' }}>实验体</span>
               通过脑量子波互联，形成
-              <span style={{ color: 'var(--accent-cyan)' }}>分布式</span>
+              <span style={{ color: 'var(--bg-deep)' }}>分布式</span>
               意识网络。每个妹妹既是独立个体，又能共享视觉、记忆、知识。
             </p>
             <p>

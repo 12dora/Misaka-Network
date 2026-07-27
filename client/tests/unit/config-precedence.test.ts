@@ -33,10 +33,6 @@ describe('CONFIG-006: mergeRuntimeConfig precedence', () => {
     expect(mergeRuntimeConfig({}, PUBLIC_JSON)).toEqual(PUBLIC_JSON)
   })
 
-  it('APP_BASE injected by the host survives a config.json that also sets it', () => {
-    expect(mergeRuntimeConfig({ APP_BASE: '/embedded' }, { APP_BASE: '/Misaka-Network' }))
-      .toEqual({ APP_BASE: '/embedded' })
-  })
 })
 
 describe('CONFIG-006: schema validation', () => {
@@ -53,7 +49,7 @@ describe('CONFIG-006: schema validation', () => {
     ['numeric API_BASE', { API_BASE: 42 }],
     ['http WS_URL', { WS_URL: 'https://example.com/ws' }],
     ['garbage WS_URL', { WS_URL: 'not a url' }],
-    ['absolute APP_BASE', { APP_BASE: 'https://evil.example/' }],
+    ['removed APP_BASE field', { APP_BASE: '/second-base' }],
   ])('drops %s', (_label, raw) => {
     expect(validateConfig(raw, 'test')).toEqual({})
   })
@@ -100,8 +96,7 @@ describe('CONFIG-006: loadConfig end-to-end', () => {
 
     expect(cfg.API_BASE).toBe(INJECTED.API_BASE)
     expect(cfg.WS_URL).toBe(INJECTED.WS_URL)
-    // The published object must reflect the same precedence for later readers
-    // (appBase.ts reads APP_BASE straight off it).
+    // The published object reflects the same backend precedence.
     expect(window.__MISAKA_CONFIG__).toEqual(INJECTED)
   })
 

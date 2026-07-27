@@ -7,11 +7,10 @@
 # The signaling container is NOT published to the host (`expose:` only), so
 # the only way in is through Caddy, and Caddy overwrites X-Forwarded-For with
 # the real socket peer (see Caddyfile.example). Those two facts together are
-# what make TRUST_PROXY=1 safe. If you put another proxy / CDN / load balancer
-# in front of Caddy, you must raise the hop count AND make that outer hop
-# rewrite the forwarded headers too — otherwise a client-supplied header wins
-# again and every per-IP defence (register IP cap, brute-force lock, rate
-# limits, TURN accounting) becomes spoofable.
+# what make TRUST_PROXY=1 safe. With a CDN, Caddy must trust only the CDN's
+# published CIDRs, derive the validated `{client_ip}`, and overwrite upstream
+# forwarding headers. Signaling still sees exactly one sanitized Caddy hop,
+# so it remains TRUST_PROXY=1. See docs/CDN_PROXY_TOPOLOGY.md.
 
 services:
   signaling:
@@ -113,8 +112,18 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+    # Caddy writes access logs to stdout. Bound Docker's local copies so IP
+    # addresses are not retained forever by an otherwise healthy deployment.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "7"
 
 volumes:
   misaka_data:
+    # Stable across project-directory/COMPOSE_PROJECT_NAME changes and matches
+    # the documented backup command exactly.
+    name: misaka_data
   caddy_data:
   caddy_config:

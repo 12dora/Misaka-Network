@@ -1,18 +1,22 @@
-import { createHash, randomBytes, scrypt, timingSafeEqual } from 'crypto'
+import { createHmac, randomBytes, scrypt, timingSafeEqual } from 'crypto'
 import type { WebSocket } from 'ws'
 import type { NodeSession, QrTokenRecord, ReportRecord } from './types.js'
-import { SERVER_SECRET, SCRYPT_MAX_CONCURRENT, SCRYPT_MAX_QUEUE } from './config.js'
+import { SERVER_SECRET_KEY, SCRYPT_MAX_CONCURRENT, SCRYPT_MAX_QUEUE } from './config.js'
 
 // ── customIdentifier derivation (P2-11) ─────────────────────────────
 //
 // Cloudflare logs and the CF dashboard see only customIdentifier — never the
 // sessionId or any user-recognisable handle. We derive it from
-// sha256(sessionId + SERVER_SECRET) and keep just the first 16 hex chars.
+// HMAC-SHA-256 keyed by SERVER_SECRET and keep just the first 16 hex chars.
 // The mapping is one-way: someone with CF logs alone cannot recover the
 // sessionId, while the server keeps both halves in memory and can revoke /
 // look up by either side. The redacted form is for log files we ship off-box.
 export function deriveCustomIdentifier(sessionId: string): string {
-  return createHash('sha256').update(sessionId + SERVER_SECRET).digest('hex').slice(0, 16)
+  return createHmac('sha256', SERVER_SECRET_KEY)
+    .update('misaka:turn-custom-id:v1\0')
+    .update(sessionId)
+    .digest('hex')
+    .slice(0, 16)
 }
 
 export function redactCustomIdentifier(cid: string): string {
@@ -143,15 +147,15 @@ export function findSessionsByNodeAndHash(nodeId: number, passCodeHash: string):
 //
 // Two hashes are kept per session, with very different jobs:
 //
-//   passCodeHash           — sha256(passCode). Deterministic, salt-free.
-//                            This is the "identity key" used for cluster
+//   passCodeHash           — HMAC-SHA-256(SERVER_SECRET, domain || passcode).
+//                            This is the opaque "identity key" used for cluster
 //                            channel id (so two devices with the same
 //                            (nodeId, passcode) hit the same channel) and
 //                            for the nodeId-occupied conflict check. It
-//                            does NOT defend against offline brute-force
-//                            of a 6-digit passcode (no hash can — the
-//                            keyspace is 10^6) so we accept its limits as
-//                            an identifier only.
+//                            stays deterministic inside one deployment but a
+//                            stolen session snapshot cannot be cracked with a
+//                            precomputed six-digit SHA-256 table without the
+//                            deployment secret.
 //
 //   passCodeVerifyHash +   — scrypt(passCode, salt). Per-session 16-byte
 //   passCodeSalt             salt. This is the only thing checked when
@@ -172,7 +176,10 @@ const SCRYPT_P = 1
 const SCRYPT_DK_LEN = 32
 
 export function hashPassCodeIdentity(code: string): string {
-  return createHash('sha256').update(code).digest('hex')
+  return createHmac('sha256', SERVER_SECRET_KEY)
+    .update('misaka/passcode-identity/v1\0')
+    .update(code)
+    .digest('hex')
 }
 
 export function newPassCodeSalt(): string {
@@ -237,7 +244,7 @@ export async function hashPassCodeScrypt(code: string, saltHex: string): Promise
 }
 
 interface PassCodeFields {
-  passCodeHash: string                         // sha256 identity hash
+  passCodeHash: string                         // keyed identity representation
   passCodeVerifyHash?: string                  // scrypt hash (current sessions)
   passCodeSalt?: string
   passCodeAlgo?: 'sha256' | 'scrypt'
@@ -263,7 +270,7 @@ export async function verifyAndMaybeUpgrade(
     const candidateHash = await hashPassCodeScrypt(candidate, stored.passCodeSalt)
     return { ok: timingSafeEqualHex(candidateHash, stored.passCodeVerifyHash) }
   }
-  // Legacy fall-back: only the sha256 identity hash is on disk. Verify and,
+  // Legacy fall-back: only the keyed identity representation is present.
   // if matched, return the scrypt fields so the caller upgrades on the spot.
   const legacy = hashPassCodeIdentity(candidate)
   if (!timingSafeEqualHex(legacy, stored.passCodeHash)) return { ok: false }
@@ -279,7 +286,7 @@ export async function verifyAndMaybeUpgrade(
 
 /**
  * Compute the canonical hashes for a fresh registration. Identity hash is
- * the deterministic sha256 (used as identity key and for cluster id);
+ * a deterministic deployment-keyed HMAC (used as identity key and cluster id);
  * verify hash is scrypt with a fresh per-session salt.
  */
 export async function newPassCodeRecord(code: string): Promise<{

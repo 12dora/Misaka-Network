@@ -52,6 +52,12 @@ function readBool(name: string, fallback: boolean): boolean {
 // ── HTTP / Process ────────────────────────────────────────────────────
 export const PORT = readInt('PORT', 9080, { min: 1, max: 65535 })
 export const SHUTDOWN_TIMEOUT_MS = 5_000
+// Integration-test process identity. The normal production bootstrap never
+// sets this variable; when a test deliberately launches a production-mode
+// child, it must still echo the nonce so readiness cannot accept a stale
+// listener on the same fixed port.
+export const TEST_INSTANCE_NONCE = process.env.TEST_INSTANCE_NONCE ?? ''
+export const IS_PRODUCTION = (process.env.NODE_ENV ?? '').toLowerCase() === 'production'
 
 // Whether to trust the `X-Forwarded-For` header when deriving the client IP.
 // SECURITY: this MUST default to off. Every per-IP defence (register IP cap,
@@ -131,6 +137,27 @@ export const TURN_CF_API_TOKEN = process.env.TURN_CF_API_TOKEN ?? ''
 export const TURN_CF_ACCOUNT_TAG = process.env.TURN_CF_ACCOUNT_TAG ?? ''
 export const TURN_CF_ANALYTICS_API_TOKEN = process.env.TURN_CF_ANALYTICS_API_TOKEN ?? TURN_CF_API_TOKEN
 
+/**
+ * Validate cross-field startup requirements after all individual values have
+ * been parsed. Kept explicit (rather than running at module import) so pure
+ * policy tests can import the configuration model with intentionally partial
+ * provider fixtures, while the real server can never bind in that state.
+ */
+export function validateStartupConfig(): void {
+  if (!TURN_AUTO_ENABLED) return
+  if (TURN_PROVIDER !== 'cloudflare') {
+    fail('TURN_PROVIDER', TURN_PROVIDER, 'TURN_AUTO_ENABLED=true 时目前只支持 cloudflare')
+  }
+  const missing = [
+    ['TURN_CF_KEY_ID', TURN_CF_KEY_ID],
+    ['TURN_CF_API_TOKEN', TURN_CF_API_TOKEN],
+    ['TURN_CF_ACCOUNT_TAG', TURN_CF_ACCOUNT_TAG],
+  ].filter(([, value]) => value.trim() === '').map(([name]) => name)
+  if (missing.length > 0) {
+    fail('TURN_AUTO_ENABLED', 'true', `缺少必填凭据：${missing.join(', ')}`)
+  }
+}
+
 // Per-credential lifetime. Revocation takes effect at most one TTL later
 // even if a CF revoke call fails.
 export const TURN_CREDENTIAL_TTL_SEC = readInt('TURN_CREDENTIAL_TTL_SEC', 300, { min: 30, max: 86400 })
@@ -204,17 +231,28 @@ export const QR_REDEEM_RATE_WINDOW_MS = 60_000
 
 // ── customIdentifier secret + WS unauth-grace ────────────────────────
 // Used to make customIdentifier opaque to anyone who only sees CF logs —
-// sessionId no longer leaks through it. If unset we generate a random
-// runtime secret and warn loudly; this means CF entries from before a
-// restart cannot be correlated, which is the correct degraded mode for an
-// unset secret. Production deployments MUST set this.
+// sessionId no longer leaks through it. Production requires exactly 32
+// decoded bytes represented as 64 hexadecimal characters. Development/tests
+// may omit it and receive an explicit random per-process key.
 import { randomBytes } from 'crypto'
-let _serverSecret = process.env.SERVER_SECRET ?? ''
+const configuredServerSecret = (process.env.SERVER_SECRET ?? '').trim()
+if (configuredServerSecret && !/^[0-9a-f]{64}$/i.test(configuredServerSecret)) {
+  const msg = '[config] 环境变量 SERVER_SECRET 无效：必须是 64 个十六进制字符（解码后 32 字节）'
+  console.error(msg)
+  throw new Error(msg)
+}
+if (!configuredServerSecret && IS_PRODUCTION) {
+  const msg = '[config] 环境变量 SERVER_SECRET 缺失：production 必须配置 32 字节密钥'
+  console.error(msg)
+  throw new Error(msg)
+}
+let _serverSecret = configuredServerSecret.toLowerCase()
 if (!_serverSecret) {
   _serverSecret = randomBytes(32).toString('hex')
   console.warn('[config] SERVER_SECRET not set; using a random per-process secret. Set SERVER_SECRET in production so customIdentifier is stable across restarts.')
 }
 export const SERVER_SECRET = _serverSecret
+export const SERVER_SECRET_KEY = Buffer.from(SERVER_SECRET, 'hex')
 
 // Time a freshly-opened WS has to send AUTH before we close it with 4001.
 // Idle connections were free to sit forever before this, which let an
@@ -292,8 +330,8 @@ export const TURN_REVOKE_RETRY_INTERVAL_MS = readInt('TURN_REVOKE_RETRY_INTERVAL
 // when the process is NOT a production build; the route additionally requires
 // the caller to be on the loopback interface (see http.ts). Both conditions
 // have to hold, so a production misconfiguration alone cannot open it.
-export const IS_PRODUCTION = (process.env.NODE_ENV ?? '').toLowerCase() === 'production'
 export const E2E_UNAUTH_RELEASE_ALLOWED = !IS_PRODUCTION && process.env.E2E_ALLOW_UNAUTH_RELEASE_BY_IP === '1'
+export const E2E_BUILD_NONCE = E2E_UNAUTH_RELEASE_ALLOWED ? (process.env.E2E_BUILD_NONCE ?? '') : ''
 if (process.env.E2E_ALLOW_UNAUTH_RELEASE_BY_IP === '1') {
   if (E2E_UNAUTH_RELEASE_ALLOWED) {
     console.warn('[config] E2E_ALLOW_UNAUTH_RELEASE_BY_IP=1 — /api/release-by-ip accepts UNAUTHENTICATED loopback callers. Never set this outside the test harness.')

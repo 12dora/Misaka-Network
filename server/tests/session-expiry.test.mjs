@@ -26,11 +26,10 @@
  * Usage: node tests/session-expiry.test.mjs
  */
 
-import { spawn } from 'child_process'
 import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
 import { WebSocket } from 'ws'
-import { runTest, killChild } from './_harness.mjs'
+import { runTest, killChild, spawn } from './_harness.mjs'
 
 runTest(main, { timeoutMs: 60_000 })
 
@@ -91,7 +90,7 @@ async function testFreshTokenWorks() {
   const skew = Math.abs(reg.expiresAt - (before + TTL_MS))
   assert(skew < 1500, `expiresAt 应约等于 now+TTL，实际偏差 ${skew}ms`)
 
-  const res = await fetch(`${BASE}/qr-token`, { headers: { Authorization: `Bearer ${reg.token}` } })
+  const res = await fetch(`${BASE}/qr-token`, { method: 'POST', headers: { Authorization: `Bearer ${reg.token}` } })
   assertEq(res.status, 200, '新 token 应可用')
 }
 
@@ -99,7 +98,7 @@ async function testExpiredTokenRejected() {
   const reg = await register(15011, '333444')
   await sleep(TTL_MS + 400)
 
-  const res = await fetch(`${BASE}/qr-token`, { headers: { Authorization: `Bearer ${reg.token}` } })
+  const res = await fetch(`${BASE}/qr-token`, { method: 'POST', headers: { Authorization: `Bearer ${reg.token}` } })
   assertEq(res.status, 401, '过期 token 在受保护路由上必须 401')
 
   // Same for the TURN issuance path — it resolves through the same helper.
@@ -213,7 +212,7 @@ function assertEq(actual, expected, msg) {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
 
 function startServer() {
-  const proc = spawn('npx', ['tsx', 'src/index.ts'], {
+  const proc = spawn('node', ['dist/index.js'], {
     cwd: SERVER_DIR,
     env: {
       ...process.env,
