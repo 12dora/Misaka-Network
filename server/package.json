@@ -3,13 +3,17 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20.12.0"
+  },
   "scripts": {
     "dev": "tsx watch src/bootstrap.ts",
     "build": "tsc",
-    "start": "node dist/index.js",
+    "start": "node dist/bootstrap.js",
+    "start:raw": "node dist/index.js",
     "typecheck": "tsc --noEmit",
     "test": "npm run build && npm run test:integration && npm run test:turn",
-    "test:integration": "node tests/register-edge.test.mjs && node tests/brute-force.test.mjs && node tests/brute-force-global.test.mjs && node tests/release-by-ip.test.mjs && node tests/signaling-end.test.mjs && node tests/ws-auth.test.mjs && node tests/ws-origin.test.mjs && node tests/csrf-origin.test.mjs && node tests/cleanup-with-active.test.mjs && node tests/ws-block.test.mjs && node tests/ws-reconnect-supersede.test.mjs && node tests/signal-peer-offline.test.mjs && node tests/activity-auth-gated.test.mjs && node tests/qr-redeem-ratelimit.test.mjs && node tests/qr-redeem-oracle.test.mjs && node tests/passcode-scrypt.test.mjs && node tests/persist-locks.test.mjs && node tests/trust-proxy.test.mjs && node tests/turn-revoke-retry.test.mjs",
+    "test:integration": "node tests/register-edge.test.mjs && node tests/brute-force.test.mjs && node tests/brute-force-global.test.mjs && node tests/release-by-ip.test.mjs && node tests/signaling-end.test.mjs && node tests/ws-auth.test.mjs && node tests/ws-origin.test.mjs && node tests/csrf-origin.test.mjs && node tests/cleanup-with-active.test.mjs && node tests/ws-block.test.mjs && node tests/ws-reconnect-supersede.test.mjs && node tests/signal-peer-offline.test.mjs && node tests/activity-auth-gated.test.mjs && node tests/qr-redeem-ratelimit.test.mjs && node tests/qr-redeem-oracle.test.mjs && node tests/passcode-scrypt.test.mjs && node tests/persist-locks.test.mjs && node tests/trust-proxy.test.mjs && node tests/turn-revoke-retry.test.mjs && node tests/session-expiry.test.mjs && node tests/ws-limits.test.mjs && node tests/ws-trust-proxy.test.mjs && node tests/config-validation.test.mjs && node tests/http-abuse-bounds.test.mjs && node tests/scrypt-nonblocking.test.mjs && node tests/activity-broadcast-scale.test.mjs",
     "test:turn": "node tests/turn-policy.test.mjs && node tests/turn-lifecycle.test.mjs && node tests/turn-http.test.mjs && node tests/turn-killswitch-reconcile.test.mjs && node tests/turn-toctou.test.mjs && node tests/turn-ip-hourly-cap.test.mjs",
     "test:stress": "node tests/stress-1gb.test.mjs"
   },
@@ -17,7 +21,7 @@
     "cors": "^2.8.5",
     "express": "^4.18.2",
     "nanoid": "^5.0.4",
-    "ws": "^8.20.1",
+    "ws": "^8.21.1",
     "zod": "^3.22.4"
   },
   "devDependencies": {

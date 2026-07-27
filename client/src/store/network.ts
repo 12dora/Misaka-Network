@@ -2,12 +2,12 @@ import { create } from 'zustand'
 import type { Peer, Transfer, NodeStatus, ChannelMessage, MessageStatus, PendingFileItem } from '@/types'
 import {
   connect as wsConnect, disconnect as wsDisconnect, send as wsSend,
-  onMessage, onConnect, onDisconnect, reconnectNow,
+  onMessage, onConnect, onDisconnect, onSessionEnd, reconnectNow,
 } from '@/lib/signaling'
 import {
   createPeerConnection, createDataChannel, createOffer, createAnswer,
   applyAnswer, addIceCandidate, getSelectedChannelType, getSelectedIcePath,
-  ensureAutoTurnReady, applyIceConfigToAll,
+  ensureAutoTurnReady, applyIceConfigToAll, isRelayAllowed,
   whenSignalingStable, endOfCandidatesFor, installIceErrorListener,
 } from '@/lib/webrtc'
 import {
@@ -49,7 +49,10 @@ const ecdhResolvers: Map<string, () => void> = new Map()
 const connectingPeers = new Map<string, Promise<RTCDataChannel>>()
 const remoteInitiatingPeers = new Set<string>()
 const primaryChannelResolvers = new Map<string, Set<() => void>>()
-const iceRestarting = new Set<string>()
+// peerSessionId → the peer generation the in-flight restart belongs to. A Map
+// (not a Set) so a stale restart can only release the lock it took itself —
+// otherwise it cleared the lock of the connection that replaced it (BUG-007).
+const iceRestarting = new Map<string, number>()
 const iceRestartAttempts = new Map<string, number>()
 // Schedule an ICE restart when state is 'disconnected' for too long. The
 // browser fires 'failed' very lazily (~30s), so we stop waiting and try
@@ -65,6 +68,61 @@ let initialized = false   // see init() — prevents StrictMode double-registrat
 const deliveredTransfers = new Set<string>()  // one file card per transferId
 const transferSpeedSamples = new Map<string, { bytes: number; at: number }>()
 let currentToken = ''
+
+// ── Session epoch (BUG-001 / BUG-002) ────────────────────────────────
+// One epoch = one authenticated signaling session. A new token, a new
+// `WELCOME.sessionId`, or an explicit logout ends the current epoch: peer
+// connections, data channels, ECDH keys, in-flight transfers and chat all
+// belong to the identity that created them and must never survive into the
+// next one. `networkEpoch` is monotonic so async work started under a dead
+// epoch can detect that it has been superseded.
+let networkEpoch = 0
+export function getNetworkEpoch(): number { return networkEpoch }
+
+// Per-peer monotonic generation. Every teardown or fresh initiation bumps it,
+// so any task that parked on an await can tell whether the connection it was
+// working on is still the current one (BUG-005 / BUG-007).
+const peerGenerations = new Map<string, number>()
+// In-flight initiations, keyed by peer and tagged with the generation they
+// were started for. Registered SYNCHRONOUSLY (before the first await) so two
+// entry points can never both create a PeerConnection.
+const initiatingPeers = new Map<string, { gen: number; task: Promise<void> }>()
+// Per-peer serialization chain for inbound signaling (BUG-006).
+const peerTaskQueues = new Map<string, Promise<void>>()
+// Unsubscribers for everything init() registered on the signaling module.
+// `signaling.disconnect()` deliberately no longer wipes the global handler
+// sets (the auth store's onAuthInvalid contract lives in the same sets), so
+// destroy() has to remove exactly what it added — otherwise a second init()
+// would process every signal twice.
+const unsubscribeSignaling: Array<() => void> = []
+
+function peerGeneration(peerSessionId: string): number {
+  return peerGenerations.get(peerSessionId) ?? 0
+}
+
+function bumpPeerGeneration(peerSessionId: string): number {
+  const next = peerGeneration(peerSessionId) + 1
+  peerGenerations.set(peerSessionId, next)
+  return next
+}
+
+function isCurrentGeneration(peerSessionId: string, gen: number): boolean {
+  return peerGeneration(peerSessionId) === gen
+}
+
+/**
+ * Run `fn` after every previously queued task for this peer. Rejections are
+ * logged and contained: they must neither escape as an unhandled rejection
+ * nor poison the rest of the queue.
+ */
+function enqueuePeerTask(peerSessionId: string, what: string, fn: () => Promise<void>): Promise<void> {
+  const previous = peerTaskQueues.get(peerSessionId) ?? Promise.resolve()
+  const next = previous.then(fn).catch(err => {
+    console.warn(`[net] ${what} failed`, peerSessionId, err)
+  })
+  peerTaskQueues.set(peerSessionId, next)
+  return next
+}
 
 // Messages typed before the DC fully opened, flushed in dc.onopen.
 const outgoingQueue = new Map<string, string[]>()
@@ -147,6 +205,51 @@ function waitForPrimaryChannel(peerSessionId: string, timeoutMs = 10_000): Promi
   })
 }
 
+// ── Signaling readiness barrier (BUG-004) ────────────────────────────
+// `wsSend()` silently drops anything written before the socket is OPEN, and
+// the server discards SIGNAL_* frames until the sender is authenticated and
+// in a channel. A recovery sweep that fired while the WS was still coming
+// back therefore built a PeerConnection, created an offer nobody received,
+// and left that PC parked in `peerConnections` — where it then blocked every
+// later initiate (`if (peerConnections.has(...)) return`).
+//
+// Readiness = socket open AND WELCOME processed AND JOIN_CLUSTER sent.
+// JOIN needs no ack: the socket is ordered, so anything we send after it is
+// processed by the server after the join.
+const SIGNALING_READY_TIMEOUT_MS = 8_000
+let signalingJoined = false
+const signalingReadyWaiters = new Set<(ready: boolean) => void>()
+
+function isSignalingReady(): boolean {
+  const s = useNetworkStore.getState()
+  return s.signalingStatus === 'online' && s.mySessionId !== null && signalingJoined
+}
+
+function notifySignalingReady() {
+  if (!isSignalingReady()) return
+  for (const settle of [...signalingReadyWaiters]) settle(true)
+}
+
+/** Epoch end / logout: settle every waiter as "not ready" instead of
+ *  leaving them parked until their timeout fires. */
+function abortSignalingReadyWaiters() {
+  for (const settle of [...signalingReadyWaiters]) settle(false)
+  signalingReadyWaiters.clear()
+}
+
+function whenSignalingReady(timeoutMs = SIGNALING_READY_TIMEOUT_MS): Promise<boolean> {
+  if (isSignalingReady()) return Promise.resolve(true)
+  return new Promise<boolean>(resolve => {
+    const settle = (ready: boolean) => {
+      clearTimeout(timer)
+      signalingReadyWaiters.delete(settle)
+      resolve(ready)
+    }
+    const timer = setTimeout(() => settle(false), timeoutMs)
+    signalingReadyWaiters.add(settle)
+  })
+}
+
 let recoveryInstalled = false
 let lastRecoverAt = 0
 let turnConfigUnsubscribe: (() => void) | null = null
@@ -157,6 +260,67 @@ let natConfigUnsubscribe: (() => void) | null = null
 let natProbeStarted = false
 let natStoreUnsubscribe: (() => void) | null = null
 
+// BUG-009: `setConfiguration()` only affects the NEXT gathering round — the
+// already-selected candidate pair keeps carrying traffic on the old path, so
+// toggling relay (or rotating credentials) left the actual route disagreeing
+// with the Settings UI. `applyIceConfigToAll` reports which live PCs saw a
+// materially different config; we migrate those with an ICE restart once
+// signaling is stable and the connection is still the current one.
+//
+// Changes are coalesced: a settings edit can emit several notifications in a
+// row (server list + master switch + force relay) and we only want one
+// restart per peer.
+const ICE_MIGRATION_DEBOUNCE_MS = 300
+let iceMigrationTimer: ReturnType<typeof setTimeout> | null = null
+const pendingIceMigration = new Set<string>()
+
+function sessionIdForPc(pc: RTCPeerConnection): string | null {
+  for (const [sid, candidate] of peerConnections) {
+    if (candidate === pc) return sid
+  }
+  return null
+}
+
+function propagateIceConfig() {
+  const changed = applyIceConfigToAll(peerConnections.values()) ?? []
+  for (const pc of changed) {
+    const sid = sessionIdForPc(pc)
+    if (sid) pendingIceMigration.add(sid)
+  }
+  if (pendingIceMigration.size === 0 || iceMigrationTimer) return
+  iceMigrationTimer = setTimeout(() => {
+    iceMigrationTimer = null
+    const targets = [...pendingIceMigration]
+    pendingIceMigration.clear()
+    for (const sid of targets) void migrateIcePath(sid)
+  }, ICE_MIGRATION_DEBOUNCE_MS)
+}
+
+async function migrateIcePath(peerSessionId: string) {
+  const pc = peerConnections.get(peerSessionId)
+  if (!pc) return
+  const gen = peerGeneration(peerSessionId)
+  const epoch = networkEpoch
+  // Nothing to migrate on a connection that hasn't picked a path yet — its
+  // first gathering round already uses the new config.
+  if (pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') return
+  try {
+    if (pc.signalingState !== 'stable') {
+      await whenSignalingStable(pc, { timeoutMs: 10_000 })
+    }
+    // Re-verify everything the awaits could have invalidated.
+    if (epoch !== networkEpoch || !isCurrentGeneration(peerSessionId, gen)) return
+    if (peerConnections.get(peerSessionId) !== pc) return
+    if (!isSignalingReady()) return
+    const offer = await pc.createOffer({ iceRestart: true })
+    if (epoch !== networkEpoch || peerConnections.get(peerSessionId) !== pc) return
+    await pc.setLocalDescription(offer)
+    wsSend({ t: 'SIGNAL_SDP', targetSessionId: peerSessionId, sdp: pc.localDescription!.toJSON() })
+  } catch (err) {
+    console.warn('[net] ICE path migration failed', peerSessionId, err)
+  }
+}
+
 function installTurnConfigPropagation() {
   if (turnConfigUnsubscribe) return
   turnConfigUnsubscribe = onTurnConfigChange(() => {
@@ -165,7 +329,7 @@ function installTurnConfigPropagation() {
     // existing connection's ICE config is frozen at the moment of
     // construction and any later credential rotation or settings change is
     // ignored until the PC is torn down and re-built.
-    applyIceConfigToAll(peerConnections.values())
+    propagateIceConfig()
   })
   // P1: also rebuild config when NAT type changes (e.g. user clicks the
   // detect button in Settings and we discover symmetric NAT). Same rationale
@@ -175,7 +339,7 @@ function installTurnConfigPropagation() {
       // Mirror the published NAT type into the store so the UI banner can
       // react without imperatively polling `getDetectedNatType()`.
       useNetworkStore.setState({ myNatType: t })
-      applyIceConfigToAll(peerConnections.values())
+      propagateIceConfig()
     })
   }
   if (!natStoreUnsubscribe) {
@@ -246,10 +410,76 @@ function startNatAndTurnProbes() {
  */
 export function isLikelyUnreachable(s: Pick<NetworkState, 'myNatType' | 'autoTurnAvailable'>): boolean {
   if (s.myNatType !== 'symmetric') return false
+  // BUG-008: the master switch gates auto TURN too. With relaying turned off
+  // there is no relay of either kind, so a symmetric NAT really is a dead end.
+  if (!isRelayAllowed()) return true
   if (s.autoTurnAvailable) return false
   const settings = loadTurnSettings()
   const hasManualTurn = settings.enabled && settings.servers.some(srv => srv.enabled)
   return !hasManualTurn
+}
+
+// ── Four-layer status model (UX-COPY-003) ────────────────────────────
+// The UI used to collapse four independent facts into one badge, so a dead
+// signaling socket still read "已接入" and an idle-but-healthy peer read
+// "数据流注入中". They are modelled separately:
+//
+//   1. auth      — the auth store's session token (is our identity valid?)
+//   2. signaling — `signalingStatus` below (can we reach the coordinator?)
+//   3. peer transport — per-peer `Peer.status` + `connectedPeers`
+//   4. transfer  — `transfers[]`
+//
+// `deriveNetworkStatus` folds layers 2–4 into the single badge the header
+// shows, picking the layer that actually explains the current situation.
+
+export type SignalingStatus = 'idle' | 'connecting' | 'online' | 'reconnecting' | 'offline'
+export type NetworkStatusKey = 'online' | 'transferring' | 'connecting' | 'reconnecting' | 'offline'
+
+const NETWORK_STATUS_LABELS: Record<NetworkStatusKey, string> = {
+  online: '在线',
+  transferring: '正在传输',
+  connecting: '正在连接',
+  reconnecting: '正在重新连接',
+  offline: '已离线',
+}
+
+export function networkStatusLabel(key: NetworkStatusKey): string {
+  return NETWORK_STATUS_LABELS[key]
+}
+
+function isActiveTransfer(t: Transfer): boolean {
+  return t.status === 'transferring' || t.status === 'pending'
+}
+
+export function deriveNetworkStatus(
+  s: Pick<NetworkState, 'signalingStatus' | 'peers' | 'transfers'>,
+): NetworkStatusKey {
+  // Signaling first: if the coordinator is unreachable, that is the fact the
+  // user needs (and the one with a retry affordance), whatever the peers say.
+  if (s.signalingStatus === 'idle' || s.signalingStatus === 'offline') return 'offline'
+  if (s.signalingStatus === 'reconnecting') return 'reconnecting'
+  if (s.signalingStatus === 'connecting') return 'connecting'
+
+  const connectedPeers = s.peers.filter(p => p.status === 'online' || p.status === 'transferring')
+  if (connectedPeers.length > 0) {
+    const busy = s.transfers.some(t => isActiveTransfer(t)
+      && connectedPeers.some(p => p.sessionId === t.peerSessionId))
+    return busy ? 'transferring' : 'online'
+  }
+  if (s.peers.some(p => p.status === 'reconnecting')) return 'reconnecting'
+  // Signaling is up but no peer transport is established yet.
+  return 'connecting'
+}
+
+/**
+ * Display status for one peer row. The store keeps `Peer.status` as pure
+ * transport state; "正在传输" is a property of the transfer layer, so it is
+ * derived here instead of being written into the peer record.
+ */
+export function peerDisplayStatus(peer: Peer, transfers: Transfer[]): NodeStatus {
+  if (peer.status !== 'online') return peer.status
+  const busy = transfers.some(t => t.peerSessionId === peer.sessionId && isActiveTransfer(t))
+  return busy ? 'transferring' : 'online'
 }
 
 // Re-export the auto-TURN state inspector so the page can decide whether
@@ -281,6 +511,26 @@ function installForegroundRecovery() {
     // speed calculation if we restore without clearing them.
     transferSpeedSamples.clear()
   })
+}
+
+/**
+ * BUG-004: after signaling comes back (fresh WELCOME + JOIN), re-negotiate
+ * every peer we still know about whose connection did not survive. Attempts
+ * made while signaling was down were refused by the readiness barrier, so
+ * something has to pick them up again — and the generation check makes this
+ * safe to run alongside the server's own PEER_JOINED-driven initiations.
+ */
+function renegotiateOrphanPeers() {
+  for (const peer of useNetworkStore.getState().peers) {
+    if (remoteInitiatingPeers.has(peer.sessionId)) continue
+    const pc = peerConnections.get(peer.sessionId)
+    const dc = dataChannels.get(peer.sessionId)
+    const alive = pc && pc.connectionState !== 'closed' && pc.connectionState !== 'failed'
+      && dc && dc.readyState !== 'closed'
+    if (alive) continue
+    cleanupPeerConnection(peer.sessionId, { failQueuedMessages: false })
+    initiateWebRTC(peer.sessionId).catch(err => console.warn('[net] orphan renegotiate failed', err))
+  }
 }
 
 function recoverConnections() {
@@ -323,8 +573,96 @@ function genMsgId(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
 }
 
+// ── Epoch teardown ───────────────────────────────────────────────────
+
+/**
+ * Hook for the transfer layer's epoch teardown.
+ *
+ * Ending an epoch must also stop every in-flight send/receive engine, but the
+ * transfer lifecycle lives in `lib/transfer.ts` and is owned separately — so
+ * the epoch code calls exactly this one named hook instead of reaching into
+ * transfer internals. Replace it with `setEpochTransferTeardown()` to extend
+ * the behaviour (e.g. flush partial receives, keep resumable records) without
+ * touching any epoch logic.
+ */
+export type EpochTransferTeardown = (transfers: Transfer[]) => void
+
+function defaultEpochTransferTeardown(transfers: Transfer[]) {
+  for (const t of transfers) {
+    if (t.status === 'completed') continue
+    try { engineCancelTransfer(t.id) } catch { /* engine may not know it */ }
+    void cancelReceive(t.id)
+    try { cancelStreamWrite(t.id) } catch { /* no stream writer */ }
+    cleanupOPFS(t.id).catch(() => {})
+    clearTransferSignal(t.id)
+  }
+  sendingFiles.clear()
+  transferSpeedSamples.clear()
+  deliveredTransfers.clear()
+  shortIdToTransferId.clear()
+}
+
+let epochTransferTeardown: EpochTransferTeardown = defaultEpochTransferTeardown
+
+export function setEpochTransferTeardown(fn: EpochTransferTeardown | null) {
+  epochTransferTeardown = fn ?? defaultEpochTransferTeardown
+}
+
+/**
+ * End the current network epoch: everything scoped to the authenticated
+ * session is destroyed and the epoch counter is bumped so any async work
+ * still parked on an await can detect that it has been superseded.
+ *
+ * Idempotent and safe to call when nothing was ever connected.
+ */
+function endNetworkEpoch(reason: string) {
+  networkEpoch++
+  signalingJoined = false
+  // Unblock anything parked on the readiness barrier: this epoch will never
+  // become ready, so those attempts must fail fast rather than time out.
+  abortSignalingReadyWaiters()
+
+  const state = useNetworkStore.getState()
+  const scopedIds = new Set<string>([
+    ...peerConnections.keys(),
+    ...remoteInitiatingPeers,
+    ...state.peers.map(p => p.sessionId),
+  ])
+  for (const sid of scopedIds) cleanupPeerConnection(sid)
+  peerGenerations.clear()
+  initiatingPeers.clear()
+  peerTaskQueues.clear()
+  pendingIceMigration.clear()
+  if (iceMigrationTimer) { clearTimeout(iceMigrationTimer); iceMigrationTimer = null }
+
+  epochTransferTeardown(state.transfers)
+  // Drop every ECDH/AES key: they were negotiated by the identity that just
+  // went away and must never be reused for the next one.
+  resetCrypto()
+
+  // Revoke cached object URLs — they pin File/Blob bytes (and OPFS handles)
+  // in memory for as long as the chatMessages entries live.
+  for (const msgs of Object.values(state.chatMessages)) {
+    for (const m of msgs) {
+      if (m.downloadUrl) { try { URL.revokeObjectURL(m.downloadUrl) } catch { /* ignore */ } }
+    }
+  }
+
+  console.warn(`[net] network epoch ended (${reason}) → ${networkEpoch}`)
+  useNetworkStore.setState({
+    mySessionId: null, channelId: null,
+    peers: [], selectedSessionId: null, transfers: [],
+    chatMessages: {}, pendingFiles: {}, connectedPeers: new Set(), unreadByPeer: {},
+    sendingPeers: new Set(),
+  })
+}
+
 interface NetworkState {
+  // Layer 2 of the four-layer status model (UX-COPY-003). `wsConnected` is
+  // the raw socket fact; `signalingStatus` is the authenticated+joined view
+  // the UI should render.
   wsConnected: boolean
+  signalingStatus: SignalingStatus
   mySessionId: string | null
   channelId: string | null
   peers: Peer[]
@@ -373,6 +711,7 @@ interface NetworkState {
 
 export const useNetworkStore = create<NetworkState>((set, get) => ({
   wsConnected: false,
+  signalingStatus: 'idle',
   mySessionId: null,
   channelId: null,
   peers: [],
@@ -400,19 +739,43 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
       // so we don't re-register handlers, but we MUST reconnect the WS with
       // the new token — otherwise signaling stays dead on the stale token.
       if (currentToken !== token) {
+        // BUG-002: a different token is a different authenticated identity.
+        // Everything the previous epoch built (peers, PC/DC, ECDH keys,
+        // transfers, chat) belongs to that identity — end the epoch BEFORE
+        // the new session can start routing through the same maps.
+        endNetworkEpoch('token-changed')
         currentToken = token
+        set({ signalingStatus: 'connecting' })
         wsConnect(token)
       }
       return
     }
     initialized = true
     currentToken = token
-    onMessage(async (msg) => {
+    unsubscribeSignaling.push(onMessage((msg) => {
       switch (msg.t) {
         case 'WELCOME': {
-          set({ wsConnected: true, mySessionId: msg.sessionId })
+          // BUG-002: the server may hand us a *different* sessionId on a
+          // reconnect (our old session was GC'd / released). Peers, keys and
+          // transfers keyed to the previous sessionId are dead — start a
+          // fresh epoch instead of letting the two coexist. A repeated
+          // WELCOME for the SAME session is just a transient WS drop and must
+          // keep the live peer connections (that is what makes resume fast).
+          const previousSessionId = get().mySessionId
+          if (previousSessionId !== null && previousSessionId !== msg.sessionId) {
+            endNetworkEpoch('session-id-changed')
+          }
+          set({ wsConnected: true, signalingStatus: 'online', mySessionId: msg.sessionId })
           // Auto-join the identity-scoped cluster channel.
           wsSend({ t: 'JOIN_CLUSTER' })
+          // The socket is ordered, so anything sent after JOIN_CLUSTER is
+          // processed by the server after the join: signaling is now "ready"
+          // for SDP/ICE (BUG-004).
+          signalingJoined = true
+          notifySignalingReady()
+          // Re-negotiate orphans: peers we still know about that have no live
+          // connection (their PC died while signaling was down).
+          renegotiateOrphanPeers()
           break
         }
 
@@ -491,16 +854,25 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
           break
         }
 
+        // BUG-006: negotiation for one peer must not interleave with itself.
+        // These used to be `await`ed inside the dispatch loop, which both
+        // stalled every OTHER peer's messages behind a slow SDP round AND
+        // let two offers from the same peer overlap (the dispatch loop calls
+        // handlers synchronously, so the second message re-entered before the
+        // first finished). Queue per peer, and swallow nothing silently.
         case 'SIGNAL_SDP':
-          await handleRemoteSDP(msg.fromSessionId, msg.fromNodeId, msg.sdp)
+          void enqueuePeerTask(msg.fromSessionId, 'handleRemoteSDP',
+            () => handleRemoteSDP(msg.fromSessionId, msg.fromNodeId, msg.sdp))
           break
 
         case 'SIGNAL_ICE':
-          await handleRemoteICE(msg.fromSessionId, msg.candidate)
+          void enqueuePeerTask(msg.fromSessionId, 'handleRemoteICE',
+            () => handleRemoteICE(msg.fromSessionId, msg.candidate))
           break
 
         case 'SIGNAL_ICE_END':
-          await handleRemoteICEEnd(msg.fromSessionId)
+          void enqueuePeerTask(msg.fromSessionId, 'handleRemoteICEEnd',
+            () => handleRemoteICEEnd(msg.fromSessionId))
           break
 
         case 'PEER_OFFLINE': {
@@ -519,7 +891,8 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
 
         case 'SERVER_SHUTDOWN':
           console.warn(`[Signaling] 服务器关闭: ${msg.reason}`)
-          set({ wsConnected: false })
+          signalingJoined = false
+          set({ wsConnected: false, signalingStatus: 'offline' })
           break
 
         case 'ERROR':
@@ -529,10 +902,12 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
         default:
           break
       }
-    })
+    }))
 
-    onConnect(() => {
-      set({ wsConnected: true })
+    unsubscribeSignaling.push(onConnect(() => {
+      // Socket is open but not yet authenticated: WELCOME is what promotes us
+      // to 'online' (UX-COPY-003 — "已接入" must not mean "TCP connected").
+      set({ wsConnected: true, signalingStatus: 'connecting' })
       // Prefetch auto TURN once authed. Server may reply 503 if disabled —
       // that's fine, we just fall back to STUN + manual TURN. Re-fetch on
       // every reconnect because credentials are short-lived.
@@ -546,18 +921,36 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
       // cheap and informational — the UI uses the result to warn ahead of
       // a 30s ICE-failure cycle when both sides are symmetric NAT.
       startNatAndTurnProbes()
-    })
-    onDisconnect(() => set({ wsConnected: false }))
+    }))
+    unsubscribeSignaling.push(onDisconnect(() => {
+      signalingJoined = false
+      set({
+        wsConnected: false,
+        // The socket dropped but we still hold a token, so signaling.ts is
+        // already scheduling a retry — that is 'reconnecting', not 'offline'.
+        signalingStatus: currentToken ? 'reconnecting' : 'offline',
+      })
+    }))
+    // BUG-001: an explicit logout must end the epoch even when this page
+    // isn't mounted — the auth store calls endSession() and we tear down.
+    unsubscribeSignaling.push(onSessionEnd(() => {
+      useNetworkStore.getState().destroy()
+    }))
 
+    set({ signalingStatus: 'connecting' })
     wsConnect(token)
     installForegroundRecovery()
     installTurnConfigPropagation()
   },
 
   destroy() {
+    // Order: stop signaling first so nothing re-enters while we tear the
+    // epoch down, then destroy every session-scoped artefact.
     wsDisconnect()
-    for (const sid of peerConnections.keys()) cleanupPeerConnection(sid)
-    resetCrypto()
+    for (const off of unsubscribeSignaling.splice(0)) {
+      try { off() } catch { /* ignore */ }
+    }
+    endNetworkEpoch('destroy')
     clearAutoTurn()
     if (turnConfigUnsubscribe) { turnConfigUnsubscribe(); turnConfigUnsubscribe = null }
     if (natConfigUnsubscribe) { natConfigUnsubscribe(); natConfigUnsubscribe = null }
@@ -568,20 +961,8 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     natProbeStarted = false
     initialized = false
     currentToken = ''
-    // Revoke every cached download URL — these point at File/Blob objects
-    // held in chatMessages, which otherwise stay alive (and keep the file
-    // bytes resident in memory / OPFS) forever.
-    const state = get()
-    for (const msgs of Object.values(state.chatMessages)) {
-      for (const m of msgs) {
-        if (m.downloadUrl) { try { URL.revokeObjectURL(m.downloadUrl) } catch { /* ignore */ } }
-      }
-    }
     set({
-      wsConnected: false, mySessionId: null, channelId: null,
-      peers: [], selectedSessionId: null, transfers: [],
-      chatMessages: {}, pendingFiles: {}, connectedPeers: new Set(), unreadByPeer: {},
-      sendingPeers: new Set(),
+      wsConnected: false, signalingStatus: 'idle',
       // Preserve the last detected NAT type — it's still a useful prior
       // until the next init() probes again. Reset autoTurnAvailable
       // because the new session may target a different signaling server.
@@ -1028,13 +1409,58 @@ function appendSystemChat(peerSessionId: string, content: string, direction: 'se
   })
 }
 
-async function initiateWebRTC(peerSessionId: string) {
+/**
+ * Start (or join) the outbound negotiation for one peer.
+ *
+ * BUG-005: the in-flight task is registered SYNCHRONOUSLY, before the first
+ * await, and tagged with the peer generation it belongs to. Two entry points
+ * (auto-initiate, manual reconnect, recovery sweep, queued send) therefore
+ * either share one attempt or supersede it — they can no longer both build a
+ * PeerConnection, overwrite each other in `peerConnections` and leave one of
+ * them alive but unreachable by any cleanup path.
+ */
+function initiateWebRTC(peerSessionId: string): Promise<void> {
+  const inFlight = initiatingPeers.get(peerSessionId)
+  // Only reuse an attempt that belongs to the CURRENT generation — a
+  // cleanup/teardown in between means the caller wants a genuinely new
+  // connection, and the old task is about to abort itself.
+  if (inFlight && inFlight.gen === peerGeneration(peerSessionId)) return inFlight.task
+
+  const gen = bumpPeerGeneration(peerSessionId)
+  const task = initiateWebRTCInner(peerSessionId, gen).finally(() => {
+    const current = initiatingPeers.get(peerSessionId)
+    if (current && current.gen === gen) initiatingPeers.delete(peerSessionId)
+  })
+  initiatingPeers.set(peerSessionId, { gen, task })
+  return task
+}
+
+/** Close a PeerConnection this attempt built but is no longer allowed to use. */
+function abandonPeerConnection(peerSessionId: string, pc: RTCPeerConnection) {
+  if (peerConnections.get(peerSessionId) === pc) peerConnections.delete(peerSessionId)
+  try { pc.close() } catch { /* already dead */ }
+}
+
+async function initiateWebRTCInner(peerSessionId: string, gen: number) {
   if (peerConnections.has(peerSessionId)) return
+  const epoch = networkEpoch
+
+  // BUG-004: never build a PC (and burn an offer) before signaling is
+  // authenticated AND joined — `wsSend` drops silently while the socket is
+  // down, and the residual PC then blocked every later attempt.
+  if (!await whenSignalingReady()) {
+    throw new Error('信令尚未就绪，暂时无法建立连接')
+  }
+  if (epoch !== networkEpoch || !isCurrentGeneration(peerSessionId, gen)) return
+
   // Without this, the first PC after WELCOME is built before the auto-TURN
   // credential fetch resolves — symmetric-NAT peers get a non-relay PC,
   // first ICE round fails, only the second restart attempt (~5s later) has
   // TURN. Wait briefly for credentials so the very first handshake has them.
   await ensureAutoTurnReady()
+  if (epoch !== networkEpoch || !isCurrentGeneration(peerSessionId, gen)) return
+  if (peerConnections.has(peerSessionId)) return
+
   const pc = createPeerConnection()
   installIceErrorListener(pc)
   peerConnections.set(peerSessionId, pc)
@@ -1052,6 +1478,10 @@ async function initiateWebRTC(peerSessionId: string) {
   }
 
   await generateECDHKeyPair(peerSessionId)
+  if (epoch !== networkEpoch || peerConnections.get(peerSessionId) !== pc) {
+    abandonPeerConnection(peerSessionId, pc)
+    return
+  }
 
   pc.onicecandidate = (e) => {
     if (e.candidate) {
@@ -1066,6 +1496,13 @@ async function initiateWebRTC(peerSessionId: string) {
   pc.oniceconnectionstatechange = () => handleIceStateChange(pc, peerSessionId)
 
   const offer = await createOffer(pc)
+  // Superseded while the browser was building the offer: the SDP belongs to a
+  // connection nobody routes through any more, so publishing it would make
+  // the remote answer the wrong PC.
+  if (epoch !== networkEpoch || peerConnections.get(peerSessionId) !== pc) {
+    abandonPeerConnection(peerSessionId, pc)
+    return
+  }
   wsSend({ t: 'SIGNAL_SDP', targetSessionId: peerSessionId, sdp: offer })
 
   const pending = pendingIceCandidates.get(peerSessionId)
@@ -1265,7 +1702,7 @@ function handleIceStateChange(pc: RTCPeerConnection, peerSessionId: string) {
             p.sessionId === peerSessionId ? { ...p, status: 'reconnecting' as NodeStatus } : p,
           ),
         }))
-        if (prevStatus === 'transferring') {
+        if (prevStatus === 'online' || prevStatus === 'transferring') {
           appendSystemChat(peerSessionId, '⚠ 连接中断，尝试恢复中…')
         }
         attemptIceRestart(peerSessionId)
@@ -1294,7 +1731,11 @@ async function onIceConnected(pc: RTCPeerConnection, peerSessionId: string) {
       p.sessionId === peerSessionId
         ? {
             ...p,
-            status: 'transferring' as NodeStatus,
+            // UX-COPY-003: `Peer.status` is TRANSPORT state only. A healthy
+            // idle peer is 'online' — it used to be written as 'transferring'
+            // ("数据流注入中") the instant ICE connected, with no transfer in
+            // sight. The transfer layer is derived via `peerDisplayStatus()`.
+            status: 'online' as NodeStatus,
             channelType: ct ?? 'stun',
             icePath: selectedPath?.pathText,
             icePathMeasuredAt: selectedPath?.pathText ? Date.now() : p.icePathMeasuredAt,
@@ -1329,8 +1770,9 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
     const prevMsgs = useNetworkStore.getState().chatMessages[peerSessionId] ?? []
     const isReconnect = prevMsgs.some(m => m.type !== 'system')
     useNetworkStore.setState(s => ({
+      // Transport is up — see the UX-COPY-003 note in onIceConnected.
       peers: s.peers.map(p =>
-        p.sessionId === peerSessionId ? { ...p, status: 'transferring' as const } : p,
+        p.sessionId === peerSessionId ? { ...p, status: 'online' as const } : p,
       ),
       connectedPeers: new Set([...s.connectedPeers, peerSessionId]),
     }))
@@ -1653,8 +2095,26 @@ function setupDataChannel(dc: RTCDataChannel, peerSessionId: string) {
   }
 }
 
+/**
+ * BUG-007: an ICE restart sleeps through an exponential backoff (up to 16 s)
+ * and may then wait for `signalingState === 'stable'`. During that window the
+ * peer can leave, be blocked, or have its PeerConnection replaced by a manual
+ * reconnect. The old code resumed against whatever was in the maps by then —
+ * resurrecting departed peers, restarting a brand-new connection, and
+ * clearing the *new* attempt's in-progress lock on the way out.
+ *
+ * Every await is therefore followed by a re-check of: the epoch, the peer
+ * generation, the peer still being in the roster, and the exact PC identity.
+ */
 async function attemptIceRestart(peerSessionId: string) {
   if (iceRestarting.has(peerSessionId)) return
+  const gen = peerGeneration(peerSessionId)
+  const epoch = networkEpoch
+  const stillCurrent = () =>
+    epoch === networkEpoch
+    && isCurrentGeneration(peerSessionId, gen)
+    && useNetworkStore.getState().peers.some(p => p.sessionId === peerSessionId)
+
   const attempts = iceRestartAttempts.get(peerSessionId) ?? 0
   if (attempts >= MAX_ICE_RESTART_ATTEMPTS) {
     useNetworkStore.setState(s => ({
@@ -1667,29 +2127,34 @@ async function attemptIceRestart(peerSessionId: string) {
     return
   }
 
-  iceRestarting.add(peerSessionId)
+  // Tagged with the generation we took it for, so a superseded attempt can
+  // only ever release its OWN lock.
+  iceRestarting.set(peerSessionId, gen)
   // P2-5: previously incremented BEFORE the early-out checks below. A
   // restart that hit `signalingState !== 'stable'` and aborted at line ~1390
   // still burned an attempt, so 5 fast aborts marked the peer offline
   // without a single real retry. Defer the +1 until we're past the early
   // exits.
 
-  // Exponential backoff: spread out retries so we don't hammer the signaling
-  // server when the network is genuinely down.
-  const delay = ICE_RESTART_BACKOFF_MS[Math.min(attempts, ICE_RESTART_BACKOFF_MS.length - 1)]
-  if (delay > 0) await new Promise(r => setTimeout(r, delay))
-
-  useNetworkStore.setState(s => ({
-    peers: s.peers.map(p =>
-      p.sessionId === peerSessionId ? { ...p, status: 'reconnecting' as NodeStatus } : p,
-    ),
-  }))
-
   try {
+    // Exponential backoff: spread out retries so we don't hammer the signaling
+    // server when the network is genuinely down.
+    const delay = ICE_RESTART_BACKOFF_MS[Math.min(attempts, ICE_RESTART_BACKOFF_MS.length - 1)]
+    if (delay > 0) await new Promise(r => setTimeout(r, delay))
+    // The peer may have left / been blocked / been rebuilt while we slept.
+    if (!stillCurrent()) return
+
+    useNetworkStore.setState(s => ({
+      peers: s.peers.map(p =>
+        p.sessionId === peerSessionId ? { ...p, status: 'reconnecting' as NodeStatus } : p,
+      ),
+    }))
+
     const pc = peerConnections.get(peerSessionId)
     if (!pc || pc.connectionState === 'closed' || pc.connectionState === 'failed') {
       cleanupPeerConnection(peerSessionId, { failQueuedMessages: false })
-      // initiateWebRTC IS a real restart attempt — count it.
+      // initiateWebRTC IS a real restart attempt — count it. (cleanup bumped
+      // the generation, so from here on we're driving the new one.)
       iceRestartAttempts.set(peerSessionId, attempts + 1)
       await initiateWebRTC(peerSessionId)
       return
@@ -1707,23 +2172,33 @@ async function attemptIceRestart(peerSessionId: string) {
         console.warn('[net] iceRestart wait-for-stable timed out', err)
         return
       }
+      // Same re-check after the second await, plus PC identity: a manual
+      // reconnect may have replaced the connection we were waiting on.
+      if (!stillCurrent() || peerConnections.get(peerSessionId) !== pc) return
     }
+    // Signaling must be back up, otherwise the restart offer is dropped by
+    // `wsSend` and we've burned an attempt for nothing (BUG-004).
+    if (!isSignalingReady()) return
 
     iceRestartAttempts.set(peerSessionId, attempts + 1)
     const offer = await pc.createOffer({ iceRestart: true })
+    if (!stillCurrent() || peerConnections.get(peerSessionId) !== pc) return
     await pc.setLocalDescription(offer)
+    if (!stillCurrent() || peerConnections.get(peerSessionId) !== pc) return
     // Trickle — candidates will stream via onicecandidate. (Same fix as
     // createOffer/createAnswer: the `{ once: true }` gathering wait could
     // miss the `complete` event and hang the restart forever.)
     wsSend({ t: 'SIGNAL_SDP', targetSessionId: peerSessionId, sdp: pc.localDescription!.toJSON() })
   } catch {
-    useNetworkStore.setState(s => ({
-      peers: s.peers.map(p =>
-        p.sessionId === peerSessionId ? { ...p, status: 'offline' as NodeStatus } : p,
-      ),
-    }))
+    if (stillCurrent()) {
+      useNetworkStore.setState(s => ({
+        peers: s.peers.map(p =>
+          p.sessionId === peerSessionId ? { ...p, status: 'offline' as NodeStatus } : p,
+        ),
+      }))
+    }
   } finally {
-    iceRestarting.delete(peerSessionId)
+    if (iceRestarting.get(peerSessionId) === gen) iceRestarting.delete(peerSessionId)
   }
 }
 
@@ -1860,8 +2335,13 @@ async function sendResumeRequests(peerSessionId: string, dc: RTCDataChannel) {
 function cleanupPeerConnection(sessionId: string, options: { failQueuedMessages?: boolean } = {}) {
   const { failQueuedMessages = true } = options
   if (failQueuedMessages) failPendingMessages(sessionId)
+  // Anything still parked on an await for this peer (initiation, delayed ICE
+  // restart, config migration) is now working on a dead connection — bumping
+  // the generation is how those tasks learn to abort (BUG-005 / BUG-007).
+  bumpPeerGeneration(sessionId)
   iceRestartAttempts.delete(sessionId)
   iceRestarting.delete(sessionId)
+  pendingIceMigration.delete(sessionId)
   clearDisconnectedTimer(sessionId)
   // Detach dc.onclose BEFORE calling dc.close(). Otherwise the listener set in
   // setupDataChannel sees pc still alive (we close dc first, pc second) and

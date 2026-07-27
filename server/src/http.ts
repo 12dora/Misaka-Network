@@ -6,7 +6,7 @@ import {
   nodes, channels, qrTokens, reports, stats, getOnlineCount, getLongestUptimeMs, countNodesByIp,
   getCpuUsagePercent, findSessionByToken, attemptLocks, attemptKey,
   nodeFreezes, hashPassCodeIdentity, newPassCodeRecord, verifyAndMaybeUpgrade,
-  deriveCustomIdentifier, redactCustomIdentifier,
+  deriveCustomIdentifier, redactCustomIdentifier, ScryptBusyError, unmarkSocket,
 } from './store.js'
 import { broadcast } from './activity.js'
 import { checkRateLimit } from './ratelimit.js'
@@ -21,6 +21,8 @@ import {
   REPORT_RATE_MAX, REPORT_RATE_WINDOW_MS, REPORT_WARN_COUNT, REPORT_WARN_WINDOW_MS,
   NODE_FREEZE_THRESHOLD, NODE_FREEZE_WINDOW_MS, NODE_FREEZE_DURATION_MS,
   QR_REDEEM_RATE_LIMIT, QR_REDEEM_RATE_WINDOW_MS,
+  MAX_TRANSFER_BYTES, TRANSFER_DONE_RATE_LIMIT, TRANSFER_DONE_RATE_WINDOW_MS,
+  E2E_UNAUTH_RELEASE_ALLOWED,
 } from './config.js'
 
 export const router = Router()
@@ -47,6 +49,25 @@ function enforceOrigin(req: Request, res: Response): boolean {
   if (isHttpOriginAllowed(req)) return true
   res.status(403).json({ error: 'BAD_ORIGIN', origin: getRequestOrigin(req) ?? null })
   return false
+}
+
+// Express 4 does not forward a rejected promise out of a route handler, so an
+// async route that throws would leave the request hanging until the client
+// gives up. Every async handler below goes through this wrapper. A
+// ScryptBusyError means the bounded passcode-hashing budget (SECURITY-013) is
+// saturated — that is a "come back later", not a bug, so it maps to 503.
+function asyncRoute(fn: (req: Request, res: Response) => Promise<void>) {
+  return (req: Request, res: Response) => {
+    fn(req, res).catch((err: unknown) => {
+      if (res.headersSent) return
+      if (err instanceof ScryptBusyError) {
+        res.status(503).json({ error: 'SERVER_BUSY', message: '服务器繁忙，请稍后再试' })
+        return
+      }
+      console.error('[http] 路由未捕获异常:', err)
+      res.status(500).json({ error: 'INTERNAL' })
+    })
+  }
 }
 
 // Rate limit middleware
@@ -116,7 +137,7 @@ function clearNodeFreezeOnSuccess(nodeId: number) {
 }
 
 // POST /api/register
-router.post('/register', (req, res) => {
+router.post('/register', asyncRoute(async (req, res) => {
   if (!enforceOrigin(req, res)) return
 
   const parsed = z.object({
@@ -206,7 +227,26 @@ router.post('/register', (req, res) => {
 
   const sessionId = nanoid(16)
   const token = randomBytes(32).toString('hex')
-  const pcRecord = newPassCodeRecord(passCode)
+  // scrypt is async now (SECURITY-013), so the admission checks above are no
+  // longer atomic with the insert below — two concurrent registers for the
+  // same nodeId could both have passed. Re-run the two checks that guard
+  // shared state after the await, before we publish the session.
+  const pcRecord = await newPassCodeRecord(passCode)
+  for (const s of nodes.values()) {
+    if (s.nodeId === nodeId && s.passCodeHash !== pcRecord.passCodeHash) {
+      res.status(409).json({ error: 'NODE_OCCUPIED', message: '该节点编号的通行码错误，请重新输入', remaining: MAX_ATTEMPTS })
+      return
+    }
+  }
+  if (nodes.size >= MAX_NODES) {
+    res.status(503).json({ error: 'NETWORK_FULL', message: '御坂网络已达容量上限' })
+    return
+  }
+  if (countNodesByIp(ip) >= MAX_NODES_PER_IP) {
+    res.status(429).json({ error: 'IP_LIMITED', message: '此 IP 地址节点数已达上限' })
+    return
+  }
+
   const session: NodeSession = {
     sessionId,
     nodeId,
@@ -219,6 +259,9 @@ router.post('/register', (req, res) => {
     failedAttempts: 0,
     lockedUntil: 0,
     joinedAt: now,
+    // SECURITY-001: the TTL we advertise below is now also the one we store
+    // and enforce. Absolute, never extended by reconnects.
+    expiresAt: now + SESSION_TTL_MS,
     ip,
   }
   // Attach scrypt verification fields. These may not exist on the
@@ -243,18 +286,29 @@ router.post('/register', (req, res) => {
 
   broadcast({ type: 'join', nodeId, message: `御坂 ${nodeId} 号已接入网络` })
 
-  res.json({ sessionId, token, expiresAt: now + SESSION_TTL_MS, resumed: false })
-})
+  res.json({ sessionId, token, expiresAt: session.expiresAt, resumed: false })
+}))
+
+// Loopback check for the E2E escape hatch (SECURITY-016). The Playwright
+// harness always talks to 127.0.0.1; a real deployment's clients never do.
+function isLoopbackAddress(ip: string): boolean {
+  return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1' || ip.startsWith('127.')
+}
 
 // POST /api/release-by-ip
-router.post('/release-by-ip', (req, res) => {
+router.post('/release-by-ip', asyncRoute(async (req, res) => {
   if (!enforceOrigin(req, res)) return
 
   const authHeader = req.headers.authorization
   const ip = getClientIP(req)
   const now = Date.now()
 
-  const testBypass = process.env.E2E_ALLOW_UNAUTH_RELEASE_BY_IP === '1'
+  // SECURITY-016: the unauthenticated "wipe every session on this IP" path is
+  // only reachable when ALL THREE hold — the env flag is set, the process is
+  // not a production build (see config.E2E_UNAUTH_RELEASE_ALLOWED), and the
+  // caller is on loopback. A production process that merely inherits the flag
+  // by mistake still gets the normal 401.
+  const testBypass = E2E_UNAUTH_RELEASE_ALLOWED && isLoopbackAddress(req.socket.remoteAddress ?? '')
 
   let scopeNodeId: number | null = null
   let scopePassHash: string | null = null
@@ -304,7 +358,7 @@ router.post('/release-by-ip', (req, res) => {
       if (s.ip !== ip) continue
       if (s.nodeId !== parsed.data.nodeId) continue
       if (s.passCodeHash !== identity) continue
-      const { ok, upgrade } = verifyAndMaybeUpgrade(parsed.data.passCode, s as NodeSession & { passCodeVerifyHash?: string; passCodeSalt?: string; passCodeAlgo?: 'sha256' | 'scrypt' })
+      const { ok, upgrade } = await verifyAndMaybeUpgrade(parsed.data.passCode, s as NodeSession & { passCodeVerifyHash?: string; passCodeSalt?: string; passCodeAlgo?: 'sha256' | 'scrypt' })
       if (!ok) continue
       if (upgrade) Object.assign(s, upgrade)
       matched = s
@@ -335,6 +389,10 @@ router.post('/release-by-ip', (req, res) => {
     if (session.ip !== ip) continue
     if (scopeNodeId !== null && (session.nodeId !== scopeNodeId || session.passCodeHash !== scopePassHash)) continue
     if (session.socket) {
+      // Drop the authenticated-socket index entry here rather than relying on
+      // the 'close' handler: that handler bails early once session.socket is
+      // null, which would otherwise leak the entry (SECURITY-014).
+      unmarkSocket(session.socket)
       try { session.socket.close() } catch { /* ignore */ }
       session.socket = null
     }
@@ -350,7 +408,7 @@ router.post('/release-by-ip', (req, res) => {
     released++
   }
   res.json({ released })
-})
+}))
 
 // POST /api/release
 router.post('/release', (req, res) => {
@@ -360,6 +418,7 @@ router.post('/release', (req, res) => {
   const session = findSessionByToken(parsed.data.token)
   if (session) {
     if (session.socket) {
+      unmarkSocket(session.socket)
       session.socket.close()
       session.socket = null
     }
@@ -426,16 +485,33 @@ router.get('/health', (_req, res) => {
 })
 
 // POST /api/transfer-done
+//
+// SECURITY-018: this counter is self-reported and published on /api/stats, so
+// it needs three bounds, not one. `z.number().int()` alone accepted 1e308
+// (Number.isInteger(1e308) is true), which pushed totalBytes to Infinity in a
+// single call. Now: a safe-integer + realistic-size ceiling per call, and a
+// per-IP call rate so a loop cannot inflate the totals either.
 router.post('/transfer-done', (req, res) => {
   const parsed = z.object({
     token: z.string(),
-    bytes: z.number().int().min(0).optional(),
+    bytes: z.number()
+      .int()
+      .min(0)
+      .max(MAX_TRANSFER_BYTES)
+      .refine(Number.isSafeInteger, { message: 'bytes must be a safe integer' })
+      .optional(),
   }).safeParse(req.body)
 
   if (!parsed.success) { res.status(400).json({ error: 'INVALID_INPUT' }); return }
 
   const session = authMiddleware(parsed.data.token)
   if (!session) { res.status(401).json({ error: 'UNAUTHORIZED' }); return }
+
+  const ip = getClientIP(req)
+  if (!checkRateLimit(`transfer-done:${ip}`, TRANSFER_DONE_RATE_LIMIT, TRANSFER_DONE_RATE_WINDOW_MS)) {
+    res.status(429).json({ error: 'RATE_LIMITED', message: '传输上报过于频繁' })
+    return
+  }
 
   stats.totalTransfers++
   stats.totalBytes += parsed.data.bytes ?? 0

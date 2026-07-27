@@ -3,13 +3,13 @@ import cors from 'cors'
 import { createServer } from 'http'
 import { WebSocketServer } from 'ws'
 import { router } from './http.js'
-import { setupWS } from './ws.js'
+import { setupWS, setTrustProxyFn } from './ws.js'
 import { setWSS } from './activity.js'
 import { startCleanupTask, stopCleanupTask } from './cleanup.js'
 import { loadTurnState, startPersistFlusher, stopPersistFlusher, flushTurnState, loadPersistedLocks, flushPersistedLocks } from './persist.js'
 import { startTurnPollers, stopTurnPollers, startTurnRevokeRetry, stopTurnRevokeRetry } from './turn.js'
 import { allowedOrigins, isOriginAllowed, isOriginAllowedForRequest, isWildcardOriginMode } from './origin.js'
-import { PORT, SHUTDOWN_TIMEOUT_MS, TRUST_PROXY } from './config.js'
+import { PORT, SHUTDOWN_TIMEOUT_MS, TRUST_PROXY, WS_MAX_PAYLOAD_BYTES } from './config.js'
 
 const app = express()
 
@@ -17,6 +17,12 @@ const app = express()
 // spoofed X-Forwarded-For header (which would defeat every per-IP defence).
 // Operators behind a reverse proxy set TRUST_PROXY (see config.ts).
 app.set('trust proxy', TRUST_PROXY)
+
+// SECURITY-005: hand Express' *compiled* trust predicate to the WS layer so
+// the upgrade handshake resolves the client IP through exactly the same hop
+// rules as `req.ip`. Before this the WS side took the left-most (i.e.
+// client-controlled) X-Forwarded-For entry and could be handed a forged IP.
+setTrustProxyFn(app.get('trust proxy fn'))
 
 // CORS policy:
 //   - ALLOWED_ORIGINS=* → wildcard mode (echo any Origin). Intended for the
@@ -56,6 +62,14 @@ const httpServer = createServer(app)
 const wss = new WebSocketServer({
   server: httpServer,
   path: '/ws',
+  // SECURITY-002: the transport-level ceiling. The application check in ws.ts
+  // only ran after `ws` had already buffered the entire message and turned it
+  // into a string, so an unauthenticated client could make the process
+  // allocate arbitrarily much before being told "too large". With maxPayload
+  // set, the receiver aborts the connection (close 1009) as soon as the
+  // accumulated frame length crosses the limit — including across
+  // continuation frames — so nothing oversize is ever fully buffered.
+  maxPayload: WS_MAX_PAYLOAD_BYTES,
   verifyClient: (info, done) => {
     const origin = info.req.headers.origin
     // No Origin (non-browser); allowlist hit; or same-origin (Origin matches
