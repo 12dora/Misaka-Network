@@ -62,6 +62,9 @@ export const MAX_INMEMORY_RECEIVE_BYTES = 256 * 1024 * 1024  // 256 MB
 // ── Signaling / WebSocket ─────────────────────────────────────────────
 export const HEARTBEAT_INTERVAL_MS = 45_000
 export const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 16000]
+// A black-holing firewall can leave WebSocket in CONNECTING forever; after
+// this budget the exact socket is closed and the existing backoff takes over.
+export const WS_CONNECT_TIMEOUT_MS = 15_000
 
 // ── A11Y-002 — verified colour pairings ───────────────────────────────
 // The semantic `--state-*` tokens are FILL colours (dots, badges, bars).

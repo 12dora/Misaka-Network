@@ -61,7 +61,10 @@ export default defineConfig({
       command: `npm run dev -- --port ${PORT} --strictPort`,
       port: PORT,
       timeout: 60_000,
-      reuseExistingServer: !process.env.CI,
+      // 05 P2: never silently reuse whatever is already on 5174 — a stale
+      // checkout from another worktree can look healthy until a nonce-gated
+      // assertion fails mid-suite. Specs also call assertE2eHostIceConfig.
+      reuseExistingServer: false,
       env: {
         VITE_API_BASE: `http://localhost:${SIGNAL_PORT}`,
         VITE_WS_URL: `ws://localhost:${SIGNAL_PORT}/ws`,

@@ -125,6 +125,69 @@ describe('BUG-030: stats fetch state machine', () => {
   })
 })
 
+describe('02 P2: stats fetch race — only the latest request may commit', () => {
+  beforeEach(reset)
+  afterEach(() => { globalThis.fetch = realFetch })
+
+  it('old-success-after-new-success: stale response must not overwrite fresher stats', async () => {
+    let resolveOld!: (v: unknown) => void
+    let resolveNew!: (v: unknown) => void
+    const oldPromise = new Promise(r => { resolveOld = r })
+    const newPromise = new Promise(r => { resolveNew = r })
+    let call = 0
+    mockFetch(() => {
+      call++
+      return (call === 1 ? oldPromise : newPromise) as Promise<Response>
+    })
+
+    const first = useHomeStore.getState().fetchStats()
+    const second = useHomeStore.getState().fetchStats()
+
+    // Newer request finishes first with onlineNodes=99.
+    resolveNew({ ok: true, json: async () => ({ ...SAMPLE, onlineNodes: 99 }) })
+    await second
+    expect(useHomeStore.getState().stats.onlineNodes).toBe(99)
+    const stamp = useHomeStore.getState().statsLastUpdated
+
+    // Older request finishes later with onlineNodes=1 — must be ignored.
+    resolveOld({ ok: true, json: async () => ({ ...SAMPLE, onlineNodes: 1 }) })
+    await first
+
+    expect(useHomeStore.getState().stats.onlineNodes).toBe(99)
+    expect(useHomeStore.getState().statsLastUpdated).toBe(stamp)
+    expect(useHomeStore.getState().statsLoading).toBe(false)
+  })
+
+  it('old-error-after-new-success: stale error must not clear ready data or loading', async () => {
+    let resolveOld!: (v: unknown) => void
+    let resolveNew!: (v: unknown) => void
+    const oldPromise = new Promise(r => { resolveOld = r })
+    const newPromise = new Promise(r => { resolveNew = r })
+    let call = 0
+    mockFetch(() => {
+      call++
+      return (call === 1 ? oldPromise : newPromise) as Promise<Response>
+    })
+
+    const first = useHomeStore.getState().fetchStats()
+    const second = useHomeStore.getState().fetchStats()
+
+    resolveNew({ ok: true, json: async () => ({ ...SAMPLE, onlineNodes: 42 }) })
+    await second
+    expect(useHomeStore.getState().statsStatus).toBe('ready')
+    expect(useHomeStore.getState().stats.onlineNodes).toBe(42)
+    expect(useHomeStore.getState().statsLoading).toBe(false)
+
+    // Old request rejects — must not flip status to error or re-toggle loading.
+    resolveOld(Promise.reject(new Error('stale')))
+    await first.catch(() => {}) // fetchStats swallows; settle the promise chain
+
+    expect(useHomeStore.getState().statsStatus).toBe('ready')
+    expect(useHomeStore.getState().stats.onlineNodes).toBe(42)
+    expect(useHomeStore.getState().statsLoading).toBe(false)
+  })
+})
+
 describe('BUG-030: staleness helpers', () => {
   it('never-loaded data is not "stale"', () => {
     expect(isStatsStale(null)).toBe(false)

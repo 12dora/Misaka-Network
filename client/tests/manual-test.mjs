@@ -91,22 +91,26 @@ async function waitForPeer(page, nodeId, timeoutMs = 15000) {
 }
 
 async function waitForTransferStatus(page, statusText, timeoutMs = 30000, minCount = 1) {
+  // statusText may be a string or RegExp (role-specific completion wording).
+  const matcher = statusText instanceof RegExp
+    ? statusText
+    : statusText
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    const count = await page.getByText(statusText, { exact: false }).count()
+    const count = await page.getByText(matcher, { exact: false }).count()
     if (count >= minCount) {
-      console.log(`[transfer] found "${statusText}" (count=${count})`)
+      console.log(`[transfer] found ${String(statusText)} (count=${count})`)
       return
     }
     await page.waitForTimeout(500)
   }
   await page.screenshot({ path: 'test-results/transfer-timeout.png' })
   const transferInfo = await page.evaluate(() => {
-    const transfers = document.querySelectorAll('[class*="transfer"]')
+    const transfers = document.querySelectorAll('[data-testid^="transfer-card-"]')
     return Array.from(transfers).map(el => el.textContent?.substring(0, 200))
   })
   console.log('[transfer] TIMEOUT — transfer elements:', JSON.stringify(transferInfo))
-  throw new Error(`Transfer status "${statusText}" not found within ${timeoutMs}ms`)
+  throw new Error(`Transfer status ${String(statusText)} not found within ${timeoutMs}ms`)
 }
 
 async function selectPeer(page, nodeId) {
@@ -176,9 +180,11 @@ async function main() {
       throw new Error('Send button not visible')
     }
 
+    // Role-specific completion wording (the generic "已完成" was removed):
+    // sender → 已保存 (v2 durable ACK); receiver → 接收完成 / 已保存到所选位置.
     console.log('[transfer] waiting for completion...')
-    await waitForTransferStatus(page1, '已完成', 30000)
-    await waitForTransferStatus(page2, '已完成', 15000)
+    await waitForTransferStatus(page2, /接收完成|已保存到所选位置/, 30000)
+    await waitForTransferStatus(page1, '已保存', 30000)
     console.log('✅ Single file transfer completed!')
     rmSync(file.dir, { recursive: true, force: true })
 
@@ -193,8 +199,8 @@ async function main() {
     await uploadFiles(page1, files.map(f => f.path))
     await clickSend(page1)
 
-    await waitForTransferStatus(page1, '已完成', 60000, 3)
-    await waitForTransferStatus(page2, '已完成', 60000, 3)
+    await waitForTransferStatus(page2, /接收完成|已保存到所选位置/, 60000, 3)
+    await waitForTransferStatus(page1, '已保存', 60000, 3)
     console.log('✅ Multiple file transfer completed!')
     files.forEach(f => rmSync(f.dir, { recursive: true, force: true }))
 
@@ -203,8 +209,8 @@ async function main() {
     const bcFile = createTempFile('broadcast.txt', 1024 * 64)
 
     await uploadBroadcastFile(page1, bcFile.path)
-    await waitForTransferStatus(page1, '已完成', 60000)
-    await waitForTransferStatus(page2, '已完成', 60000)
+    await waitForTransferStatus(page2, /接收完成|已保存到所选位置/, 60000)
+    await waitForTransferStatus(page1, '已保存', 60000)
     console.log('✅ Broadcast transfer completed!')
     rmSync(bcFile.dir, { recursive: true, force: true })
 

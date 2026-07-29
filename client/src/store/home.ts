@@ -63,6 +63,10 @@ interface HomeState {
   addActivity: (event: ActivityEvent) => void
 }
 
+// Monotonic request id so a slow old /api/stats response cannot overwrite a
+// newer one (or clear statsLoading while a later fetch is still in flight).
+let statsFetchSeq = 0
+
 export const useHomeStore = create<HomeState>((set, get) => ({
   stats: EMPTY_STATS,
   activities: [],
@@ -72,13 +76,16 @@ export const useHomeStore = create<HomeState>((set, get) => ({
   statsHasData: false,
 
   async fetchStats() {
+    const seq = ++statsFetchSeq
     // Keep `statsStatus` at 'ready' during a background refresh so a poll
     // doesn't flash the skeleton over good data every 10 seconds.
     set({ statsLoading: true, statsStatus: get().statsHasData ? 'ready' : 'loading' })
     try {
       const res = await fetch(apiUrl('/api/stats'))
+      if (seq !== statsFetchSeq) return
       if (res.ok) {
         const data = await res.json() as NetworkStats
+        if (seq !== statsFetchSeq) return
         set({
           stats: data,
           statsStatus: 'ready',
@@ -90,9 +97,14 @@ export const useHomeStore = create<HomeState>((set, get) => ({
         set({ statsStatus: 'error' })
       }
     } catch {
+      if (seq !== statsFetchSeq) return
       set({ statsStatus: 'error' })
     } finally {
-      set({ statsLoading: false })
+      // Only the latest request may clear loading — an older request finishing
+      // while a newer one is in flight must leave the spinner alone.
+      if (seq === statsFetchSeq) {
+        set({ statsLoading: false })
+      }
     }
   },
 

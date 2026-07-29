@@ -19,18 +19,48 @@ export function useModalExit(onClose: () => void) {
   // unmount.
   const closedRef = useRef(false)
   const timerRef = useRef<number | null>(null)
+  // Optional callback run after the exit animation (or immediately under
+  // reduced motion). Callers that navigate on close must use `requestCloseThen`
+  // instead of hardcoding EXIT_MS — otherwise reduced-motion still waits 180 ms.
+  const afterCloseRef = useRef<(() => void) | null>(null)
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
 
-  const requestClose = useCallback(() => {
+  const finish = useCallback(() => {
+    onCloseRef.current()
+    const after = afterCloseRef.current
+    afterCloseRef.current = null
+    after?.()
+  }, [])
+
+  const beginClose = useCallback((afterClose?: () => void) => {
     if (closedRef.current) return
     closedRef.current = true
+    afterCloseRef.current = afterClose ?? null
     setClosing(true)
     const delay = exitDelay()
     if (delay === 0) {
-      onClose()
+      finish()
       return
     }
-    timerRef.current = window.setTimeout(onClose, delay)
-  }, [onClose])
+    timerRef.current = window.setTimeout(finish, delay)
+  }, [finish])
+
+  /**
+   * Begin the close animation. Safe to pass as an `onClick` handler — it
+   * ignores event arguments so a MouseEvent is never treated as afterClose.
+   */
+  const requestClose = useCallback(() => {
+    beginClose()
+  }, [beginClose])
+
+  /**
+   * Begin the close animation and run `afterClose` only after the exit
+   * completes (or immediately when reduced-motion is on).
+   */
+  const requestCloseThen = useCallback((afterClose: () => void) => {
+    beginClose(afterClose)
+  }, [beginClose])
 
   useEffect(() => () => {
     if (timerRef.current !== null) window.clearTimeout(timerRef.current)
@@ -39,7 +69,12 @@ export function useModalExit(onClose: () => void) {
   return {
     closing,
     requestClose,
+    requestCloseThen,
+    /** @deprecated alias — prefer requestCloseThen */
+    onExited: requestCloseThen,
     backdropClass: closing ? 'modal-backdrop-out' : 'modal-backdrop-in',
     panelClass: closing ? 'modal-panel-out' : 'modal-panel-in',
   }
 }
+
+export { EXIT_MS }

@@ -183,10 +183,6 @@ export function buildIceConfig(): RTCConfiguration {
   }
 }
 
-export function createPeerConnection(): RTCPeerConnection {
-  return new RTCPeerConnection(buildIceConfig())
-}
-
 // BUG-009: `setConfiguration()` re-arms the ICE agent for the NEXT gathering
 // round; it does not move an already-selected candidate pair. Flipping
 // force-relay on a live call therefore left the media path exactly where it
@@ -205,22 +201,41 @@ function iceConfigSignature(cfg: RTCConfiguration): string {
   return `${cfg.iceTransportPolicy ?? 'all'}::${urls.join(',')}`
 }
 
+function readLiveIceSignature(pc: RTCPeerConnection): string | undefined {
+  try {
+    const live = pc.getConfiguration?.()
+    if (live) return iceConfigSignature(live)
+  } catch { /* getConfiguration may not exist on older shims */ }
+  return undefined
+}
+
+export function createPeerConnection(): RTCPeerConnection {
+  // Seed the signature at construction so the first real config change
+  // (e.g. STUN-only → TURN credentials arrive) is reported as `changed`
+  // rather than treated as "baseline only".
+  const cfg = buildIceConfig()
+  const pc = new RTCPeerConnection(cfg)
+  appliedIceSignature.set(pc, iceConfigSignature(cfg))
+  return pc
+}
+
 // Re-apply the current TURN config to every live PC. Called when auto-TURN
 // creds refresh, when the user toggles force-relay, when manual servers are
 // added/removed, etc. Without this an existing connection keeps the original
 // (now stale) creds until it's torn down and re-created.
 //
-// Returns the PCs whose effective config changed since the last call (empty
-// on the first call for a given PC — that only establishes the baseline).
+// Returns only the PCs whose effective config was successfully applied AND
+// genuinely differed from the previous applied (or live) signature.
 export function applyIceConfigToAll(pcs: Iterable<RTCPeerConnection>): RTCPeerConnection[] {
   const cfg = buildIceConfig()
   const signature = iceConfigSignature(cfg)
   const changed: RTCPeerConnection[] = []
   for (const pc of pcs) {
     if (pc.connectionState === 'closed') continue
-    const previous = appliedIceSignature.get(pc)
-    appliedIceSignature.set(pc, signature)
-    if (previous !== undefined && previous !== signature) changed.push(pc)
+    // Prefer the signature we recorded at construction / last success; fall
+    // back to getConfiguration() so a PC built outside createPeerConnection
+    // still detects a first-ever material change.
+    const previous = appliedIceSignature.get(pc) ?? readLiveIceSignature(pc)
     // P0: setConfiguration() throws InvalidModificationError on Chrome the
     // moment iceCandidatePoolSize differs from the pool size used at
     // construction time AND gathering has begun (iceGatheringState !=
@@ -239,8 +254,13 @@ export function applyIceConfigToAll(pcs: Iterable<RTCPeerConnection>): RTCPeerCo
       // toggling forceRelay OFF actually clears the prior 'relay' policy.
       pc.setConfiguration(live)
     } catch (err) {
+      // Do NOT commit the signature on failure — a later retry with the same
+      // desired config must still be attempted and reported as changed.
       wlog('webrtc', 'setConfiguration failed', err)
+      continue
     }
+    if (previous !== signature) changed.push(pc)
+    appliedIceSignature.set(pc, signature)
   }
   return changed
 }

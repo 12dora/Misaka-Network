@@ -455,3 +455,119 @@ describe('handler dispatch is failure-isolated (BUG-006)', () => {
     offA(); offB(); warn.mockRestore()
   })
 })
+
+describe('Contract 3: close code 4003 is transient — same-token reconnect', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('4003 does NOT dispatch onAuthInvalid and reconnects with the same token', async () => {
+    const { signaling } = await freshModules()
+    const authInvalid: number[] = []
+    const off = signaling.onAuthInvalid(() => { authInvalid.push(1) })
+
+    signaling.connect('live-token')
+    const sock = constructed[0]
+    sock.open()
+    sock.fireClose(4003)
+
+    expect(authInvalid).toEqual([])
+    // Backoff fires the first reconnect attempt.
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(constructed.length).toBe(2)
+    const next = constructed[1]
+    next.open()
+    expect(next.sentFrames()).toContainEqual({ t: 'AUTH', token: 'live-token' })
+
+    off()
+  })
+
+  it('4001 still dispatches onAuthInvalid (hard contract unchanged)', async () => {
+    const { signaling, useAuthStore } = await freshModules()
+    seedSession(useAuthStore, 'stale-token')
+    const authInvalid: number[] = []
+    const off = signaling.onAuthInvalid(() => { authInvalid.push(1) })
+
+    signaling.connect('stale-token')
+    constructed[0].open()
+    constructed[0].fireClose(4001)
+
+    expect(authInvalid).toEqual([1])
+    off()
+  })
+})
+
+describe('socket ownership: generation-guarded callbacks (02 P2 / 09 P2)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('reconnectNow replaces an OPEN socket when PING throws', async () => {
+    const { signaling } = await freshModules()
+    signaling.connect('tok')
+    const sock = constructed[0]
+    sock.open()
+    sock.send = vi.fn(() => { throw new Error('half-dead') })
+
+    signaling.reconnectNow()
+
+    expect(constructed.length).toBe(2)
+    expect(sock.close).toHaveBeenCalled()
+    // Old handlers detached so a late close cannot poison the new socket.
+    expect(sock.onclose).toBeNull()
+  })
+
+  it('a CLOSING socket set aside cannot stop the NEW socket heartbeat or fire authInvalid', async () => {
+    const { signaling, useAuthStore } = await freshModules()
+    seedSession(useAuthStore, 'tok')
+    const authInvalid: number[] = []
+    const disconnects: number[] = []
+    signaling.onAuthInvalid(() => { authInvalid.push(1) })
+    signaling.onDisconnect(() => { disconnects.push(1) })
+
+    signaling.connect('tok')
+    const old = constructed[0]
+    old.open()
+
+    // Simulate reconnectNow's CLOSING path: detach the old, open a new one.
+    old.readyState = StubWS.CLOSING
+    signaling.reconnectNow()
+    expect(constructed.length).toBe(2)
+    const next = constructed[1]
+    next.open()
+
+    // Stale close from the detached old socket (as if the browser delivered it late).
+    old.readyState = StubWS.CLOSED
+    old.onclose?.({ code: 4001 })
+
+    // Must not have counted as auth-invalid or an extra disconnect for the live socket.
+    expect(authInvalid).toEqual([])
+    // reconnectNow detachAndClose nulls onclose, so fireClose path shouldn't run —
+    // but if a caller still holds a reference and invokes, generation check blocks it.
+    // Since onclose is null after detach, we also verify via direct call above no-ops.
+    expect(signaling.isConnected()).toBe(true)
+  })
+
+  it('connect watchdog closes a forever-CONNECTING socket and enters backoff', async () => {
+    const { signaling } = await freshModules()
+    const { WS_CONNECT_TIMEOUT_MS } = await import('../../src/constants')
+
+    signaling.connect('tok')
+    expect(constructed.length).toBe(1)
+    expect(constructed[0].readyState).toBe(StubWS.CONNECTING)
+
+    // Still CONNECTING past the watchdog budget.
+    await vi.advanceTimersByTimeAsync(WS_CONNECT_TIMEOUT_MS)
+    expect(constructed[0].close).toHaveBeenCalled()
+
+    // Backoff schedules a new socket.
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(constructed.length).toBe(2)
+  })
+})

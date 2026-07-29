@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+// UI structure contracts that are awkward as full component renders (CSS
+// keyframes, install-prompt finally, footer cross-links). Behavioural
+// contracts for API/signaling/crypto/transfer live in real unit suites —
+// do NOT re-add source-regex assertions for those modules here (05 P2).
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -16,12 +20,6 @@ const footer = read('src/components/ui/AppFooter.tsx')
 const privacy = read('src/pages/Privacy.tsx')
 const terms = read('src/pages/Terms.tsx')
 const network = read('src/pages/Network.tsx')
-const networkStore = read('src/store/network.ts')
-const authStore = read('src/store/auth.ts')
-const signaling = read('src/lib/signaling.ts')
-const api = read('src/lib/api.ts')
-const crypto = read('src/lib/crypto.ts')
-const transfer = read('src/lib/transfer.ts')
 const serviceWorker = read('public/sw.js')
 
 assert.match(css, /@keyframes page-enter/)
@@ -81,77 +79,11 @@ assert.match(qr, /tokenRenderFailed|二维码渲染失败|QR 渲染失败/)
 const networkCopy = read('src/copy/zh-CN/network.ts')
 assert.match(networkCopy, /tokenRenderFailed:.*二维码渲染失败|二维码渲染失败/)
 
-// authedFetch core contract: retry once with a fresh token after 401, then
-// throw AuthRequiredError (not just resolve a 401 response). Terminal failure
-// goes through invalidateSession() so the node Web Lock is released.
-assert.match(api, /export class AuthRequiredError/)
-assert.match(api, /export async function authedFetch/)
-assert.match(api, /res\.status !== 401/)
-assert.match(api, /throw new AuthRequiredError\(\)/)
-assert.match(api, /invalidateSession\(\)/)
-
-// WS close codes 4001/4002 (AUTH_REQUIRED / INVALID_TOKEN) must trigger the
-// auth-invalid signal — otherwise the client loops on the dead token forever.
-// Recovery uses /api/re-register with a stored proof (Contract 1), never
-// /register with an empty passcode.
-assert.match(signaling, /e\.code === 4001 \|\| e\.code === 4002/)
-assert.match(signaling, /export function onAuthInvalid/)
-assert.match(authStore, /onAuthInvalid\(\(\)\s*=>/)
-assert.match(authStore, /invalidateSession\(\)/)
-assert.match(authStore, /reRegisterProof/)
-assert.match(authStore, /\/api\/re-register/)
-
 assert.match(network, /type="file" multiple/)
 assert.match(network, /webkitdirectory/)
 // Pending-items copy lives in zh-CN/network.ts after the copy migration.
 assert.match(network, /pendingItems\(|待发送 \{pendingFiles\.length\} 个项目/)
 assert.match(networkCopy, /pendingItems:\s*\(n:\s*number\)\s*=>\s*`待发送 \$\{n\} 个项目`|待发送/)
-
-assert.match(networkStore, /startQueuedDelivery\(peerSessionId\)/)
-assert.match(networkStore, /ensureConnected\(peerSessionId\)/)
-assert.match(networkStore, /cleanupPeerConnection\(peerSessionId, \{ failQueuedMessages: false \}\)/)
-assert.match(networkStore, /remoteInitiatingPeers\.add\(sessionId\)/)
-assert.match(networkStore, /waitForPrimaryChannel\(peerSessionId\)/)
-assert.match(networkStore, /peerConnections\.has\(peerSessionId\)\) && !dataChannels\.has\(peerSessionId\)/)
-assert.match(networkStore, /notifyPrimaryChannel\(fromSessionId\)/)
-assert.match(networkStore, /getMyPublicKey\(peerSessionId\)/)
-assert.match(networkStore, /setPeerPublicKey\(peerSessionId, msg\.pub\)/)
-assert.match(networkStore, /hasAESKey\(peerSessionId\)/)
-assert.match(networkStore, /const isTransferLane = dc\.label\.startsWith\('misaka-transfer-'\)/)
-assert.match(networkStore, /if \(!isTransferLane\)/)
-assert.match(networkStore, /const publishEncryptedReady = \(\) =>/)
-assert.match(networkStore, /if \(!stillCurrent\(\) \|\| !hasAESKey\(peerSessionId\)\) return false/)
-assert.match(networkStore, /if \(hasAESKey\(peerSessionId\)\) flushOutgoing\(peerSessionId, dc\)/)
-assert.match(networkStore, /flushOutgoing\(peerSessionId, dc\)\s+sendResumeRequests\(peerSessionId, dc\)/)
-// receiveChunk now takes (transferId, index, iv, ciphertext) — chunk frame is
-// a single binary message; the transferId comes from the shortId map.
-assert.match(networkStore, /receiveChunk\(\s*transferId, frame\.index, frame\.iv, frame\.ciphertext, peerSessionId,/)
-assert.match(networkStore, /decodeChunkFrame\(e\.data\)/)
-assert.match(networkStore, /shortIdToTransferId/)
-// Per-chunk JSON header and ack are removed — the binary frame carries both
-// shortId and index; DataChannel reliability makes app-level acks redundant.
-assert.doesNotMatch(networkStore, /lastChunkHeader/)
-assert.doesNotMatch(networkStore, /dc\.send\(JSON\.stringify\(ack\)\)/)
-assert.match(networkStore, /engineSendFileParallel\([^)]*peerSessionId/s)
-assert.match(networkStore, /if \(s\.transfers\.some\(t => t\.id === meta\.transferId\)\) return s/)
-assert.match(networkStore, /if \(!pc && sdp\.type !== 'offer'\)/)
-assert.match(networkStore, /pc\.signalingState !== 'have-local-offer'/)
-
-assert.match(crypto, /const peerStates = new Map<string, PeerCryptoState>\(\)/)
-assert.match(crypto, /generateECDHKeyPair\(peerSessionId: string\)/)
-assert.match(crypto, /setPeerPublicKey\(peerSessionId: string, peerPubBase64: string\)/)
-assert.match(crypto, /resetCrypto\(peerSessionId\?: string\)/)
-
-// Per-chunk IV is built from an 8-byte per-transfer prefix + 4-byte index
-// (NIST SP 800-38D §8.2.1) instead of a per-chunk getRandomValues call.
-// P1-9: the prefix is additionally domain-separated with `transferId`
-// (SHA-256 of prefix||transferId) so two transfers that draw the same
-// random prefix still produce distinct IVs. The hot-path call is now
-// awaited (digest is async) and threads `transferId` through.
-assert.match(transfer, /makeChunkIv\(ivPrefix, i, transferId\)/)
-assert.match(transfer, /encryptChunk\(raw, peerSessionId, ivForChunk\)/)
-assert.match(transfer, /decryptChunk\(iv, encrypted, peerSessionId\)/)
-assert.match(transfer, /const ivPrefix = randomIvPrefix\(\)/)
 
 // Bumped to v5: shell-only install (no aggressive asset prefetch — that
 // doubled first-paint network load and slowed initial visits on tight uplinks).

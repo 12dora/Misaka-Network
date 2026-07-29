@@ -9,7 +9,7 @@ import { createHash } from 'node:crypto'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { cleanupE2eSessions } from './helpers'
+import { cleanupE2eSessions, assertE2eHostIceConfig } from './helpers'
 
 const NODE_ID = '10001'
 const PASS_CODE = '123456'
@@ -23,6 +23,13 @@ const PASS_CODE = '123456'
 test.beforeEach(async ({ request }) => {
   await cleanupE2eSessions(request)
 })
+
+// 05 P2: reuseExistingServer can leave a stale Vite on 5174. Every describe
+// that opens a page must verify the frontend build nonce matches the suite.
+async function assertFrontendNonce(page: Page, request: Parameters<typeof assertE2eHostIceConfig>[1]) {
+  await page.goto('/', { waitUntil: 'load' })
+  await assertE2eHostIceConfig(page, request)
+}
 
 function createTempFile(name: string, sizeBytes: number) {
   const dir = mkdtempSync(join(tmpdir(), 'misaka-e2e-'))
@@ -129,12 +136,24 @@ async function clickSend(page: Page) {
   await page.locator('[data-testid="send-pending-file"]').first().click()
 }
 
-async function expectTransferComplete(page: Page, atLeast = 1) {
-  // The product deliberately distinguishes sender durability ("已保存") from
-  // receiver availability ("接收完成"); the old generic "已完成" wording was
-  // removed because it could not say what had actually happened.
+/** Sender durability: "✓ 已保存" on a send-direction card (📤). */
+async function expectSenderSaved(page: Page, atLeast = 1) {
   await expect.poll(
-    async () => await page.getByText(/已保存|接收完成/).count(),
+    async () => page.locator('[data-testid^="transfer-card-"]')
+      .filter({ hasText: '📤' })
+      .filter({ hasText: /已保存/ })
+      .count(),
+    { timeout: 60_000, intervals: [500, 1_000, 2_000] },
+  ).toBeGreaterThanOrEqual(atLeast)
+}
+
+/** Receiver availability: "接收完成" or FSA "已保存到所选位置" on a recv card (📥). */
+async function expectReceiverComplete(page: Page, atLeast = 1) {
+  await expect.poll(
+    async () => page.locator('[data-testid^="transfer-card-"]')
+      .filter({ hasText: '📥' })
+      .filter({ hasText: /接收完成|已保存到所选位置/ })
+      .count(),
     { timeout: 60_000, intervals: [500, 1_000, 2_000] },
   ).toBeGreaterThanOrEqual(atLeast)
 }
@@ -217,13 +236,14 @@ async function expectNoReconnectingBanner(page: Page) {
 }
 
 test.describe('two-peer file transfer (happy path)', () => {
-  test('single file transfers end-to-end', async ({ browser }) => {
+  test('single file transfers end-to-end', async ({ browser, request }) => {
     const ctxA = await browser.newContext()
     const ctxB = await browser.newContext()
     const pageA = await ctxA.newPage()
     const pageB = await ctxB.newPage()
 
     try {
+      await assertFrontendNonce(pageA, request)
       await login(pageA, NODE_ID, PASS_CODE)
       await login(pageB, NODE_ID, PASS_CODE)
       await waitForPeer(pageA, NODE_ID)
@@ -238,9 +258,10 @@ test.describe('two-peer file transfer (happy path)', () => {
         await installConnectionFailureObserver(pageB)
         await uploadFiles(pageA, [file.path])
         await clickSend(pageA)
-        await expectTransferComplete(pageA)
-        await expectTransferComplete(pageB)
+        // v2: receiver durable write first, then sender may promote to saved.
+        await expectReceiverComplete(pageB)
         expect(await capturedArtifacts(pageB, 1)).toEqual([expectedArtifact(file.path)])
+        await expectSenderSaved(pageA)
         await expectNoReconnectingBanner(pageA)
         await expectNoReconnectingBanner(pageB)
       } finally {
@@ -277,11 +298,11 @@ test.describe('two-peer file transfer (happy path)', () => {
         await installConnectionFailureObserver(pageB)
         await uploadFiles(pageA, files.map(f => f.path))
         await clickSend(pageA)
-        await expectTransferComplete(pageA, 3)
-        await expectTransferComplete(pageB, 3)
+        await expectReceiverComplete(pageB, 3)
         expect(await capturedArtifacts(pageB, 3)).toEqual(
           files.map(file => expectedArtifact(file.path)),
         )
+        await expectSenderSaved(pageA, 3)
         await expectNoReconnectingBanner(pageA)
         await expectNoReconnectingBanner(pageB)
       } finally {
@@ -321,8 +342,7 @@ test.describe('folder transfer', () => {
         await uploadFolder(pageA, folder.folderPath)
         await clickSend(pageA)
         // Each file in the folder becomes its own transfer card on both sides.
-        await expectTransferComplete(pageA, folder.paths.length)
-        await expectTransferComplete(pageB, folder.paths.length)
+        await expectReceiverComplete(pageB, folder.paths.length)
         // Folder relative paths are flattened at the storage boundary so a
         // peer cannot create directories. Assert the ordered path→safe-name
         // mapping as well as every artifact's bytes.
@@ -332,6 +352,7 @@ test.describe('folder transfer', () => {
             expectedArtifact(path, `${folderName}_${path.split('/').pop()}`),
           ),
         )
+        await expectSenderSaved(pageA, folder.paths.length)
         await expectNoReconnectingBanner(pageA)
         await expectNoReconnectingBanner(pageB)
       } finally {
@@ -381,12 +402,12 @@ test.describe('broadcast to all peers', () => {
         await broadcastFiles(pageA, files.map(file => file.path))
         // Two ordered files × two recipients produce four independent sender
         // outcomes; each receiver must expose both complete artifacts.
-        await expectTransferComplete(pageA, 4)
-        await expectTransferComplete(pageB, 2)
-        await expectTransferComplete(pageC, 2)
+        await expectReceiverComplete(pageB, 2)
+        await expectReceiverComplete(pageC, 2)
         const expected = files.map(file => expectedArtifact(file.path))
         expect(await capturedArtifacts(pageB, 2)).toEqual(expected)
         expect(await capturedArtifacts(pageC, 2)).toEqual(expected)
+        await expectSenderSaved(pageA, 4)
         for (const p of pages) await expectNoReconnectingBanner(p)
       } finally {
         files.forEach(file => rmSync(file.dir, { recursive: true, force: true }))
