@@ -134,15 +134,74 @@ export function bitmapToRanges(buf: Uint8Array, totalChunks: number): Array<[num
   return ranges
 }
 
-/** Inverse of `bitmapToRanges`: rebuild bitmap from runs. */
+/**
+ * Cap on the number of RLE ranges accepted from an untrusted peer in one
+ * control message. Far more than any legitimate resume/repair needs; enough
+ * to reject a range-flood DoS before we spend O(rangeCount × totalChunks).
+ */
+export const MAX_RANGE_COUNT = 4096
+
+/**
+ * Validate, clamp, sort and merge untrusted RLE ranges against a known
+ * `totalChunks`. Rejects non-arrays, non-safe-integers, empty/negative
+ * lengths, and oversize range lists. Returns a minimal sorted, non-overlapping
+ * list ready to feed a send task or `rangesToBitmap` — never expands into a
+ * per-index array.
+ */
+export function validateAndNormalizeRanges(
+  ranges: unknown,
+  totalChunks: number,
+): Array<[number, number]> {
+  if (!Array.isArray(ranges) || totalChunks <= 0) return []
+  if (ranges.length > MAX_RANGE_COUNT) return []
+
+  const clamped: Array<[number, number]> = []
+  for (const range of ranges) {
+    if (!Array.isArray(range) || range.length !== 2) continue
+    const start = range[0]
+    const length = range[1]
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(length)) continue
+    if (start < 0 || length <= 0) continue
+    // Clamp into [0, totalChunks) BEFORE any expansion. A hostile
+    // `[0, 4294967295]` collapses to a single `[0, totalChunks)` run.
+    const lo = Math.min(start, totalChunks)
+    if (lo >= totalChunks) continue
+    const end = Math.min(start + length, totalChunks)
+    if (end <= lo) continue
+    clamped.push([lo, end - lo])
+  }
+  if (clamped.length === 0) return []
+
+  clamped.sort((a, b) => a[0] - b[0] || a[1] - b[1])
+  const merged: Array<[number, number]> = []
+  let [cs, cl] = clamped[0]
+  for (let i = 1; i < clamped.length; i++) {
+    const [s, l] = clamped[i]
+    const cEnd = cs + cl
+    if (s <= cEnd) {
+      cl = Math.max(cEnd, s + l) - cs
+    } else {
+      merged.push([cs, cl])
+      cs = s
+      cl = l
+    }
+  }
+  merged.push([cs, cl])
+  return merged
+}
+
+/** Inverse of `bitmapToRanges`: rebuild bitmap from runs. Untrusted input
+ *  must go through `validateAndNormalizeRanges` first — this helper still
+ *  clamps so a single oversized run cannot loop past `totalChunks`. */
 export function rangesToBitmap(
   ranges: ReadonlyArray<readonly [number, number]>,
   totalChunks: number,
 ): Uint8Array<ArrayBuffer> {
   const buf = newBitmap(totalChunks)
-  for (const [start, length] of ranges) {
-    const end = Math.min(start + length, totalChunks)
-    for (let i = Math.max(0, start); i < end; i++) bitmapSet(buf, i)
+  const normalized = validateAndNormalizeRanges(ranges, totalChunks)
+  for (const [start, length] of normalized) {
+    const end = start + length
+    for (let i = start; i < end; i++) bitmapSet(buf, i)
   }
   return buf
 }

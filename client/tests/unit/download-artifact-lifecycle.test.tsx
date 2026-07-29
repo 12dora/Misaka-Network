@@ -16,6 +16,7 @@ const { markStarted, release } = vi.hoisted(() => ({
 vi.mock('@/store/network', () => ({
   markDownloadArtifactStarted: markStarted,
   releaseDownloadArtifact: release,
+  isDownloadArtifactStarted: () => false,
 }))
 
 import DownloadArtifactActions from '../../src/components/features/DownloadArtifactActions'

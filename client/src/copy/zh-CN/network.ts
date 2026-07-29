@@ -151,6 +151,9 @@ export const network = {
   selectFolder: '🗂 选择文件夹',
   multiSelectHint: '支持多选、拖拽多个文件和文件夹队列',
   targetMisaka: (nodeId: number) => `目标：御坂 ${nodeId} 号`,
+  blockPeer: '屏蔽',
+  blockPeerConfirm: (nodeId: number) =>
+    `屏蔽御坂 ${nodeId} 号？已开始的下载仍可在「未完成下载」中释放。`,
   reconnectNow: '立即重连',
   reconnectThisDevice: '立即重连此设备',
   reconnecting: '正在重连…',

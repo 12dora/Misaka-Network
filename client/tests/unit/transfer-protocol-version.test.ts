@@ -45,7 +45,7 @@ import {
   setPeerProtocolVersion, getPeerProtocolVersion,
   negotiatedProtocolVersion, clearPeerProtocolVersion,
   sendFileParallel, markReceiverReady, markTransferAcked,
-  markReceiverRejected, applyRepairRequest,
+  markReceiverRejected, applyRepairRequest, getSendTaskInfo,
   CHUNK_SIZE,
 } from '../../src/lib/transfer'
 import * as db from '../../src/lib/db'
@@ -78,8 +78,8 @@ beforeEach(() => {
 
 describe('protocol version negotiation', () => {
   it('announces the current version in `hello`', () => {
-    expect(PROTOCOL_VERSION).toBe(2)
-    expect(JSON.parse(makeHelloMessage())).toEqual({ type: 'hello', v: 2 })
+    expect(PROTOCOL_VERSION).toBe(3)
+    expect(JSON.parse(makeHelloMessage())).toEqual({ type: 'hello', v: 3 })
   })
 
   it('treats an unknown / malformed / absent version as v1', () => {
@@ -127,11 +127,12 @@ describe('version-gated delivery semantics', () => {
     await new Promise(r => setTimeout(r, 5))
     expect(frames.length).toBe(0)      // parked on the readiness barrier
 
-    markReceiverReady('gate', OWNER)
+    const info = getSendTaskInfo('gate')!
+    markReceiverReady('gate', info.shortId, OWNER)
     await new Promise(r => setTimeout(r, 20))
     expect(frames.length).toBe(2)
 
-    markTransferAcked('gate', OWNER)
+    markTransferAcked('gate', file.size, OWNER)
     await expect(sending).resolves.toMatchObject({ state: 'saved' })
   })
 
@@ -164,7 +165,9 @@ describe('JSON control-plane version differences', () => {
 
     await new Promise(r => setTimeout(r, 5))
     expect(frames.length).toBe(0)
-    expect(JSON.parse(control[0])).toMatchObject({ type: 'meta', v: 2 })
+    // `meta.v` announces OUR version, not the negotiated one — the peer is v2
+    // here, so negotiation settles on 2 while we still advertise PROTOCOL_VERSION.
+    expect(JSON.parse(control[0])).toMatchObject({ type: 'meta', v: PROTOCOL_VERSION })
 
     expect(markReceiverRejected('rej', OWNER)).toBe(true)
     await expect(sending).rejects.toThrow()
@@ -179,7 +182,11 @@ describe('JSON control-plane version differences', () => {
     const sending = sendFileParallel(
       [lane], file, 'rep', 1, PEER, undefined, undefined, undefined, 0,
     )
-    markReceiverReady('rep', OWNER)
+    // The shortId is minted inside the engine — sendFileParallel's 4th argument
+    // is peerNodeId. A ready ACK carrying any other shortId is rejected, which
+    // is the whole point of the attempt check, so read the live one.
+    const shortId = getSendTaskInfo('rep')!.shortId
+    expect(markReceiverReady('rep', shortId, OWNER)).toBe(true)
     // Let a chunk or two leave so there is a live task to repair into.
     await new Promise(r => setTimeout(r, 20))
     const requeued = applyRepairRequest(
@@ -189,7 +196,8 @@ describe('JSON control-plane version differences', () => {
     // Live task: returns the number of indexes re-queued (≥ 0). -1 would mean
     // "no live task — spawn a second engine", which protocol v2 forbids.
     expect(requeued).toBeGreaterThanOrEqual(0)
-    markTransferAcked('rep', OWNER)
+    // bytes must equal the declared file size exactly, or the ACK is rejected.
+    expect(markTransferAcked('rep', file.size, OWNER)).toBe(true)
     await expect(sending).resolves.toMatchObject({ state: 'saved' })
   })
 
