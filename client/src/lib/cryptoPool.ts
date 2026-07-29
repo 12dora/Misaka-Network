@@ -16,19 +16,26 @@
 //      the replacement fail with "no key for peer"),
 //   3. rejects immediately when no healthy worker is left, instead of
 //      queueing work nothing will ever service.
+//
+// Replacement budget is a consecutive-failure / time-window breaker, NOT a
+// page-lifetime cumulative cap — eight independent recovered crashes must
+// not permanently degrade the pool.
 
 const POOL_SIZE = Math.max(1, Math.min(4, (typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : 2) || 2))
 
-// A worker module that fails to parse crashes every replacement too. Cap the
-// churn so we surface a hard error instead of spawning workers in a loop.
-const MAX_REPLACEMENTS = POOL_SIZE * 2
+// Consecutive failed replacements within the window trip the breaker.
+const MAX_CONSECUTIVE_FAILURES = POOL_SIZE * 2
+// After this much healthy service, the consecutive-failure counter resets.
+const FAILURE_WINDOW_MS = 60_000
 
 type PendingEntry = { resolve: (buf: ArrayBuffer) => void; reject: (err: Error) => void; worker: Worker }
 
 let workers: Worker[] | null = null
 let rrCursor = 0
 let nextId = 0
-let replacements = 0
+let consecutiveFailures = 0
+let lastFailureAt = 0
+let breakerOpenUntil = 0
 const pending = new Map<number, PendingEntry>()
 // Mirror of every peer key we have handed to the pool, so a replacement
 // worker can be brought up to date without waiting for a new ECDH round.
@@ -42,6 +49,35 @@ export class CryptoPoolUnavailableError extends Error {
   }
 }
 
+function noteHealthyService() {
+  // A successful op proves the pool is productive — reset the consecutive
+  // failure counter so long-lived tabs recover from isolated crashes.
+  consecutiveFailures = 0
+}
+
+function noteReplacementFailure() {
+  const now = Date.now()
+  if (now - lastFailureAt > FAILURE_WINDOW_MS) {
+    consecutiveFailures = 0
+  }
+  lastFailureAt = now
+  consecutiveFailures++
+  if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+    breakerOpenUntil = now + FAILURE_WINDOW_MS
+    console.warn('[cryptoPool] consecutive failure breaker open — pool is degraded')
+  }
+}
+
+function breakerIsOpen(): boolean {
+  if (breakerOpenUntil === 0) return false
+  if (Date.now() >= breakerOpenUntil) {
+    breakerOpenUntil = 0
+    consecutiveFailures = 0
+    return false
+  }
+  return true
+}
+
 function spawnWorker(): Worker {
   const w = new Worker(new URL('../workers/crypto.worker.ts', import.meta.url), { type: 'module' })
   w.onmessage = (e: MessageEvent<{ id: number; ok: boolean; result?: ArrayBuffer; error?: string }>) => {
@@ -49,8 +85,12 @@ function spawnWorker(): Worker {
     const entry = pending.get(id)
     if (!entry) return
     pending.delete(id)
-    if (ok && result) entry.resolve(result)
-    else entry.reject(new Error(error ?? 'crypto worker failed'))
+    if (ok && result) {
+      noteHealthyService()
+      entry.resolve(result)
+    } else {
+      entry.reject(new Error(error ?? 'crypto worker failed'))
+    }
   }
   w.onerror = (e: { message?: string }) => {
     console.warn('[cryptoPool] worker error', e?.message)
@@ -84,11 +124,15 @@ function handleWorkerCrash(dead: Worker, message?: string) {
 
   // 3. Replace it and re-seed the peer keys, so throughput (and correctness
   //    for peers whose keys only lived in the dead worker) recovers.
-  if (replacements >= MAX_REPLACEMENTS) {
-    console.warn('[cryptoPool] replacement budget exhausted — pool is degraded')
+  //
+  // Each crash counts toward the consecutive-failure breaker. Only a later
+  // healthy op (noteHealthyService) resets the counter — a successful spawn
+  // of a worker that immediately crashes again must still trip the breaker.
+  noteReplacementFailure()
+  if (breakerIsOpen()) {
+    console.warn('[cryptoPool] replacement skipped — breaker open')
     return
   }
-  replacements++
   try {
     const fresh = spawnWorker()
     for (const [peerSessionId, aesKey] of peerKeys) {
@@ -103,12 +147,20 @@ function handleWorkerCrash(dead: Worker, message?: string) {
 function ensurePool(): Worker[] {
   if (workers && workers.length > 0) return workers
   if (workers && workers.length === 0) {
-    // Every worker crashed and replacement is exhausted — don't silently
-    // rebuild a pool that is going to die again on the next op.
-    if (replacements >= MAX_REPLACEMENTS) return workers
+    // Every worker crashed and the breaker is open — don't silently rebuild
+    // a pool that is going to die again on the next op.
+    if (breakerIsOpen()) return workers
   }
   const list: Worker[] = workers ?? []
-  for (let i = list.length; i < POOL_SIZE; i++) list.push(spawnWorker())
+  for (let i = list.length; i < POOL_SIZE; i++) {
+    try {
+      list.push(spawnWorker())
+    } catch (err) {
+      noteReplacementFailure()
+      console.warn('[cryptoPool] failed to spawn worker', err)
+      break
+    }
+  }
   workers = list
   return list
 }
@@ -134,7 +186,29 @@ export function healthyWorkerCount(): number {
   return workers?.length ?? 0
 }
 
-function dispatch(op: 'encrypt' | 'decrypt', peerSessionId: string, iv: Uint8Array, data: ArrayBuffer): Promise<ArrayBuffer> {
+/** Test hook: reset breaker + replacement counters. */
+export function __resetCryptoPoolBudgetForTests() {
+  consecutiveFailures = 0
+  lastFailureAt = 0
+  breakerOpenUntil = 0
+}
+
+export interface CryptoOpOptions {
+  additionalData?: Uint8Array
+  /** Full-frame decrypt: byte offset of the ciphertext inside `data`. */
+  cipherOffset?: number
+  cipherLength?: number
+  ivOffset?: number
+  ivLength?: number
+}
+
+function dispatch(
+  op: 'encrypt' | 'decrypt',
+  peerSessionId: string,
+  iv: Uint8Array,
+  data: ArrayBuffer,
+  options?: CryptoOpOptions,
+): Promise<ArrayBuffer> {
   const pool = ensurePool()
   if (pool.length === 0) {
     // Reject immediately rather than parking a promise no worker will ever
@@ -148,14 +222,57 @@ function dispatch(op: 'encrypt' | 'decrypt', peerSessionId: string, iv: Uint8Arr
   return new Promise<ArrayBuffer>((resolve, reject) => {
     pending.set(id, { resolve, reject, worker })
     // `data` is transferred (zero copy); caller must not touch it after this.
-    worker.postMessage({ type: 'op', id, op, peerSessionId, iv, data }, [data])
+    const msg: Record<string, unknown> = {
+      type: 'op', id, op, peerSessionId, iv, data,
+    }
+    if (options?.additionalData && options.additionalData.byteLength > 0) {
+      msg.additionalData = options.additionalData
+    }
+    if (typeof options?.cipherOffset === 'number') {
+      msg.cipherOffset = options.cipherOffset
+      msg.cipherLength = options.cipherLength
+      msg.ivOffset = options.ivOffset
+      msg.ivLength = options.ivLength
+    }
+    worker.postMessage(msg, [data])
   })
 }
 
-export function encryptInWorker(peerSessionId: string, iv: Uint8Array, data: ArrayBuffer): Promise<ArrayBuffer> {
-  return dispatch('encrypt', peerSessionId, iv, data)
+export function encryptInWorker(
+  peerSessionId: string,
+  iv: Uint8Array,
+  data: ArrayBuffer,
+  additionalData?: Uint8Array,
+): Promise<ArrayBuffer> {
+  return dispatch('encrypt', peerSessionId, iv, data, { additionalData })
 }
 
-export function decryptInWorker(peerSessionId: string, iv: Uint8Array, encrypted: ArrayBuffer): Promise<ArrayBuffer> {
-  return dispatch('decrypt', peerSessionId, iv, encrypted)
+export function decryptInWorker(
+  peerSessionId: string,
+  iv: Uint8Array,
+  encrypted: ArrayBuffer,
+  additionalData?: Uint8Array,
+): Promise<ArrayBuffer> {
+  return dispatch('decrypt', peerSessionId, iv, encrypted, { additionalData })
+}
+
+/** Decrypt a whole chunk frame buffer without a main-thread ciphertext copy. */
+export function decryptFrameInWorker(
+  peerSessionId: string,
+  frame: ArrayBuffer,
+  ivOffset: number,
+  ivLength: number,
+  cipherOffset: number,
+  cipherLength: number,
+  additionalData?: Uint8Array,
+): Promise<ArrayBuffer> {
+  // Dummy iv view for the message shape; the worker uses offsets into frame.
+  const iv = new Uint8Array(frame, ivOffset, ivLength)
+  return dispatch('decrypt', peerSessionId, iv, frame, {
+    additionalData,
+    cipherOffset,
+    cipherLength,
+    ivOffset,
+    ivLength,
+  })
 }

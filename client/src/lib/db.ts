@@ -19,6 +19,15 @@ export interface TransferRecord {
    * the session id next.
    */
   epoch?: number
+  /**
+   * Exact receive-attempt identity for this durable row. Globally unique
+   * (UUID / random hex) so a page reload cannot reuse the same token as a
+   * distinct later attempt. Terminal cleanup intents bind to this so a
+   * same-scope later transfer reusing transferId cannot be destroyed by an
+   * older intent. Optional for pre-generation rows; legacy counters may
+   * still appear as numbers from intermediate builds.
+   */
+  attemptToken?: string | number
   fileName: string
   fileSize: number
   fileHash: string

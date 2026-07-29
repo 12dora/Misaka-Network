@@ -4,11 +4,28 @@
 // contracts for API/signaling/crypto/transfer live in real unit suites —
 // do NOT re-add source-regex assertions for those modules here (05 P2).
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 
 const root = new URL('..', import.meta.url).pathname
 const read = path => readFileSync(join(root, path), 'utf8')
+
+// Wave 4a: transfer implementation lives under src/lib/transfer/*; the
+// facade at transfer.ts only re-exports. Contract patterns must match the
+// implementation, not the barrel alone.
+function readTransferTree(dir = 'src/lib/transfer') {
+  const parts = [read('src/lib/transfer.ts')]
+  const walk = (d) => {
+    for (const name of readdirSync(join(root, d))) {
+      const rel = `${d}/${name}`
+      const abs = join(root, rel)
+      if (statSync(abs).isDirectory()) walk(rel)
+      else if (name.endsWith('.ts')) parts.push(read(rel))
+    }
+  }
+  try { walk(dir) } catch { /* pre-split layout */ }
+  return parts.join('\n')
+}
 
 const css = read('src/index.css')
 const app = read('src/App.tsx')
