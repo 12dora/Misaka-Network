@@ -4,8 +4,12 @@ build/
 .env
 .env.local
 .credentials
-data/
-server/data/
+# Runtime data dirs only — anchored so client/src/data/*.ts is never swallowed.
+/data/
+/server/data/
+/client/data/
+# Root has no package dependencies; a root lockfile would make `npm ci` a false success.
+/package-lock.json
 .DS_Store
 *.log
 .vscode/

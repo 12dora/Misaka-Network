@@ -16,7 +16,6 @@
 
   /* Accents */
   --accent-cyan:   #5BB3FF;
-  --accent-ribbon: #E8C5C0;
 
   /* State — these are FILL colours (badges, dots, progress bars, borders).
      They are NOT safe as small-size text colours; see the *-on-light /
@@ -71,7 +70,6 @@
 
   /* UX-LAYOUT-009 — one notification layer that knows about the nav, the
      mobile action bar, the home-indicator safe area and open dialogs. */
-  --z-nav: 50;
   --z-notify: 90;
   --z-dialog: 100;
 }
@@ -100,7 +98,6 @@ body {
 .font-jp    { font-family: 'Shippori Mincho', 'Noto Serif JP', 'Source Han Serif SC', serif; }
 .font-kanji { font-family: 'Noto Sans JP', 'Noto Sans SC', 'PingFang SC', sans-serif; }
 .font-mono  { font-family: 'IBM Plex Mono', 'Roboto Mono', 'Courier New', monospace; }
-.tabular    { font-variant-numeric: tabular-nums; }
 
 /* ── Core Components ────────────────────────────────────────────── */
 @layer components {
@@ -501,29 +498,11 @@ body {
   .activity-exit { animation: none !important; }
 }
 
-/* Card entrance ─── triggered by .animate-in class added via JS */
+/* Card entrance — StatsDashboard uses `animation: card-in …` inline. */
 @keyframes card-in {
   from { opacity: 0; transform: translateY(14px); }
   to   { opacity: 1; transform: translateY(0); }
 }
-.card-in {
-  animation: card-in 0.4s ease forwards;
-  opacity: 0;
-}
-
-/* Title fade-scale in ─── */
-@keyframes title-in {
-  from { opacity: 0; transform: scale(1.04); }
-  to   { opacity: 1; transform: scale(1); }
-}
-.title-in { animation: title-in 0.7s ease forwards; }
-
-/* Slide up for hero content ─── */
-@keyframes slide-up {
-  from { opacity: 0; transform: translateY(20px); }
-  to   { opacity: 1; transform: translateY(0); }
-}
-.slide-up { animation: slide-up 0.6s ease forwards; }
 
 @keyframes channel-enter {
   from { opacity: 0; transform: translateY(14px) scale(0.985); }
@@ -637,10 +616,6 @@ body[data-dialog-open="true"] { overflow: hidden; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.35); }
-
-/* ── Utility overrides ──────────────────────────────────────────── */
-.no-scrollbar::-webkit-scrollbar { display: none; }
-.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
 
 /* Toast positioning. On mobile (<md) we sit above the 96px bottom action bar
    and the home-indicator safe area. On desktop the bar is hidden, so 2rem

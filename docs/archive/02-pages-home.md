@@ -1,6 +1,6 @@
 # 02 · 首页 HOME
 
-按 [sample/home-page-sample.jpg](sample/home-page-sample.jpg) 的海报构图。视觉规范见 [01-design-system.md](01-design-system.md)。
+按 [home-page-sample.jpg](../sample/home-page-sample.jpg) 的海报构图。视觉规范见 [01-design-system.md](01-design-system.md)。
 
 ## 页面分层
 
@@ -17,7 +17,7 @@ FOOTER     版权信息（作者 + GitHub）
 
 桌面 ≥1024px：`grid-template-columns: 44% 1fr`，高 `min(100vh, 820px)`。
 
-- **左栏**：立绘 [sample/misaka.webp](sample/misaka.webp)，`object-position: bottom left`，底部出血，4s 上下浮动 ±6px。
+- **左栏**：立绘 [misaka.webp](../../client/public/assets/misaka.webp)，`object-position: bottom left`，底部出血，4s 上下浮动 ±6px。
 - **右栏**：TopNav（吸顶）/ TitleLockup / LoginCard 三段垂直。
 
 平板：立绘缩到右下 ~320px；移动：立绘变顶部头图 200px。

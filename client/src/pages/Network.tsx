@@ -1298,10 +1298,8 @@ export default function Network() {
   const peerEntity = store.peers.find(p => p.sessionId === store.selectedSessionId) ?? null
   const onlinePeerCount = store.peers.filter(p => p.status !== 'offline').length
 
-  // P1-3 wiring: pause/resume/cancel must dispatch to the receive-side
-  // variants when the transfer is inbound, since the engine state lives in
-  // a different bucket. Falls back to the send-side action if the receive
-  // variant isn't wired yet — same UX, just less complete.
+  // Pause/resume/cancel must dispatch to the receive-side variants when the
+  // transfer is inbound — engine state lives in a different bucket.
   function dispatchPause(transferId: string) {
     const t = store.transfers.find(tr => tr.id === transferId)
     if (t?.direction === 'recv') {
