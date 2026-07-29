@@ -49,16 +49,37 @@ export function clearTransferOwner(transferId: string) {
 }
 
 /**
- * True when `owner` may act on an EXISTING `transferId`. Unknown transferIds
- * return FALSE — peer-driven control handlers must not create state for an id
- * the local side has never registered. Registration is a separate API
- * (`registerTransferOwner` / `handleMetaMessage` / `sendFileParallel`).
+ * True when `owner` may act on an EXISTING in-memory `transferId`.
+ *
+ * Unknown transferIds return FALSE — peer-driven control handlers must not
+ * create state for an id the local side has never registered.
+ *
+ * IMPORTANT: do **not** use this for durable-row resume after reload/reset.
+ * `transferOwners` is emptied by epoch teardown and page reload; a matching
+ * persisted `TransferRecord` is still resumable via durable field checks in
+ * `buildResumeRequest` / `matchesDurableReceiveOwner`. Registration is a
+ * separate API (`registerTransferOwner` / `handleMetaMessage` / `sendFileParallel`).
  */
 export function assertTransferOwner(transferId: string, owner: TransferOwner | undefined): boolean {
   const rec = transferOwners.get(transferId)
   if (!rec) return false
   if (!owner) return false
   return rec.peerSessionId === owner.peerSessionId && rec.epoch === owner.epoch
+}
+
+/**
+ * Durable-row ownership for resume paths. Does not consult the in-memory
+ * owner map — after reload that map is empty while the IDB row remains.
+ * Records without peerSessionId (pre-v2) stay resumable under any owner.
+ */
+export function matchesDurableReceiveOwner(
+  record: { peerSessionId?: string; epoch?: number },
+  owner: TransferOwner | undefined,
+): boolean {
+  if (!owner) return true
+  if (record.peerSessionId && record.peerSessionId !== owner.peerSessionId) return false
+  if (record.epoch !== undefined && record.epoch !== owner.epoch) return false
+  return true
 }
 
 /** An attempt is identified by all four fields, never by transferId alone. */

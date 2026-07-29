@@ -66,8 +66,38 @@ const INITIAL_ICE_REOBSERVE_MS = 8_000
 /** Elapsed-time budget for non-stable / signaling-down ICE restart waits. */
 const ICE_RESTART_PRECONDITION_BUDGET_MS = 60_000
 
-/** Cleanup owner: OPEN — survives connection cleanup (see report); ice-recovery partial */
+/**
+ * Elapsed-time budget start per peer for non-stable / signaling-down waits.
+ * Cleanup owner: clearPeerIceRecovery (via cleanupPeerConnection) — also
+ * deleted when a real offer begins, observation succeeds, or exhaustion runs.
+ */
 export const iceRestartPreconditionStarted = new Map<string, number>()
+
+/** Single cleanup owner for all ICE-recovery maps for one peer. */
+export function clearPeerIceRecovery(sessionId: string): void {
+  iceRestartPreconditionStarted.delete(sessionId)
+  iceRestartAttempts.delete(sessionId)
+  iceRestarting.delete(sessionId)
+  const retry = iceRestartRetryTimers.get(sessionId)
+  if (retry) {
+    clearTimeout(retry)
+    iceRestartRetryTimers.delete(sessionId)
+  }
+  clearDisconnectedTimer(sessionId)
+  clearInitialIceRecovery(sessionId)
+}
+
+export function clearAllIceRecovery(): void {
+  for (const sid of [...iceRestartPreconditionStarted.keys()]) clearPeerIceRecovery(sid)
+  // clearPeerIceRecovery already cleared the rest for known keys; sweep leftovers.
+  iceRestartPreconditionStarted.clear()
+  iceRestartAttempts.clear()
+  iceRestarting.clear()
+  for (const t of iceRestartRetryTimers.values()) clearTimeout(t)
+  iceRestartRetryTimers.clear()
+  for (const sid of [...disconnectedTimers.keys()]) clearDisconnectedTimer(sid)
+  for (const sid of [...initialIceRecoveryTimers.keys()]) clearInitialIceRecovery(sid)
+}
 
 
 export function handleIceStateChange(attempt: PeerConnectionAttempt) {
@@ -220,18 +250,19 @@ export function scheduleInitialIceRecovery(pc: RTCPeerConnection, peerSessionId:
       let offer: RTCSessionDescriptionInit
       try {
         offer = await pc.createOffer({ iceRestart: true })
+        if (!isInitialIceRecoveryCurrent(pc, peerSessionId, epoch, gen)) return
+        if (!deps.isLocalOfferCurrent(peerSessionId, offerToken)) return
+        // makingOffer stays true until local description is installed.
+        await pc.setLocalDescription(offer)
+        if (!isInitialIceRecoveryCurrent(pc, peerSessionId, epoch, gen)) return
+        if (!deps.isLocalOfferCurrent(peerSessionId, offerToken)) return
+        deps.sendLocalOffer(peerSessionId, pc, pc.localDescription!.toJSON())
+        scheduleInitialIceReobservation(pc, peerSessionId, epoch, gen)
       } finally {
         if (offerToken !== undefined && deps.isLocalOfferCurrent(peerSessionId, offerToken)) {
           deps.negState(peerSessionId).makingOffer = false
         }
       }
-      if (!isInitialIceRecoveryCurrent(pc, peerSessionId, epoch, gen)) return
-      if (!deps.isLocalOfferCurrent(peerSessionId, offerToken)) return
-      await pc.setLocalDescription(offer)
-      if (!isInitialIceRecoveryCurrent(pc, peerSessionId, epoch, gen)) return
-      if (!deps.isLocalOfferCurrent(peerSessionId, offerToken)) return
-      deps.sendLocalOffer(peerSessionId, pc, pc.localDescription!.toJSON())
-      scheduleInitialIceReobservation(pc, peerSessionId, epoch, gen)
     } catch (err) {
       if (offerToken !== undefined && deps.isLocalOfferCurrent(peerSessionId, offerToken)) {
         deps.negState(peerSessionId).makingOffer = false
@@ -480,38 +511,39 @@ export async function attemptIceRestart(peerSessionId: string) {
     let offer: RTCSessionDescriptionInit
     try {
       offer = await pc.createOffer({ iceRestart: true })
+      if (!pcStillCurrent()) {
+        scheduleIceRestartRetry(peerSessionId, gen)
+        return
+      }
+      if (!deps.isLocalOfferCurrent(peerSessionId, offerToken)) {
+        scheduleIceRestartRetry(peerSessionId, gen)
+        return
+      }
+      // makingOffer stays true until local description is installed.
+      await pc.setLocalDescription(offer)
+      if (!pcStillCurrent()) {
+        scheduleIceRestartRetry(peerSessionId, gen)
+        return
+      }
+      if (!deps.isLocalOfferCurrent(peerSessionId, offerToken)) {
+        scheduleIceRestartRetry(peerSessionId, gen)
+        return
+      }
+      // Trickle — candidates will stream via onicecandidate. (Same fix as
+      // createOffer/createAnswer: the `{ once: true }` gathering wait could
+      // miss the `complete` event and hang the restart forever.)
+      deps.sendLocalOffer(peerSessionId, pc, pc.localDescription!.toJSON())
+      // Always give the just-published restart an observation window — even
+      // when this was the final numeric attempt. Terminal offline is decided
+      // only after that window elapses without ICE recovery.
+      scheduleIceRestartRetry(peerSessionId, gen, ICE_RESTART_BACKOFF_MS[
+        Math.min(attempts + 1, ICE_RESTART_BACKOFF_MS.length - 1)
+      ] ?? 16_000)
     } finally {
       if (deps.isLocalOfferCurrent(peerSessionId, offerToken)) {
         deps.negState(peerSessionId).makingOffer = false
       }
     }
-    if (!pcStillCurrent()) {
-      scheduleIceRestartRetry(peerSessionId, gen)
-      return
-    }
-    if (!deps.isLocalOfferCurrent(peerSessionId, offerToken)) {
-      scheduleIceRestartRetry(peerSessionId, gen)
-      return
-    }
-    await pc.setLocalDescription(offer)
-    if (!pcStillCurrent()) {
-      scheduleIceRestartRetry(peerSessionId, gen)
-      return
-    }
-    if (!deps.isLocalOfferCurrent(peerSessionId, offerToken)) {
-      scheduleIceRestartRetry(peerSessionId, gen)
-      return
-    }
-    // Trickle — candidates will stream via onicecandidate. (Same fix as
-    // createOffer/createAnswer: the `{ once: true }` gathering wait could
-    // miss the `complete` event and hang the restart forever.)
-    deps.sendLocalOffer(peerSessionId, pc, pc.localDescription!.toJSON())
-    // Always give the just-published restart an observation window — even
-    // when this was the final numeric attempt. Terminal offline is decided
-    // only after that window elapses without ICE recovery.
-    scheduleIceRestartRetry(peerSessionId, gen, ICE_RESTART_BACKOFF_MS[
-      Math.min(attempts + 1, ICE_RESTART_BACKOFF_MS.length - 1)
-    ] ?? 16_000)
   } catch {
     const attemptCurrent = pcAttempt
       ? deps.isPeerConnectionAttemptCurrent(pcAttempt)

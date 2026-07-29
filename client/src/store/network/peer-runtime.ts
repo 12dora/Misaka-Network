@@ -342,25 +342,27 @@ async function initiateWebRTCInner(peerSessionId: string, gen: number) {
   const offerToken = deps.beginLocalOffer(peerSessionId)
   let offer: RTCSessionDescriptionInit
   try {
+    // createOffer() installs the local description before returning — so
+    // makingOffer stays true through the entire setLocalDescription window.
     offer = await createOffer(pc, () => isPeerConnectionAttemptCurrent(attempt))
+    // Superseded while the browser was building the offer: the SDP belongs to a
+    // connection nobody routes through any more, so publishing it would make
+    // the remote answer the wrong PC.
+    if (!isPeerConnectionAttemptCurrent(attempt)) {
+      abandonPeerConnection(peerSessionId, pc)
+      return
+    }
+    // Polite glare accepted a remote offer while createOffer was pending —
+    // publishing this stale local offer would break the negotiated session.
+    if (!deps.isLocalOfferCurrent(peerSessionId, offerToken)) {
+      return
+    }
+    deps.sendLocalOffer(peerSessionId, pc, offer)
   } finally {
     if (deps.isLocalOfferCurrent(peerSessionId, offerToken)) {
       deps.negState(peerSessionId).makingOffer = false
     }
   }
-  // Superseded while the browser was building the offer: the SDP belongs to a
-  // connection nobody routes through any more, so publishing it would make
-  // the remote answer the wrong PC.
-  if (!isPeerConnectionAttemptCurrent(attempt)) {
-    abandonPeerConnection(peerSessionId, pc)
-    return
-  }
-  // Polite glare accepted a remote offer while createOffer was pending —
-  // publishing this stale local offer would break the negotiated session.
-  if (!deps.isLocalOfferCurrent(peerSessionId, offerToken)) {
-    return
-  }
-  deps.sendLocalOffer(peerSessionId, pc, offer)
 }
 
 
@@ -372,11 +374,31 @@ export function cleanupPeerConnection(sessionId: string, options: { failQueuedMe
   // restart, config migration) is now working on a dead connection — bumping
   // the generation is how those tasks learn to abort (BUG-005 / BUG-007).
   bumpPeerGeneration(sessionId)
-  deps.iceRestartAttempts.delete(sessionId)
-  deps.iceRestarting.delete(sessionId)
+  // Single ICE-recovery cleanup owner: attempts, locks, retry timers, AND
+  // precondition timestamps (must not survive into a replacement sessionId).
+  if (typeof deps.clearPeerIceRecovery === 'function') {
+    deps.clearPeerIceRecovery(sessionId)
+  } else {
+    deps.iceRestartAttempts.delete(sessionId)
+    deps.iceRestarting.delete(sessionId)
+    deps.iceRestartPreconditionStarted?.delete(sessionId)
+    deps.clearDisconnectedTimer(sessionId)
+    deps.clearInitialIceRecovery(sessionId)
+    const retryTimer = deps.iceRestartRetryTimers.get(sessionId)
+    if (retryTimer) {
+      clearTimeout(retryTimer)
+      deps.iceRestartRetryTimers.delete(sessionId)
+    }
+  }
   deps.pendingIceMigration.delete(sessionId)
-  deps.clearDisconnectedTimer(sessionId)
-  deps.clearInitialIceRecovery(sessionId)
+  // Per-peer chat dedupe + durable ACK queue: peer departure / reconnect /
+  // block all flow through here — complete teardown vs epoch-only clear.
+  // Required deps (wired in runtime.bindDeps). No optional-chain: a missing
+  // binding must throw, not silently leak.
+  deps.seenInboundChatIds.delete(sessionId)
+  for (const key of [...deps.pendingDurableAcks.keys()]) {
+    if (key.startsWith(`${sessionId}\u0000`)) deps.pendingDurableAcks.delete(key)
+  }
   // Detach dc.onclose BEFORE calling dc.close(). Otherwise the listener set in
   // deps.setupDataChannel sees pc still alive (we close dc first, pc second) and
   // fires attemptIceRestart for a connection we're intentionally tearing down,
@@ -407,11 +429,6 @@ export function cleanupPeerConnection(sessionId: string, options: { failQueuedMe
   }
   connectingPeers.delete(sessionId)
   remoteInitiatingPeers.delete(sessionId)
-  const retryTimer = deps.iceRestartRetryTimers.get(sessionId)
-  if (retryTimer) {
-    clearTimeout(retryTimer)
-    deps.iceRestartRetryTimers.delete(sessionId)
-  }
   const resolvers = primaryChannelResolvers.get(sessionId)
   if (resolvers) {
     primaryChannelResolvers.delete(sessionId)

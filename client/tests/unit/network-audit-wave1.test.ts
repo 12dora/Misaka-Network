@@ -490,116 +490,77 @@ describe('02 P2: chat retry does not duplicate after reconnect flush', () => {
 })
 
 describe('02 P2: blockPeer preserves started download release path', () => {
-  it('rehomes started artifacts under ORPHANED_DOWNLOADS_CHAT_KEY', async () => {
-    const { store, mod } = await freshStore()
-    const url = URL.createObjectURL(new Blob([new Uint8Array([1, 2, 3]).buffer]))
-    // Plant a file chat with a lifecycle and mark started.
-    store.setState(s => ({
-      chatMessages: {
-        ...s.chatMessages,
-        [PEER]: [{
-          id: 'file-1',
-          type: 'file' as const,
-          content: '',
-          fileName: 'x.bin',
-          fileSize: 3,
-          downloadUrl: url,
-          timestamp: Date.now(),
-          direction: 'recv' as const,
-        }],
-      },
-    }))
-    // artifactLifecycleByUrl is module-private; markDownloadArtifactStarted
-    // only flips started when a lifecycle exists. deliverCompletedFile plants
-    // one — simulate by appending via the public mark after a manual plant
-    // is impossible. Instead: call markDownloadArtifactStarted after we
-    // ensure a lifecycle by going through append path is hard.
-    // Work around: releaseDownloadArtifact / markDownload only work with map
-    // entries. Use the exported mark after injecting via deliverCompletedFile
-    // is too heavy. Check the blockPeer logic by planting lifecycle through
-    // a side door — the map is not exported.
-    // Practical test: without started flag, blockPeer retires; WITH started
-    // we need a lifecycle. Read network module and use markDownload after
-    // creating URL from a completed receive is ideal.
-    // Minimal: plant lifecycle by calling the same path deliver uses —
-    // not exported. So we only assert that started downloads are not
-    // released when we can mark them.
-    // Force a lifecycle entry by completing a zero-byte receive is complex.
-    // Alternative: spy on URL.revokeObjectURL / ensure keep path exists.
-    const key = mod.ORPHANED_DOWNLOADS_CHAT_KEY
-    expect(typeof key).toBe('string')
-    // Manually set started via markDownloadArtifactStarted after faking the
-    // map by completing a file delivery is the only production path.
-    // For this test: plant message, mark started only if lifecycle exists.
-    // Create lifecycle by using the fact that deliverCompletedFile sets it —
-    // skip and instead verify blockPeer keeps messages when downloadUrl has
-    // started lifecycle. We'll inject by monkey-patching:
-    const lifeMap = (mod as unknown as { artifactLifecycleByUrl?: Map<string, { started: boolean }> })
-    // Map is not exported. Use markDownloadArtifactStarted after creating
-    // entry via a completed transfer is the honest path.
-    // Simpler approach that still fails old code: if we mark started on a
-    // URL that has no lifecycle, mark is a no-op; blockPeer will retire and
-    // drop chat — that's the OLD behaviour for non-started.
-    // To prove the NEW behaviour we need a real lifecycle. Create one by
-    // calling releaseDownloadArtifact's inverse — not available.
-    // Export is only markDownloadArtifactStarted. Looking at deliverCompletedFile:
-    // artifactLifecycleByUrl.set(url, { cleanup, started: false })
-    // We can simulate a full mini receive completing to plant it.
-
-    // Use Object URL + direct block after planting lifecycle via (unexported)
-    // path: monkeypatch by completing finalize is heavy.
-    // FINAL approach: export nothing; test through receive zero-byte path.
-    // If too flaky, assert the keep key constant and that blockPeer does not
-    // throw, and that messages without downloadUrl are dropped.
-    store.getState().blockPeer(PEER)
-    await settle(5)
-    expect(store.getState().peers.find(p => p.sessionId === PEER)).toBeUndefined()
-    // Without a started lifecycle the file message is dropped (retired).
-    // The key for rehoming must exist as a public contract.
-    expect(mod.ORPHANED_DOWNLOADS_CHAT_KEY).toBe('__orphaned-downloads__')
-    try { URL.revokeObjectURL(url) } catch { /* ignore */ }
-  })
-
-  it('keeps started download chat under orphan key when lifecycle.started', async () => {
+  it('keeps started download under orphan key and UI release is clickable', async () => {
     const { store, mod, transfer } = await freshStore()
-    // Complete a tiny inbound file to plant a real lifecycle entry.
-    const chunkSize = transfer.CHUNK_SIZE
     const primary = dcs.find(d => d.label === 'misaka')!
-    const meta = {
-      type: 'meta', transferId: 'block-art', shortId: 11,
-      fileName: 'keep.bin', fileSize: chunkSize, fileHash: '',
-      totalChunks: 1, mime: 'application/octet-stream', v: 2,
+    // Zero-byte inbound — guaranteed complete without crypto/chunks.
+    const zbMeta = {
+      type: 'meta', transferId: 'block-zb', shortId: 12,
+      fileName: 'keep-zb.bin', fileSize: 0, fileHash: '',
+      totalChunks: 0, mime: 'application/octet-stream', v: 2,
     }
-    primary.onmessage!({ data: JSON.stringify(meta) } as MessageEvent)
-    await settle(20)
-    const session = transfer.getReceiveSession('block-art')
-    if (session) {
-      session.backend = 'idb'
-      session.storageMode = 'indexeddb'
-    }
-    const payload = new Uint8Array(chunkSize).fill(7)
-    const frame = transfer.encodeChunkFrame(11, 0, new Uint8Array(12), payload.buffer)
-    primary.onmessage!({ data: frame } as MessageEvent)
-    await settle(80)
+    primary.onmessage!({ data: JSON.stringify(zbMeta) } as MessageEvent)
+    await settle(100)
     const fileMsg = (store.getState().chatMessages[PEER] ?? []).find(m => m.type === 'file')
-    if (!fileMsg?.downloadUrl) {
-      // Backend may not have completed in this environment; skip soft.
-      expect(true).toBe(true)
-      return
-    }
-    mod.markDownloadArtifactStarted(fileMsg.downloadUrl)
+    expect(fileMsg?.downloadUrl).toBeTruthy()
+    const url = fileMsg!.downloadUrl!
+    mod.markDownloadArtifactStarted(url)
     store.getState().blockPeer(PEER)
     await settle(5)
+    expect(mod.ORPHANED_DOWNLOADS_CHAT_KEY).toBe('__orphaned-downloads__')
     const orphaned = store.getState().chatMessages[mod.ORPHANED_DOWNLOADS_CHAT_KEY] ?? []
-    expect(orphaned.some(m => m.downloadUrl === fileMsg.downloadUrl)).toBe(true)
-    // Release path still works.
-    await mod.releaseDownloadArtifact(fileMsg.downloadUrl)
+    expect(orphaned.some(m => m.downloadUrl === url)).toBe(true)
+
+    // Remount after rehome: already-started artifact must show Release, not Download.
+    const { act } = await import('react-dom/test-utils')
+    const { createRoot } = await import('react-dom/client')
+    const React = await import('react')
+    const DownloadArtifactActions = (await import('../../src/components/features/DownloadArtifactActions')).default
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    const root = createRoot(container)
+    ;(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+    try {
+      act(() => {
+        root.render(
+          React.createElement('div', { 'data-testid': 'orphaned-downloads-panel' },
+            orphaned.filter(m => m.downloadUrl).map(m =>
+              React.createElement(DownloadArtifactActions, {
+                key: m.id,
+                id: m.id,
+                url: m.downloadUrl!,
+                fileName: m.fileName ?? 'download',
+              }),
+            ),
+          ),
+        )
+      })
+      expect(container.querySelector('[data-testid="orphaned-downloads-panel"]')).toBeTruthy()
+      // Started before blockPeer → remount initializes from registry (no second Download).
+      expect(Array.from(container.querySelectorAll('button')).some(b => b.textContent?.includes('下载'))).toBe(false)
+      const releaseBtn = container.querySelector<HTMLButtonElement>(
+        `[data-testid="release-download-${fileMsg!.id}"]`,
+      )
+      expect(releaseBtn).toBeTruthy()
+      await act(async () => { releaseBtn?.click(); await Promise.resolve() })
+      await settle(30)
+      expect(container.textContent).toMatch(/临时副本已释放/)
+      // Release also prunes the orphan chat row.
+      const after = store.getState().chatMessages[mod.ORPHANED_DOWNLOADS_CHAT_KEY] ?? []
+      expect(after.some(m => m.downloadUrl === url)).toBe(false)
+    } finally {
+      act(() => root.unmount())
+      container.remove()
+    }
+    void transfer
   })
 })
 
 describe('02 P1: epoch switch during deferred finalization must not publish to new identity', () => {
   it('deliver path does not inject completed file into a post-epoch peer chat', async () => {
     const { store, primary, transfer, mod } = await freshStore()
+    const { getNetworkEpoch } = await import('../../src/store/network')
+    const epochBefore = getNetworkEpoch()
     const chunkSize = transfer.CHUNK_SIZE
     const meta = {
       type: 'meta', transferId: 'epoch-fin', shortId: 42,
@@ -613,7 +574,6 @@ describe('02 P1: epoch switch during deferred finalization must not publish to n
       session.backend = 'idb'
       session.storageMode = 'indexeddb'
     }
-    // Park finalization by making updateTransfer hang until we end the epoch.
     let releaseStatus!: () => void
     const statusGate = new Promise<void>(r => { releaseStatus = r })
     const db = await import('../../src/lib/db')
@@ -625,29 +585,16 @@ describe('02 P1: epoch switch during deferred finalization must not publish to n
     })
     const payload = new Uint8Array(chunkSize).fill(9)
     const frame = transfer.encodeChunkFrame(42, 0, new Uint8Array(12), payload.buffer)
-    // Kick receive which will eventually finalize
     primary.onmessage!({ data: frame } as MessageEvent)
     await settle(40)
-    // End the network epoch while status write is still parked.
-    // endNetworkEpoch is not exported — re-init / force via auth-like path:
-    // calling init again after clear, or use the store's teardown if available.
-    // Practical: bump by logging out is store-private. Use setState + reset
-    // transfer module, and verify chat for PEER does not gain a file after
-    // the deferred finalize resumes under a NEW epoch when possible.
-    //
-    // Minimal behavioural check: if finalize is still deferred, PEER chat has
-    // no file yet; after release under a reset module, file delivery must not
-    // target a wiped epoch (deliveredTransfers / epoch check).
     const before = (store.getState().chatMessages[PEER] ?? []).filter(m => m.type === 'file')
-    // Simulate epoch end: wipe chat and bump via private path if exported.
-    // Network exports setEpochTransferTeardown only. Fall back to:
-    store.setState({ chatMessages: {}, peers: [], selectedSessionId: null })
-    transfer.resetTransferModuleState()
+    // Genuinely end the network epoch (bumps getNetworkEpoch()).
+    store.getState().destroy()
+    await settle(10)
+    expect(getNetworkEpoch()).toBeGreaterThan(epochBefore)
     releaseStatus()
     await settle(80)
     const after = (store.getState().chatMessages[PEER] ?? []).filter(m => m.type === 'file')
-    // Either delivery was blocked (preferred) or only pre-epoch messages remain.
-    // Must not grow file cards on PEER after we wiped chat mid-finalize.
     expect(after.length).toBeLessThanOrEqual(before.length)
     void mod
   })
@@ -741,6 +688,119 @@ describe('02 P1: zero-copy receive never evaluates ciphertext getter', () => {
       expect(spy).toHaveBeenCalled()
     } finally {
       spy.mockRestore()
+    }
+  })
+})
+
+describe('02 P1: makingOffer stays true through setLocalDescription', () => {
+  it('older deferred createOffer does not clear a newer token mid setLocalDescription', async () => {
+    const { beginLocalOffer, isLocalOfferCurrent, negState, invalidatePendingLocalOffer } =
+      await import('../../src/store/network/negotiation-controller')
+    const peer = 'offer-race-peer'
+    const t1 = beginLocalOffer(peer)
+    expect(negState(peer).makingOffer).toBe(true)
+    // Second overlapping offer bumps token.
+    const t2 = beginLocalOffer(peer)
+    expect(t2).toBeGreaterThan(t1)
+    expect(isLocalOfferCurrent(peer, t1)).toBe(false)
+    expect(isLocalOfferCurrent(peer, t2)).toBe(true)
+    // Older token must not clear makingOffer while newer is in-flight.
+    if (isLocalOfferCurrent(peer, t1)) negState(peer).makingOffer = false
+    expect(negState(peer).makingOffer).toBe(true)
+    // Simulate deferred setLocalDescription still pending for t2.
+    expect(negState(peer).makingOffer).toBe(true)
+    // Only after current token completes/invalidates may makingOffer clear.
+    invalidatePendingLocalOffer(peer)
+    expect(negState(peer).makingOffer).toBe(false)
+  })
+
+  it('superseded offer token does not clear makingOffer after connection cleanup', async () => {
+    const {
+      beginLocalOffer, isLocalOfferCurrent, negState, clearPeerNegotiationState,
+    } = await import('../../src/store/network/negotiation-controller')
+    const peer = 'offer-cleanup-peer'
+    const oldToken = beginLocalOffer(peer)
+    expect(negState(peer).makingOffer).toBe(true)
+    // Peer cleanup deletes negotiationState entry (replacement PC).
+    clearPeerNegotiationState(peer)
+    // Replacement connection starts a new offer — generation must not restart at 1.
+    const newToken = beginLocalOffer(peer)
+    expect(newToken).toBeGreaterThan(oldToken)
+    expect(isLocalOfferCurrent(peer, oldToken)).toBe(false)
+    expect(isLocalOfferCurrent(peer, newToken)).toBe(true)
+    expect(negState(peer).makingOffer).toBe(true)
+    // Stale deferred finally of the old offer must not clear the new window.
+    if (isLocalOfferCurrent(peer, oldToken)) negState(peer).makingOffer = false
+    expect(negState(peer).makingOffer).toBe(true)
+  })
+})
+
+describe('02 P1: iceRestartPreconditionStarted retired with connection cleanup', () => {
+  it('cleanupPeerConnection clears precondition timestamps', async () => {
+    const { iceRestartPreconditionStarted, clearPeerIceRecovery } =
+      await import('../../src/store/network/ice-recovery')
+    const sid = 'ice-precond-peer'
+    iceRestartPreconditionStarted.set(sid, Date.now() - 120_000)
+    clearPeerIceRecovery(sid)
+    expect(iceRestartPreconditionStarted.has(sid)).toBe(false)
+  })
+})
+
+describe('02 P0: cleanupPeerConnection actually clears peer-scoped maps via deps', () => {
+  it('seenInboundChatIds and pendingDurableAcks are bound and cleared', async () => {
+    // freshStore runs runtime bindDeps — without the maps in deps, cleanup is a no-op.
+    await freshStore()
+    const sid = PEER
+    const { seenInboundChatIds } = await import('../../src/store/network/chat-controller')
+    const { pendingDurableAcks } = await import('../../src/store/network/transfer-controller')
+    const { cleanupPeerConnection } = await import('../../src/store/network/peer-runtime')
+    const { deps } = await import('../../src/store/network/deps')
+    // Binding check: composition root must have wired the real maps.
+    expect(deps.seenInboundChatIds).toBe(seenInboundChatIds)
+    expect(deps.pendingDurableAcks).toBe(pendingDurableAcks)
+    // Seed state that must be owned by cleanupPeerConnection.
+    seenInboundChatIds.set(sid, new Set(['msg-a']))
+    pendingDurableAcks.set(`${sid}\u0000tid-1`, {
+      transferId: 'tid-1', bytes: 1, epoch: 0, peerSessionId: sid,
+    } as never)
+    expect(seenInboundChatIds.has(sid)).toBe(true)
+    expect(pendingDurableAcks.has(`${sid}\u0000tid-1`)).toBe(true)
+    // Real production teardown path (not a direct map.delete helper).
+    cleanupPeerConnection(sid, { failQueuedMessages: false })
+    expect(seenInboundChatIds.has(sid)).toBe(false)
+    expect(pendingDurableAcks.has(`${sid}\u0000tid-1`)).toBe(false)
+  })
+})
+
+describe('02 P2: orphan remount shows Release for already-started artifact', () => {
+  it('initializes started from registry so remount does not re-show Download', async () => {
+    await freshStore()
+    const url = 'blob:orphan-started'
+    const artifacts = await import('../../src/store/network/download-artifacts')
+    artifacts.registerDownloadArtifact(url, {})
+    artifacts.markDownloadArtifactStarted(url)
+    const { act } = await import('react-dom/test-utils')
+    const { createRoot } = await import('react-dom/client')
+    const React = await import('react')
+    const DownloadArtifactActions = (await import('../../src/components/features/DownloadArtifactActions')).default
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    const root = createRoot(container)
+    ;(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+    try {
+      act(() => {
+        root.render(
+          React.createElement(DownloadArtifactActions, {
+            id: 'orph-1', url, fileName: 'started.bin',
+          }),
+        )
+      })
+      // Already started → release control, not Download.
+      expect(container.querySelector('[data-testid="release-download-orph-1"]')).toBeTruthy()
+      expect(Array.from(container.querySelectorAll('button')).some(b => b.textContent?.includes('下载'))).toBe(false)
+    } finally {
+      act(() => root.unmount())
+      container.remove()
     }
   })
 })

@@ -104,6 +104,8 @@ import {
   getReceiveSession,
   cancelReceive,
   forgetTransfer,
+  resetTransferModuleState,
+  buildResumeRequest,
   CHUNK_SIZE,
   type MetaMessage,
 } from '../../src/lib/transfer'
@@ -319,6 +321,22 @@ describe('characterization: ownership (peerSessionId, epoch)', () => {
     expect(assertTransferOwner('own-1', { peerSessionId: PEER, epoch: 0 })).toBe(false)
     expect(assertTransferOwner('own-1', { peerSessionId: 'other', epoch: 3 })).toBe(false)
     clearTransferOwner('own-1')
+  })
+
+  it('reload-then-resume: durable receive row still builds resume after owner map wipe', async () => {
+    const id = 'char-reload-resume'
+    const meta = makeMeta({ transferId: id, shortId: 1, fileSize: CHUNK_SIZE, totalChunks: 1 })
+    await handleMetaMessage(meta, 1, OWNER)
+    // Simulate chunks already on disk from before reload.
+    const dbMod = await import('../../src/lib/db')
+    vi.mocked(dbMod.getSavedChunkIndexes).mockResolvedValueOnce([0])
+    // Page reload / epoch: in-memory owners gone, durable row remains.
+    resetTransferModuleState()
+    expect(assertTransferOwner(id, OWNER)).toBe(false)
+    const req = await buildResumeRequest(id, OWNER)
+    expect(req).not.toBeNull()
+    expect(req!.transferId).toBe(id)
+    forgetTransfer(id)
   })
 })
 

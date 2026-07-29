@@ -577,9 +577,25 @@ function TransferChannel({ selectedPeer, onlinePeerCount, onStageFiles, onSendFi
         className="px-5 py-3 border-b"
         style={{ background: 'var(--surface-tint)', borderColor: 'var(--border-card)', borderRadius: '1rem 1rem 0 0' }}
       >
-        <div className="font-kanji text-sm font-semibold text-[var(--text-on-white)]">
-          目标：御坂 {selectedPeer.nodeId} 号
-          <span className="ml-1 font-mono text-[10px] text-[var(--text-muted)]">#{selectedPeer.sessionId.slice(-4)}</span>
+        <div className="flex items-center gap-2">
+          <div className="font-kanji text-sm font-semibold text-[var(--text-on-white)] flex-1 min-w-0">
+            目标：御坂 {selectedPeer.nodeId} 号
+            <span className="ml-1 font-mono text-[10px] text-[var(--text-muted)]">#{selectedPeer.sessionId.slice(-4)}</span>
+          </div>
+          {/* Production path for blockPeer → orphaned-downloads panel */}
+          <MisakaButton
+            variant="pill"
+            size="sm"
+            className="text-[10px] py-0.5 px-2 shrink-0"
+            data-testid={`block-peer-${selectedPeer.sessionId}`}
+            onClick={() => {
+              if (window.confirm(`屏蔽御坂 ${selectedPeer.nodeId} 号？已开始的下载仍可在「未完成下载」中释放。`)) {
+                useNetworkStore.getState().blockPeer(selectedPeer.sessionId)
+              }
+            }}
+          >
+            屏蔽
+          </MisakaButton>
         </div>
         <div className="font-kanji text-xs text-[var(--text-on-white-2)] mt-0.5">
           {channelLabel(selectedPeer.channelType)} · DTLS + AES-GCM
