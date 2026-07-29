@@ -5,10 +5,34 @@ export interface Identity {
   createdAt: number
 }
 
+/**
+ * Live client session (Contract 1).
+ *
+ * `reRegisterProof` is a required key with a nullable value: every construction
+ * site must decide deliberately, but absence degrades silent 4001/4002
+ * recovery rather than blocking connect/chat/transfer.
+ */
 export interface Session {
   token: string
   sessionId: string
   expiresAt: number
+  /**
+   * Opaque re-registration proof for 4001/4002 recovery without the passcode.
+   * `null` means the session works normally but cannot auto-recover from
+   * auth-invalid closes (older server, stripped field, or legacy cache).
+   */
+  reRegisterProof: string | null
+}
+
+/**
+ * sessionStorage shape — may omit proof (pre-Contract rows or older servers).
+ * Restored via `tryRestoreSession` with `reRegisterProof: null` when missing.
+ */
+export interface LegacyStoredSession {
+  token: string
+  sessionId: string
+  expiresAt: number
+  reRegisterProof?: string | null
 }
 
 // ── Network Stats ─────────────────────────────────────────────────

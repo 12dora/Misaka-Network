@@ -39,21 +39,37 @@ let _config: AppConfig | null = null
 // absolute http(s) / ws(s) URL is dropped rather than silently poisoning
 // every later `apiUrl()` call.
 
+/**
+ * API_BASE must be a consumable absolute http(s) origin/prefix:
+ * no credentials, no hash, no query (query breaks path concatenation).
+ */
 function isHttpUrl(v: unknown): v is string {
   if (typeof v !== 'string' || v === '') return false
   try {
     const u = new URL(v)
-    return u.protocol === 'http:' || u.protocol === 'https:'
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false
+    if (u.username || u.password) return false
+    if (u.hash) return false
+    if (u.search) return false
+    return true
   } catch {
     return false
   }
 }
 
+/**
+ * WS_URL must be constructible for `new WebSocket()`:
+ * no credentials, no hash (fragment throws synchronously).
+ * Query is allowed (rare, but WebSocket accepts it).
+ */
 function isWsUrl(v: unknown): v is string {
   if (typeof v !== 'string' || v === '') return false
   try {
     const u = new URL(v)
-    return u.protocol === 'ws:' || u.protocol === 'wss:'
+    if (u.protocol !== 'ws:' && u.protocol !== 'wss:') return false
+    if (u.username || u.password) return false
+    if (u.hash) return false
+    return true
   } catch {
     return false
   }
@@ -170,9 +186,17 @@ export function __resetConfig() {
   _config = null
 }
 
+/**
+ * Join `path` onto API_BASE with the URL API so a trailing slash / missing
+ * slash on the base never string-concatenates into a broken route.
+ * Paths are treated as relative to the base prefix (not site-root absolute).
+ */
 export function apiUrl(path: string): string {
   const cfg = getConfig()
-  return cfg.API_BASE ? `${cfg.API_BASE}${path}` : path
+  if (!cfg.API_BASE) return path
+  const base = cfg.API_BASE.endsWith('/') ? cfg.API_BASE : `${cfg.API_BASE}/`
+  const rel = path.startsWith('/') ? path.slice(1) : path
+  return new URL(rel, base).href
 }
 
 export function wsUrl(): string {

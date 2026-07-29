@@ -3,7 +3,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
 import IpFullPrompt from '@/components/features/IpFullPrompt'
-import { useAuthStore } from '@/store/auth'
+import { useAuthStore, decodeAuthError } from '@/store/auth'
 import { apiUrl } from '@/config'
 
 type JoinStatus = 'connecting' | 'needs-passcode' | 'error' | 'ip-limited'
@@ -30,11 +30,16 @@ export default function Join() {
     type: params.get('type') ?? 'node',
     targetNodeId: Number(params.get('id')),
     qrToken: params.get('t') ?? '',
-    fileSessionId: params.get('fid'),
   }), [params])
 
   useEffect(() => {
     if (attempt > 0) return
+    // Contract 7: only node QR is supported.
+    if (joinInfo.type !== 'node') {
+      setStatus('error')
+      setErrorMsg('不支持的 QR 类型')
+      return
+    }
     if (
       params.has('c')
       || !joinInfo.qrToken
@@ -51,7 +56,7 @@ export default function Join() {
       return
     }
     setAttempt(1)
-  }, [attempt, joinInfo.qrToken, joinInfo.targetNodeId, params, passCode])
+  }, [attempt, joinInfo.qrToken, joinInfo.targetNodeId, joinInfo.type, params, passCode])
 
   useEffect(() => {
     if (attempt === 0) return
@@ -76,14 +81,20 @@ export default function Join() {
         })
 
         if (!res.ok) {
-          const err = await res.json().catch(() => ({ error: 'UNKNOWN' })) as { error?: string }
+          const err = await res.json().catch(() => ({ error: 'UNKNOWN' })) as {
+            error?: string
+            message?: string
+            reason?: string
+            unlockAt?: number
+          }
           if (cancelled) return
+          const view = decodeAuthError(res.status, err)
           if (err.error === 'QR_REQUIRES_PASSCODE' || err.error === 'WRONG_PASSCODE') {
             setStatus('needs-passcode')
             setErrorMsg(err.error === 'WRONG_PASSCODE' ? '通行码不正确，请重新输入' : '')
           } else {
             setStatus('error')
-            setErrorMsg(err.error === 'INVALID_QR_TOKEN' ? 'QR 码已过期或已被使用' : '接入失败')
+            setErrorMsg(view.message)
           }
           return
         }
@@ -97,15 +108,16 @@ export default function Join() {
         sessionStorage.setItem('misaka.join', JSON.stringify({
           targetNodeId: data.targetNodeId,
           channelId: data.channelId,
-          type: joinInfo.type,
-          fileSessionId: joinInfo.fileSessionId,
+          type: 'node',
         }))
 
-        await auth.connect({ admissionGrant: data.admissionGrant })
+        // Branch on THIS operation's commit result — never a stale global
+        // isConnected from a prior session that survived a failed admission.
+        const committed = await auth.connect({ admissionGrant: data.admissionGrant })
         if (cancelled) return
 
         const after = useAuthStore.getState()
-        if (after.isConnected) {
+        if (committed) {
           navigate('/network', { replace: true })
         } else if (after.ipFullPrompt) {
           // P0-2: surface the shared release-and-retry UI here so the Join
