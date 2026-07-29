@@ -13,6 +13,13 @@ const EMPTY_STATS: NetworkStats = {
   cpuLoadPercent: 0,
 }
 
+/**
+ * Maximum activities retained in the home store after any add.
+ * ActivityStream pause/flush must disclose this cap so the button count
+ * never promises more history than the store will keep.
+ */
+export const ACTIVITY_HISTORY_CAP = 20
+
 // BUG-030 — "实时服务状态" rendered failed and stale fetches as valid data.
 //
 // `fetchStats` swallowed every failure: a non-ok response or a thrown fetch
@@ -91,7 +98,7 @@ export const useHomeStore = create<HomeState>((set, get) => ({
 
   addActivity(event) {
     set(state => ({
-      activities: [event, ...state.activities].slice(0, 20),
+      activities: [event, ...state.activities].slice(0, ACTIVITY_HISTORY_CAP),
     }))
   },
 }))

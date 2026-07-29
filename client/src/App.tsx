@@ -1,9 +1,10 @@
-import { Component, lazy, Suspense, useLayoutEffect, useRef, type ErrorInfo, type ReactNode } from 'react'
+import { Component, lazy, Suspense, useEffect, useLayoutEffect, useRef, type ErrorInfo, type ReactNode } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigationType } from 'react-router-dom'
 import TopNav from '@/components/layout/TopNav'
 import UpdateBanner from '@/components/features/UpdateBanner'
 import { useAuthStore } from '@/store/auth'
 import { appBasePath } from '@/lib/appBase'
+import { titleForPath } from '@/copy/zh-CN/pageMeta'
 
 const Home = lazy(() => import('@/pages/Home'))
 const Network = lazy(() => import('@/pages/Network'))
@@ -121,11 +122,21 @@ function ForwardNavigationReset({ pathname }: { pathname: string }) {
   return null
 }
 
+/** Exported so unit tests can wire the real App title effect, not a reimplementation. */
+export function PageTitle() {
+  const location = useLocation()
+  useEffect(() => {
+    document.title = titleForPath(location.pathname)
+  }, [location.pathname])
+  return null
+}
+
 function AnimatedRoutes() {
   const location = useLocation()
 
   return (
     <>
+      <PageTitle />
       <ForwardNavigationReset pathname={location.pathname} />
       {/* A11Y-006: exactly one <main> landmark for the whole app; the pages
           render plain sections inside it. */}

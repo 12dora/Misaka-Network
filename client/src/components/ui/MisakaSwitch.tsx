@@ -63,9 +63,11 @@ export default function MisakaSwitch({
           background: checked ? onColor : 'var(--text-muted)',
         }}
       >
+        {/* Animate transform, not left — transition-transform only fires when
+            transform changes. Track is 40px, knob 20px, inset 2px → 16px travel. */}
         <span
-          className="absolute top-0.5 w-5 h-5 rounded-full bg-white transition-transform"
-          style={{ left: checked ? 'calc(100% - 22px)' : '2px' }}
+          className="absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform duration-150 ease-out"
+          style={{ transform: checked ? 'translateX(16px)' : 'translateX(0)' }}
         />
       </button>
     </div>

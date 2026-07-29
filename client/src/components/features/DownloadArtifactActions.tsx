@@ -36,24 +36,26 @@ export default function DownloadArtifactActions({ id, url, fileName }: Props) {
   }
 
   if (released) {
-    return <span className="text-[10px] font-mono shrink-0" style={{ color: 'var(--state-success)' }}>✓ 临时副本已释放</span>
+    return <span className="text-[10px] font-mono shrink-0" style={{ color: 'var(--state-success-on-light)' }}>✓ 临时副本已释放</span>
   }
 
   if (started) {
     return (
       <div className="flex flex-col items-end gap-1 shrink-0">
-        <span className="text-[10px] font-mono" style={{ color: 'var(--state-success)' }}>✓ 已开始下载</span>
-        <button
-          type="button"
+        <span className="text-[10px] font-mono" style={{ color: 'var(--state-success-on-light)' }}>✓ 已开始下载</span>
+        {/* 08 P2: was a 10px zero-padding text button — far below the project's
+            44px tap standard. Mis-tapping deletes the retained temporary copy. */}
+        <MisakaButton
+          variant="pill"
+          size="sm"
           data-testid={`release-download-${id}`}
           disabled={releasing}
           onClick={() => { void confirmSaved() }}
-          className="text-[10px] underline decoration-dotted disabled:opacity-60"
-          style={{ border: 0, padding: 0, background: 'transparent', color: 'var(--text-muted)', cursor: 'pointer' }}
+          className="text-xs min-h-11 px-2 tap-target"
           title="确认浏览器已完成保存后，删除本站保留的临时副本"
         >
           {releasing ? '释放中…' : '确认已保存并释放临时副本'}
-        </button>
+        </MisakaButton>
       </div>
     )
   }

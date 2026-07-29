@@ -10,7 +10,7 @@ export default function MisakaHeroTitle({ width }: { width: CSSProperties['width
     <svg
       className="block select-none pointer-events-none"
       role="img"
-      aria-label="とある科学 御坂网络"
+      aria-label="某科学的御坂网络"
       viewBox="-40 -40 1616 1104"
       style={{
         width,

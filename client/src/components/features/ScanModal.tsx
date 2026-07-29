@@ -5,6 +5,8 @@ import MisakaDialog from '@/components/ui/MisakaDialog'
 import { useModalExit } from '@/hooks/useModalExit'
 import { createCameraController } from '@/hooks/useCameraStream'
 import { parseJoinLink, describeJoinLinkRejection } from '@/components/features/joinLink'
+import { createQrScanLoop, SCAN_INTERVAL_MS } from '@/lib/qrScanLoop'
+import { network as netCopy } from '@/copy/zh-CN/network'
 import jsQR from 'jsqr'
 
 interface Props {
@@ -22,17 +24,17 @@ function describeCameraError(err: unknown): string {
   if (typeof err === 'object' && err && 'name' in err) {
     const name = (err as { name: string }).name
     switch (name) {
-      case 'NotAllowedError':       return '摄像头权限被拒绝，请在浏览器设置中允许'
-      case 'NotFoundError':         return '未检测到摄像头设备'
-      case 'NotReadableError':      return '摄像头被其他应用占用，请先关闭再试'
-      case 'OverconstrainedError':  return '当前设备不支持所选摄像头方向，正在切换…'
-      case 'SecurityError':         return '需要 HTTPS 或 localhost 才能使用摄像头'
-      case 'AbortError':            return '摄像头启动被中断，请重试'
+      case 'NotAllowedError':       return netCopy.scan.permissionDenied
+      case 'NotFoundError':         return netCopy.scan.notFound
+      case 'NotReadableError':      return netCopy.scan.inUse
+      case 'OverconstrainedError':  return netCopy.scan.overconstrained
+      case 'SecurityError':         return netCopy.scan.security
+      case 'AbortError':            return netCopy.scan.aborted
     }
   }
   // UX-COPY-004: never surface the raw exception text — it used to print
   // browser-internal messages straight into the modal.
-  return '摄像头启动失败，请重试或改用下方链接接入'
+  return netCopy.scan.genericFail
 }
 
 // P1: surface the "where do I open the camera permission" question with a
@@ -69,6 +71,9 @@ export default function ScanModal({ onClose }: Props) {
   const [acquiring, setAcquiring] = useState(false)
   const modal = useModalExit(onClose)
   const animRef = useRef<number>(0)
+  const warmTimerRef = useRef<number>(0)
+  /** Bumped by stopScanLoop so an in-flight tick/warm-up aborts. */
+  const scanGenRef = useRef(0)
   const inputId = useId()
 
   // SECURITY-012: one controller owns the camera for the whole lifetime of
@@ -99,6 +104,11 @@ export default function ScanModal({ onClose }: Props) {
   }, [facingMode])
 
   function stopScanLoop() {
+    scanGenRef.current += 1
+    if (warmTimerRef.current) {
+      window.clearTimeout(warmTimerRef.current)
+      warmTimerRef.current = 0
+    }
     if (animRef.current) {
       cancelAnimationFrame(animRef.current)
       animRef.current = 0
@@ -111,12 +121,12 @@ export default function ScanModal({ onClose }: Props) {
 
     if (!navigator.mediaDevices?.getUserMedia) {
       setHasCamera(false)
-      setCameraError('此浏览器不支持摄像头 API')
+      setCameraError(netCopy.scan.unsupported)
       return
     }
     if (!window.isSecureContext) {
       setHasCamera(false)
-      setCameraError('需要 HTTPS 或 localhost 才能使用摄像头')
+      setCameraError(netCopy.scan.needSecureContext)
       return
     }
 
@@ -180,51 +190,54 @@ export default function ScanModal({ onClose }: Props) {
   function startScanning(stream: MediaStream) {
     const camera = cameraRef.current
     const BarcodeDetectorCtor = (window as unknown as Record<string, unknown>).BarcodeDetector as typeof BarcodeDetector | undefined
+    const gen = scanGenRef.current
 
-    async function scanWithBarcodeDetector() {
-      if (!videoRef.current || !BarcodeDetectorCtor) return false
-      try {
-        const detector = new BarcodeDetectorCtor({ formats: ['qr_code'] })
-        const codes = await detector.detect(videoRef.current)
-        if (codes.length > 0) {
-          setDetected(codes[0].rawValue)
-          return true
+    // 08 P1: detector once per session; native miss does not dual-decode.
+    const loop = createQrScanLoop({
+      intervalMs: SCAN_INTERVAL_MS,
+      createDetector: () => {
+        if (!BarcodeDetectorCtor) return null
+        try {
+          return new BarcodeDetectorCtor({ formats: ['qr_code'] })
+        } catch {
+          return null
         }
-      } catch { /* fall through */ }
-      return false
-    }
+      },
+      scanWithJsQR: (video) => {
+        const canvas = canvasRef.current
+        if (!canvas || video.readyState < 2) return null
+        const ctx = canvas.getContext('2d', { willReadFrequently: true })
+        if (!ctx) return null
+        canvas.width = video.videoWidth
+        canvas.height = video.videoHeight
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)
+        const code = jsQR(imageData.data, imageData.width, imageData.height)
+        return code?.data ?? null
+      },
+    })
 
-    async function scanWithJsQR() {
-      const video = videoRef.current
-      const canvas = canvasRef.current
-      if (!video || !canvas || video.readyState < 2) return false
-      const ctx = canvas.getContext('2d')
-      if (!ctx) return false
-      canvas.width = video.videoWidth
-      canvas.height = video.videoHeight
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)
-      const code = jsQR(imageData.data, imageData.width, imageData.height)
-      if (code) {
-        setDetected(code.data)
-        return true
-      }
-      return false
-    }
-
-    async function tick() {
+    async function tick(now: number) {
       // Identity check, not just "is there a stream": after a facing-mode
       // switch the old loop must die rather than scan the new camera twice.
-      if (camera.current() !== stream) return
-      const found = await scanWithBarcodeDetector()
-      if (!found) await scanWithJsQR()
-      if (camera.current() !== stream) return
+      if (scanGenRef.current !== gen || camera.current() !== stream) return
+      const found = await loop.tick(now, videoRef.current, {
+        hidden: typeof document !== 'undefined' && document.hidden,
+      })
+      // Root cause A: revalidate AFTER the await. A detector that resolves
+      // during the 180 ms exit animation must not call setDetected — that
+      // effect navigates even though the user already closed the modal.
+      if (scanGenRef.current !== gen || camera.current() !== stream) return
+      if (found) setDetected(found)
+      if (scanGenRef.current !== gen || camera.current() !== stream) return
       animRef.current = requestAnimationFrame(tick)
     }
 
     // Small delay to let camera warm up
-    setTimeout(() => {
-      if (camera.current() === stream) void tick()
+    warmTimerRef.current = window.setTimeout(() => {
+      if (scanGenRef.current === gen && camera.current() === stream) {
+        animRef.current = requestAnimationFrame(tick)
+      }
     }, 500)
   }
 
@@ -278,23 +291,17 @@ export default function ScanModal({ onClose }: Props) {
 
   return (
     <MisakaDialog
-      title="扫描节点 QR"
-      description="仅扫描御坂网络接入码"
+      title={netCopy.qr.scanNode}
+      description={netCopy.qr.scanDescription}
       onRequestClose={handleClose}
       backdropClass={modal.backdropClass}
       panelClass={modal.panelClass}
       backdropStyle={{ background: 'rgba(14,42,107,0.55)', backdropFilter: 'blur(8px)' }}
-      panelClassName="relative flex flex-col items-center gap-4 rounded-2xl p-5 xs:p-6"
+      panelClassName="relative flex flex-col items-center gap-4 rounded-2xl p-5 xs:p-6 misaka-dialog-panel"
       panelStyle={{
         background: 'var(--surface)',
         boxShadow: 'var(--shadow-float)',
-        // P0-2: gracefully shrink on 320px-class devices instead of relying
-        // on width: 100% inside a fixed-padding backdrop.
         width: 'min(340px, 100% - 8px)',
-        // P1-13: landscape phone / split-view iPad — without a maxHeight the
-        // aspect-square camera + URL input + buttons overflow and the
-        // "接入" / "取消" actions are off-screen.
-        maxHeight: '90svh',
         overflowY: 'auto',
       }}
       renderHeader={({ titleId, descriptionId }) => (
@@ -302,12 +309,10 @@ export default function ScanModal({ onClose }: Props) {
           <MisakaKanjiBlock char="読" size="md" />
           <div>
             <h2 id={titleId} className="font-kanji font-bold text-base text-[var(--text-on-white)] m-0">
-              扫描节点 QR
+              {netCopy.qr.scanNode}
             </h2>
-            {/* SECURITY-006 replacement copy — set the expectation before
-                the user points the camera at an arbitrary code. */}
             <p id={descriptionId} className="font-kanji text-xs text-[var(--text-on-white-2)] m-0">
-              仅扫描御坂网络接入码
+              {netCopy.qr.scanDescription}
             </p>
           </div>
         </div>
@@ -368,7 +373,7 @@ export default function ScanModal({ onClose }: Props) {
       {/* Manual entry — A11Y-004: real label association */}
       <div className="w-full rounded-xl p-3" style={{ background: 'var(--surface-tint)' }}>
         <label htmlFor={inputId} className="block font-kanji text-xs text-[var(--text-on-white-2)] mb-2">
-          粘贴接入链接
+          {netCopy.qr.pasteJoinLink}
         </label>
         <div className="flex gap-2">
           <input
@@ -376,7 +381,7 @@ export default function ScanModal({ onClose }: Props) {
             value={manualUrl}
             onChange={e => { setManualUrl(e.target.value); setManualError(null) }}
             onKeyDown={e => { if (e.key === 'Enter') handleManualJoin() }}
-            placeholder="https://…/join?type=node&id=…"
+            placeholder={netCopy.qr.pasteJoinLink}
             aria-invalid={manualError ? true : undefined}
             aria-describedby={manualError ? `${inputId}-error` : undefined}
             className="misaka-input text-xs flex-1 min-w-0"

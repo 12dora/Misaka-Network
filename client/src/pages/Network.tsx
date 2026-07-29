@@ -4,13 +4,14 @@ import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
 import MisakaStatusBadge from '@/components/ui/MisakaStatusBadge'
 import MisakaProgressBar from '@/components/ui/MisakaProgressBar'
+import MisakaDialog from '@/components/ui/MisakaDialog'
 import AppFooter from '@/components/ui/AppFooter'
 import QRModal from '@/components/features/QRModal'
 import SettingsModal from '@/components/features/SettingsModal'
 import DownloadArtifactActions from '@/components/features/DownloadArtifactActions'
 import {
   useNetworkStore, isLikelyUnreachable,
-  deriveNetworkStatus, networkStatusLabel, peerDisplayStatus,
+  deriveNetworkStatus, peerDisplayStatus,
   getTransferDeliveryState,
 } from '@/store/network'
 import { useAuthStore } from '@/store/auth'
@@ -18,16 +19,23 @@ import { appUrl } from '@/lib/appBase'
 import { authedFetch, AuthRequiredError } from '@/lib/api'
 import { humanizeError } from '@/lib/transfer'
 import { ensureNotificationPermission } from '@/lib/notify'
+import { scrollIntoViewSafely, useReducedMotion } from '@/hooks/useReducedMotion'
+import { formatDurationZhCN } from '@/copy/zh-CN/common'
+import { network as netCopy } from '@/copy/zh-CN/network'
+import { transfer as xferCopy } from '@/copy/zh-CN/transfer'
+import { toUserMessageFromUnknown } from '@/copy/errors'
 import type { Peer, Transfer, PendingFileItem } from '@/types'
 
 function channelLabel(t: Peer['channelType']) {
-  return { direct: '直接信道（局域网）', stun: '标准信道（STUN）', relay: '中继信道（TURN）', ws: '备用信道（WS）' }[t]
+  return netCopy.channel[t]
 }
 
 function formatDuration(ms: number) {
-  const s = Math.floor(ms / 1000)
-  const m = Math.floor(s / 60)
-  return m > 0 ? `${m}m ${s % 60}s` : `${s}s`
+  return formatDurationZhCN(ms)
+}
+
+function statusLabel(key: ReturnType<typeof deriveNetworkStatus>) {
+  return netCopy.status[key]
 }
 
 // P2-10: align with SettingsModal — use 1024-base everywhere so the same
@@ -52,7 +60,7 @@ function totalFileSize(items: PendingFileItem[]) {
 }
 
 function formatIceMeasuredAt(ts?: number) {
-  if (!ts) return '未记录'
+  if (!ts) return netCopy.notRecorded
   return new Date(ts).toLocaleString('zh-CN', { hour12: false })
 }
 
@@ -75,12 +83,12 @@ function NodeRadar({ peers, selected, unreadByPeer, onSelect, onShowQR, onCopyLi
     <div className="flex flex-col gap-4">
       <div className="flex items-center gap-2 mb-1">
         <MisakaKanjiBlock char="点" size="sm" />
-        <span className="font-kanji font-bold text-white text-sm">节点雷达</span>
+        <span className="font-kanji font-bold text-white text-sm">{netCopy.nodeRadar}</span>
         {/* UX-COPY-003: one honest status, derived from the layer that
             actually explains it (signaling → peer transport → transfer)
             instead of a blanket "已接入". */}
         <span className="font-kanji text-xs text-[var(--text-on-blue-2)] ml-1">
-          发现同身份设备 · {networkStatusLabel(status)}
+          {netCopy.foundSameIdentity(statusLabel(status))}
         </span>
       </div>
       <div className="w-12 h-0.5 ml-[calc(1.25rem+0.5rem)]" style={{ background: 'var(--accent-cyan)' }} />
@@ -88,21 +96,34 @@ function NodeRadar({ peers, selected, unreadByPeer, onSelect, onShowQR, onCopyLi
       {peers.length === 0 ? (
         <MisakaCard padding="md" className="text-center">
           <MisakaKanjiBlock char="空" size="lg" className="mx-auto mb-3" />
-          <p className="font-kanji text-sm text-[var(--text-on-white)] mb-1">网络中暂无其他实验体</p>
-          <p className="font-kanji text-xs text-[var(--text-on-white-2)] mb-4">分享 QR 或链接给另一台设备即可接入</p>
+          <p className="font-kanji text-sm text-[var(--text-on-white)] mb-1">{netCopy.noOtherDevices}</p>
+          <p className="font-kanji text-xs text-[var(--text-on-white-2)] mb-4">{netCopy.shareToJoin}</p>
           <div className="flex gap-2">
-            <MisakaButton variant="pill" size="sm" fullWidth onClick={onShowQR}>显示我的 QR</MisakaButton>
-            <MisakaButton variant="pill" size="sm" fullWidth onClick={onCopyLink}>复制链接</MisakaButton>
+            <MisakaButton variant="pill" size="sm" fullWidth onClick={onShowQR}>{netCopy.showMyQr}</MisakaButton>
+            <MisakaButton variant="pill" size="sm" fullWidth onClick={onCopyLink}>{netCopy.copyLink}</MisakaButton>
           </div>
         </MisakaCard>
       ) : (
-        peers.map(peer => {
+        peers.map((peer) => {
           const isSelected = selected === peer.sessionId
           const unread = unreadByPeer[peer.sessionId]
           const hasUnread = !!unread && (unread.message > 0 || unread.file > 0)
-          // Suffix the last 4 chars of sessionId so multiple devices sharing
-          // the same nodeId remain visually distinguishable in the list.
-          const sidTag = peer.sessionId.slice(-4)
+          // Same nodeId can appear on multiple devices — ordinal distinguishes
+          // them in the main flow; full session id lives in tech diagnostics.
+          const sameIdPeers = peers.filter(p => p.nodeId === peer.nodeId)
+          const deviceOrdinal = sameIdPeers.length > 1
+            ? sameIdPeers.findIndex(p => p.sessionId === peer.sessionId) + 1
+            : 0
+          const displayStatus = peerDisplayStatus(peer, transfers)
+          const unreadPart = hasUnread
+            ? netCopy.unreadSummary(unread.message, unread.file)
+            : undefined
+          const ariaName = netCopy.selectDevice(
+            peer.nodeId,
+            deviceOrdinal > 0 ? netCopy.deviceOrdinal(deviceOrdinal) : undefined,
+            netCopy.peerStatus[displayStatus],
+            unreadPart,
+          )
           return (
             <MisakaCard
               key={peer.sessionId}
@@ -114,7 +135,7 @@ function NodeRadar({ peers, selected, unreadByPeer, onSelect, onShowQR, onCopyLi
               // re-uses the same focus outline as the passcode inputs.
               role="button"
               tabIndex={0}
-              aria-label={`选择御坂 ${peer.nodeId} 号节点`}
+              aria-label={ariaName}
               aria-pressed={isSelected}
               className={`misaka-focus-ring cursor-pointer hover:-translate-y-0.5 transition-all duration-150 relative ${isSelected ? 'ring-2 ring-[var(--bg-deep)]' : ''}`}
               style={isSelected ? { background: 'var(--surface-tint)' } : {}}
@@ -130,16 +151,26 @@ function NodeRadar({ peers, selected, unreadByPeer, onSelect, onShowQR, onCopyLi
                 <div className="absolute left-0 top-3 bottom-3 w-1 rounded-r" style={{ background: 'var(--bg-deep)' }} />
               )}
               <div className="flex items-center gap-2 mb-2 pl-2">
-                <MisakaStatusBadge status={peerDisplayStatus(peer, transfers)} />
+                <MisakaStatusBadge status={displayStatus} />
                 <span className="font-kanji font-bold text-sm text-[var(--text-on-white)] ml-auto">
-                  御坂 {peer.nodeId} 号
-                  <span className="ml-1 font-mono text-[10px] text-[var(--text-muted)]">#{sidTag}</span>
+                  {netCopy.misakaNumber(peer.nodeId)}
+                  {deviceOrdinal > 0 && (
+                    <span className="ml-1 font-kanji text-[10px] text-[var(--text-muted-on-light)]">
+                      {netCopy.deviceOrdinal(deviceOrdinal)}
+                    </span>
+                  )}
                 </span>
                 {hasUnread && (
                   <span
-                    className="ml-2 inline-flex items-center justify-center min-w-5 h-5 px-1 rounded-full text-[10px] font-mono text-white"
-                    style={{ background: 'var(--state-danger)' }}
-                    title={`未读消息 ${unread.message}，未读文件 ${unread.file}`}
+                    className="ml-2 inline-flex items-center justify-center min-w-5 h-5 px-1 rounded-full text-[10px] font-mono font-semibold"
+                    data-testid="unread-badge"
+                    // 08 P2: white on --state-danger is ~4.05:1 (fails AA at 10px).
+                    // Use the contrast-safe fill+text pair (darker danger + white).
+                    style={{
+                      background: 'var(--state-danger-on-light)',
+                      color: '#FFFFFF',
+                    }}
+                    title={netCopy.unreadSummary(unread.message, unread.file)}
                   >
                     {Math.min(99, unread.message + unread.file)}
                   </span>
@@ -160,20 +191,20 @@ function NodeRadar({ peers, selected, unreadByPeer, onSelect, onShowQR, onCopyLi
 // ── Delivery status indicator (WhatsApp-style) ────────────────────
 function DeliveryStatus({ status, onRetry }: { status?: string; onRetry: () => void }) {
   if (status === 'sending') return (
-    <span className="ml-1 text-[10px] opacity-40 select-none" title="发送中">⏳</span>
+    <span className="ml-1 text-[10px] opacity-40 select-none" title={netCopy.delivery.sending}>⏳</span>
   )
   if (status === 'sent') return (
-    <span className="ml-1 text-[10px] opacity-50 select-none" title="已发送">✓</span>
+    <span className="ml-1 text-[10px] opacity-50 select-none" title={netCopy.delivery.sent}>✓</span>
   )
   if (status === 'delivered') return (
-    <span className="ml-1 text-[10px] select-none" style={{ color: 'var(--accent-cyan)' }} title="已送达">✓✓</span>
+    <span className="ml-1 text-[10px] select-none" style={{ color: 'var(--accent-cyan)' }} title={netCopy.delivery.delivered}>✓✓</span>
   )
   if (status === 'failed') return (
     <button
       onClick={onRetry}
       className="ml-1 text-[10px] select-none"
-      style={{ color: 'var(--state-danger)', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}
-      title="发送失败，点击重试"
+      style={{ color: 'var(--state-danger-on-light)', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}
+      title={netCopy.delivery.failedRetry}
     >↺</button>
   )
   return null
@@ -197,7 +228,8 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
   const bottomRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    // 08 P2: honour prefers-reduced-motion via the shared helper.
+    scrollIntoViewSafely(bottomRef.current)
   }, [messages.length, recvTransfers.length, pendingFiles.length])
 
   return (
@@ -213,17 +245,17 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
       // reasonable height across sizes without overlapping siblings.
       style={{ borderColor: 'var(--border-card)', maxHeight: 'min(45svh, 360px)', overflowY: 'auto' }}
     >
-      <div className="font-kanji text-xs font-semibold text-[var(--text-on-white-2)] mb-1">会话信道</div>
+      <div className="font-kanji text-xs font-semibold text-[var(--text-on-white-2)] mb-1">{netCopy.sessionChannel}</div>
       {messages.length === 0 && recvTransfers.length === 0 && pendingFiles.length === 0 && (
         <div className="font-kanji text-xs text-[var(--text-on-white-2)]">
           <span className="font-mono mr-2 text-[var(--accent-cyan)]">▸</span>
           {peerStatus === 'online' || peerStatus === 'transferring'
-            ? '连接成功。现在可以发送消息或文件。'
+            ? netCopy.peerConnected
             : peerStatus === 'reconnecting'
-              ? '正在重新连接，稍后即可发送消息或文件。'
+              ? netCopy.peerReconnecting
               : peerStatus === 'offline'
-                ? '尚未连接。请检查网络，或点击上方的重连。'
-                : '正在连接…'}
+                ? netCopy.peerOffline
+                : netCopy.peerConnecting}
         </div>
       )}
       {messages.map(m => {
@@ -241,7 +273,7 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
                   <span className="text-[10px] opacity-70">
                     {new Date(m.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
                   </span>
-                  <span className="text-[10px] opacity-80 ml-1">对方:</span>
+                  <span className="text-[10px] opacity-80 ml-1">{netCopy.peer}：</span>
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="text-sm">📎</span>
@@ -292,7 +324,7 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
               <span className="text-[10px] opacity-70 mr-1">
                 {new Date(m.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
               </span>
-              {!isSystem && <span className="mr-1 text-[10px] opacity-80">{mine ? '你' : '对方'}:</span>}
+              {!isSystem && <span className="mr-1 text-[10px] opacity-80">{mine ? netCopy.you : netCopy.peer}：</span>}
               {m.content}
               {mine && m.type === 'text' && (
                 <DeliveryStatus status={m.status} onRetry={() => retryChatMessage(peerSessionId, m.id)} />
@@ -320,18 +352,18 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
           <div className="flex items-center gap-2 mb-2">
             <span className="font-mono text-[var(--accent-cyan)]">📎</span>
             <div className="flex-1 min-w-0">
-              <div className="text-[var(--text-on-white)] font-semibold">待发送 {pendingFiles.length} 个项目</div>
+              <div className="text-[var(--text-on-white)] font-semibold">{netCopy.pendingItems(pendingFiles.length)}</div>
               <div className="text-[10px] text-[var(--text-muted)]">{formatBytes(totalFileSize(pendingFiles))}</div>
             </div>
             <MisakaButton variant="primary" size="sm" className="text-xs py-1 px-3 shrink-0"
               data-testid="send-pending-file"
               disabled={isSending}
               onClick={() => sendPendingFile(peerSessionId)}>
-              {isSending ? '发送中…' : '发送'}
+              {isSending ? netCopy.sending : netCopy.send}
             </MisakaButton>
             <MisakaButton variant="pill" size="sm" className="text-xs py-1 px-2 shrink-0"
               onClick={() => clearPendingFiles(peerSessionId)}>
-              清空
+              {netCopy.clearPending}
             </MisakaButton>
           </div>
           <div className="max-h-28 overflow-y-auto space-y-1 pr-1">
@@ -347,7 +379,7 @@ function ChannelChat({ peerSessionId }: { peerSessionId: string }) {
                   onClick={() => removePendingFile(peerSessionId, item.id)}
                   className="w-6 h-6 inline-flex items-center justify-center rounded-full text-xs cursor-pointer"
                   style={{ border: 'none', background: 'rgba(14,42,107,0.1)', color: 'var(--text-on-white)' }}
-                  aria-label={`移除 ${item.displayName}`}
+                  aria-label={netCopy.removeItem(item.displayName)}
                 >
                   ✕
                 </button>
@@ -378,29 +410,33 @@ function ChatInput({ peerSessionId }: { peerSessionId: string }) {
   // viewport, then scroll the input back into view.
   function handleFocus() {
     setTimeout(() => {
-      inputRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+      // 08 P2: honour prefers-reduced-motion; prefer nearest to avoid jumps.
+      scrollIntoViewSafely(inputRef.current, { block: 'nearest' })
     }, 250)
   }
 
   return (
     <div
-      className="border-t p-3 flex gap-2"
+      className="border-t p-3 flex gap-2 min-w-0"
+      data-testid="chat-input-row"
       style={{ borderColor: 'var(--border-card)', borderRadius: '0 0 1rem 1rem' }}
     >
       <input
         ref={inputRef}
         type="text"
-        placeholder="输入消息…"
+        placeholder={netCopy.chatPlaceholder}
         value={text}
         onChange={e => setText(e.target.value)}
         onKeyDown={e => { if (e.key === 'Enter') handleSend() }}
         onFocus={handleFocus}
-        className="misaka-focus-ring flex-1 px-3 py-2 rounded-lg text-sm font-kanji focus:outline-none"
+        // 08 P1: min-w-0 w-0 flex-1 lets the input shrink inside narrow flex
+        // columns (320px phone / 768px three-column threshold).
+        className="misaka-focus-ring min-w-0 w-0 flex-1 px-3 py-2 rounded-lg text-sm font-kanji focus:outline-none"
         // Use 16px so iOS Safari doesn't auto-zoom on focus.
         style={{ border: '1px solid var(--border-card)', background: 'var(--surface)', color: 'var(--text-on-white)', fontSize: '16px' }}
-        aria-label="聊天输入框"
+        aria-label={netCopy.chatInputLabel}
       />
-      <MisakaButton variant="primary" size="sm" onClick={handleSend}>发送</MisakaButton>
+      <MisakaButton variant="primary" size="sm" className="shrink-0" onClick={handleSend}>{netCopy.send}</MisakaButton>
     </div>
   )
 }
@@ -431,7 +467,7 @@ function TransferChannel({ selectedPeer, onlinePeerCount, onStageFiles, onSendFi
     try {
       await onReconnectPeer(selectedPeer.sessionId)
     } catch (e) {
-      onToast(`重连失败：${String((e as Error).message ?? e)}`)
+      onToast(toUserMessageFromUnknown(e instanceof Error ? e : String(e)) || netCopy.reconnectFailed)
     } finally {
       setReconnecting(false)
     }
@@ -459,20 +495,20 @@ function TransferChannel({ selectedPeer, onlinePeerCount, onStageFiles, onSendFi
   async function handleCopyIceDiagnostics() {
     if (!selectedPeer) return
     const lines = [
-      `节点: 御坂 ${selectedPeer.nodeId} 号 (#${selectedPeer.sessionId.slice(-4)})`,
-      `信道: ${channelLabel(selectedPeer.channelType)}`,
-      `ICE路径: ${selectedPeer.icePath ?? '未采集'}`,
-      `采集时间: ${formatIceMeasuredAt(selectedPeer.icePathMeasuredAt)}`,
-      `状态: ${selectedPeer.status}`,
+      netCopy.diagLineNode(selectedPeer.nodeId, selectedPeer.sessionId.slice(-4)),
+      netCopy.diagLineChannel(channelLabel(selectedPeer.channelType)),
+      netCopy.diagLineIce(selectedPeer.icePath ?? netCopy.notRecorded),
+      netCopy.diagLineGather(formatIceMeasuredAt(selectedPeer.icePathMeasuredAt)),
+      netCopy.diagLineStatus(selectedPeer.status),
     ]
     // P1: previously a silent try/catch — users had no idea whether the copy
     // worked, so they clicked again and again. Surface success/failure via
     // the shared page-level toast.
     try {
       await navigator.clipboard.writeText(lines.join('\n'))
-      onToast('诊断信息已复制到剪贴板')
+      onToast(netCopy.diagnosticsCopied)
     } catch {
-      onToast('复制失败，请手动选取诊断文本')
+      onToast(netCopy.diagnosticsCopyFailed)
     }
   }
 
@@ -498,8 +534,8 @@ function TransferChannel({ selectedPeer, onlinePeerCount, onStageFiles, onSendFi
         }}
       >
         <MisakaKanjiBlock char="同" size="xl" className="mb-4" />
-        <p className="font-kanji font-bold text-lg text-[var(--text-on-white)] mb-1">请先在「节点」页选择目标节点</p>
-        <p className="font-kanji text-sm text-[var(--text-on-white-2)] mb-3">选择后即可打开信道并发送文件或消息</p>
+        <p className="font-kanji font-bold text-lg text-[var(--text-on-white)] mb-1">{netCopy.selectDeviceFirst}</p>
+        <p className="font-kanji text-sm text-[var(--text-on-white-2)] mb-3">{netCopy.selectDeviceThenSend}</p>
         {/* P1-4: with ≥2 online peers, fanout is a useful shortcut even
             before the user picks a target. Previously this entry point
             only existed inside the per-peer drop zone, so a brand-new
@@ -512,7 +548,7 @@ function TransferChannel({ selectedPeer, onlinePeerCount, onStageFiles, onSendFi
               className="mt-2"
               onClick={() => emptyFanoutInputRef.current?.click()}
             >
-              📡 群发到所有在线节点（{onlinePeerCount}）
+              {netCopy.fanoutAllDevices(onlinePeerCount)}
             </MisakaButton>
             <input
               ref={emptyFanoutInputRef}
@@ -539,44 +575,57 @@ function TransferChannel({ selectedPeer, onlinePeerCount, onStageFiles, onSendFi
         style={{ background: 'var(--surface-tint)', borderColor: 'var(--border-card)', borderRadius: '1rem 1rem 0 0' }}
       >
         <div className="font-kanji text-sm font-semibold text-[var(--text-on-white)]">
-          目标：御坂 {selectedPeer.nodeId} 号
-          <span className="ml-1 font-mono text-[10px] text-[var(--text-muted)]">#{selectedPeer.sessionId.slice(-4)}</span>
+          {netCopy.targetMisaka(selectedPeer.nodeId)}
         </div>
         <div className="font-kanji text-xs text-[var(--text-on-white-2)] mt-0.5">
-          {channelLabel(selectedPeer.channelType)} · DTLS + AES-GCM
+          {netCopy.connectionMethod}：{channelLabel(selectedPeer.channelType)} · {netCopy.e2eEncrypted}
         </div>
-        {selectedPeer.icePath && (
-          <>
-            <div className="font-mono text-[10px] text-[var(--text-muted)] mt-1">
-              ICE 路径：{selectedPeer.icePath}
+        {/* 07 P2: protocol/ICE/session internals live in a collapsed tech panel. */}
+        <details className="mt-2">
+          <summary className="font-kanji text-[11px] cursor-pointer" style={{ color: 'var(--text-muted-on-light)' }}>
+            {netCopy.techDiagnostics}
+          </summary>
+          <div className="mt-1.5 space-y-0.5">
+            <div className="font-mono text-[10px] text-[var(--text-muted-on-light)]">
+              {netCopy.sessionIdLabel(selectedPeer.sessionId)}
             </div>
-            <div className="font-mono text-[10px] text-[var(--text-muted)] mt-0.5">
-              采集时间：{formatIceMeasuredAt(selectedPeer.icePathMeasuredAt)}
+            <div className="font-mono text-[10px] text-[var(--text-muted-on-light)]">
+              {netCopy.channelTypeLabel(selectedPeer.channelType)}
             </div>
+            {selectedPeer.icePath && (
+              <>
+                <div className="font-mono text-[10px] text-[var(--text-muted-on-light)]">
+                  {netCopy.icePath}：{selectedPeer.icePath}
+                </div>
+                <div className="font-mono text-[10px] text-[var(--text-muted-on-light)]">
+                  {netCopy.gatherTime}：{formatIceMeasuredAt(selectedPeer.icePathMeasuredAt)}
+                </div>
+              </>
+            )}
             <div className="mt-1.5">
               <MisakaButton variant="pill" size="sm" className="text-[10px] py-0.5 px-2" onClick={handleCopyIceDiagnostics}>
-                复制诊断
+                {netCopy.copyDiagnostics}
               </MisakaButton>
             </div>
-          </>
-        )}
+          </div>
+        </details>
         {selectedPeer.status === 'reconnecting' && (
-          <div className="flex items-center gap-1.5 mt-2 px-2 py-1 rounded text-[10px]" style={{ background: 'rgba(255,193,7,0.12)', color: 'var(--state-warn)' }}>
+          <div className="flex items-center gap-1.5 mt-2 px-2 py-1 rounded text-[10px]" style={{ background: 'rgba(255,193,7,0.12)', color: 'var(--state-warn-on-light)' }}>
             <MisakaStatusBadge status="reconnecting" />
-            <span className="font-kanji">正在尝试重新协商连接…</span>
+            <span className="font-kanji">{netCopy.restoringConnection}</span>
             <button
               type="button"
               onClick={onForceReconnect}
               className="ml-auto font-kanji underline decoration-dotted cursor-pointer"
-              style={{ background: 'transparent', border: 'none', color: 'var(--state-warn)', padding: 0 }}
+              style={{ background: 'transparent', border: 'none', color: 'var(--state-warn-on-light)', padding: 0 }}
             >
-              立即重连
+              {netCopy.reconnectNow}
             </button>
           </div>
         )}
         {selectedPeer.status === 'offline' && (
-          <div className="flex flex-wrap items-center gap-1.5 mt-2 px-2 py-1 rounded text-[10px]" style={{ background: 'rgba(239,68,68,0.1)', color: 'var(--state-danger)' }}>
-            <span className="font-kanji">连接已断开 — 请检查网络或开启 TURN 中继</span>
+          <div className="flex flex-wrap items-center gap-1.5 mt-2 px-2 py-1 rounded text-[10px]" style={{ background: 'rgba(239,68,68,0.1)', color: 'var(--state-danger-on-light)' }}>
+            <span className="font-kanji">{netCopy.connectionDropped}</span>
             {/* P0-1: explicit per-peer reconnect so the user doesn't have
                 to wait for the auto-recovery cycle (focus/online events).
                 Disabled while a previous attempt is in flight. */}
@@ -585,17 +634,17 @@ function TransferChannel({ selectedPeer, onlinePeerCount, onStageFiles, onSendFi
               onClick={handleReconnectClick}
               disabled={reconnecting}
               className="ml-auto font-kanji underline decoration-dotted cursor-pointer disabled:opacity-50 disabled:cursor-wait"
-              style={{ background: 'transparent', border: 'none', color: 'var(--state-danger)', padding: 0 }}
+              style={{ background: 'transparent', border: 'none', color: 'var(--state-danger-on-light)', padding: 0 }}
             >
-              {reconnecting ? '正在重连…' : '立即重连此节点'}
+              {reconnecting ? netCopy.reconnecting : netCopy.reconnectThisDevice}
             </button>
             <button
               type="button"
               onClick={onOpenSettings}
               className="font-kanji underline decoration-dotted cursor-pointer"
-              style={{ background: 'transparent', border: 'none', color: 'var(--state-danger)', padding: 0 }}
+              style={{ background: 'transparent', border: 'none', color: 'var(--state-danger-on-light)', padding: 0 }}
             >
-              打开设置
+              {netCopy.openSettings}
             </button>
           </div>
         )}
@@ -611,17 +660,17 @@ function TransferChannel({ selectedPeer, onlinePeerCount, onStageFiles, onSendFi
       >
         <MisakaButton variant="pill" size="md" className="w-full max-w-[14rem] whitespace-nowrap"
           onClick={() => fileInputRef.current?.click()}>
-          📁 选择文件
+          {netCopy.selectFile}
         </MisakaButton>
         <MisakaButton variant="pill" size="md" className="w-full max-w-[14rem] whitespace-nowrap"
           onClick={() => folderInputRef.current?.click()}>
-          🗂 选择文件夹
+          {netCopy.selectFolder}
         </MisakaButton>
         <MisakaButton variant="pill" size="md" className="w-full max-w-[14rem] whitespace-nowrap"
           onClick={() => document.getElementById('fanout-file-input')?.click()}>
-          📡 群发文件到全部节点
+          {netCopy.fanoutAllDevicesShort}
         </MisakaButton>
-        <p className="font-kanji text-xs text-[var(--text-on-white-2)] text-center">支持多选、拖拽多个文件和文件夹队列</p>
+        <p className="font-kanji text-xs text-[var(--text-on-white-2)] text-center">{netCopy.multiSelectHint}</p>
         <input ref={fileInputRef} type="file" multiple className="hidden" onChange={handleFileChange} />
         <input
           ref={folderInputRef}
@@ -648,29 +697,169 @@ function TransferChannel({ selectedPeer, onlinePeerCount, onStageFiles, onSendFi
   )
 }
 
+/** Statuses for which cancel is still a meaningful, non-destructive-to-done action. */
+const CANCELLABLE_STATUSES = new Set<Transfer['status']>([
+  'pending',
+  'transferring',
+  'paused',
+  'reconnecting',
+])
+
+type PendingCancelSnapshot = {
+  id: string
+  /** Transfer attempt identity — a re-queued same-id must not match a stale dialog. */
+  startedAt: number
+  fileName: string
+  direction: Transfer['direction']
+  progress: number
+  status: Transfer['status']
+}
+
+export type DisplayTransfer = Transfer & { exiting?: boolean }
+
+/**
+ * 08-20 pure transition: keep removed transfer cards briefly as `exiting`
+ * so the list does not pop. Exported for unit tests.
+ */
+export function planTransferDisplay(
+  prev: DisplayTransfer[],
+  live: Transfer[],
+  reducedMotion: boolean,
+): { next: DisplayTransfer[]; removedIds: string[] } {
+  const nextIds = live.map(t => t.id)
+  const prevIds = prev.filter(p => !p.exiting).map(p => p.id)
+  const same =
+    nextIds.length === prevIds.length &&
+    nextIds.every((id, i) => id === prevIds[i])
+
+  if (same) {
+    const liveById = new Map(live.map(t => [t.id, t]))
+    return {
+      next: prev.map(p => {
+        if (p.exiting) return p
+        const cur = liveById.get(p.id)
+        return cur ? { ...cur } : p
+      }),
+      removedIds: [],
+    }
+  }
+
+  const removedIds = prevIds.filter(id => !nextIds.includes(id))
+  if (reducedMotion || removedIds.length === 0) {
+    return { next: live.map(t => ({ ...t })), removedIds }
+  }
+
+  const liveCards = live.map(t => ({ ...t }))
+  const exiting = prev
+    .filter(p => removedIds.includes(p.id) && !p.exiting)
+    .map(p => ({ ...p, exiting: true as const }))
+  return { next: [...liveCards, ...exiting], removedIds }
+}
+
 // ── TaskPanel ─────────────────────────────────────────────────────
-function TaskPanel({ transfers, onPause, onResume, onCancel, onResendToPeer }: {
+function TaskPanel({ transfers, onPause, onResume, onCancel, onResendToPeer, onToast }: {
   transfers: Transfer[]
   onPause: (id: string) => void
   onResume: (id: string, peerSessionId: string) => void
   onCancel: (id: string) => void
   onResendToPeer: (peerSessionId: string) => void
+  onToast?: (msg: string) => void
 }) {
+  // 08 P0: gate destructive cancel behind an explicit confirmation so a
+  // mis-tap next to "暂停" cannot throw away a 90%-received multi-GB file.
+  // Confirm revalidates identity + cancellable state so a dialog opened at 99%
+  // cannot destroy a transfer that completed while the dialog was open.
+  const [pendingCancel, setPendingCancel] = useState<PendingCancelSnapshot | null>(null)
+  const continueFocusRef = useRef<HTMLButtonElement>(null)
+  const reducedMotion = useReducedMotion()
+  // 08-20: enter/exit presentation so transfer cards do not pop in/out.
+  const [displayTransfers, setDisplayTransfers] = useState<DisplayTransfer[]>(
+    () => transfers.map(t => ({ ...t })),
+  )
+  const prevLiveIdsRef = useRef<string[]>(transfers.map(t => t.id))
+
+  useEffect(() => {
+    const nextIds = transfers.map(t => t.id)
+    const removed = prevLiveIdsRef.current.filter(id => !nextIds.includes(id))
+    prevLiveIdsRef.current = nextIds
+
+    // Pure state update only — schedule exit cleanup outside the updater.
+    setDisplayTransfers(prev => planTransferDisplay(prev, transfers, reducedMotion).next)
+
+    if (reducedMotion || removed.length === 0) return
+    const timeoutId = window.setTimeout(() => {
+      setDisplayTransfers(transfers.map(tr => ({ ...tr })))
+    }, 180)
+    return () => window.clearTimeout(timeoutId)
+  }, [transfers, reducedMotion])
+
+  function requestCancel(t: Transfer) {
+    if (!CANCELLABLE_STATUSES.has(t.status)) return
+    setPendingCancel({
+      id: t.id,
+      startedAt: t.startedAt,
+      fileName: t.fileName,
+      direction: t.direction,
+      progress: t.progress,
+      status: t.status,
+    })
+  }
+
+  function isStillCancellable(snapshot: PendingCancelSnapshot, current: Transfer | undefined): boolean {
+    if (!current) return false
+    if (current.id !== snapshot.id) return false
+    if (current.startedAt !== snapshot.startedAt) return false
+    return CANCELLABLE_STATUSES.has(current.status)
+  }
+
+  // Auto-dismiss when the transfer finishes or is replaced while the dialog is open.
+  useEffect(() => {
+    if (!pendingCancel) return
+    const current = transfers.find(t => t.id === pendingCancel.id)
+    if (!isStillCancellable(pendingCancel, current)) {
+      setPendingCancel(null)
+    }
+  }, [transfers, pendingCancel])
+
+  function confirmCancel() {
+    if (!pendingCancel) return
+    const snapshot = pendingCancel
+    const current = transfers.find(t => t.id === snapshot.id)
+    setPendingCancel(null)
+    if (!isStillCancellable(snapshot, current)) {
+      onToast?.(xferCopy.cancelAlreadyFinished)
+      return
+    }
+    onCancel(snapshot.id)
+  }
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center gap-2 mb-1">
         <MisakaKanjiBlock char="流" size="sm" />
-        <span className="font-kanji font-bold text-white text-sm">传输面板</span>
-        <span className="font-kanji text-xs text-[var(--text-on-blue-2)] ml-1">当前文件任务</span>
+        <span className="font-kanji font-bold text-white text-sm">{xferCopy.panelTitle}</span>
+        <span className="font-kanji text-xs text-[var(--text-on-blue-2)] ml-1">{xferCopy.panelSubtitle}</span>
       </div>
       <div className="w-12 h-0.5 ml-[calc(1.25rem+0.5rem)]" style={{ background: 'var(--accent-cyan)' }} />
 
-      {transfers.map(t => (
-        <MisakaCard key={t.id} padding="sm">
+      {displayTransfers.map((t, idx) => (
+        <MisakaCard
+          key={t.id}
+          padding="sm"
+          data-testid={`transfer-card-${t.id}`}
+          data-transfer-exiting={t.exiting ? 'true' : undefined}
+          className={
+            !reducedMotion && t.exiting
+              ? 'activity-exit'
+              : !reducedMotion && idx === 0 && !t.exiting
+                ? 'activity-enter'
+                : undefined
+          }
+        >
           <div className="flex items-center gap-1.5 mb-1.5">
             <span className="text-xs">{t.direction === 'send' ? '📤' : '📥'}</span>
             <span className="font-kanji text-xs font-semibold text-[var(--text-on-white)]">
-              {t.direction === 'send' ? '→' : '←'} 御坂 {t.peerNodeId} 号
+              {t.direction === 'send' ? '→' : '←'} {netCopy.misakaNumber(t.peerNodeId)}
             </span>
           </div>
           <div className="font-kanji text-xs text-[var(--text-on-white-2)] mb-2 truncate" title={`${t.fileName} · ${formatBytes(t.fileSize)}`}>
@@ -678,7 +867,11 @@ function TaskPanel({ transfers, onPause, onResume, onCancel, onResendToPeer }: {
           </div>
           {(t.status === 'transferring' || t.status === 'reconnecting') && (
             <>
-              <MisakaProgressBar value={t.progress} className="mb-1.5" />
+              <MisakaProgressBar
+                value={t.progress}
+                className="mb-1.5"
+                label={xferCopy.progressLabel(t.direction, t.fileName)}
+              />
               <div className="flex justify-between text-[10px] font-mono text-[var(--text-on-white-2)]">
                 <span style={{ color: 'var(--accent-cyan)' }}>{Math.round(t.progress * 100)}%</span>
                 <span>{formatSpeed(t.speedBps)}</span>
@@ -687,63 +880,86 @@ function TaskPanel({ transfers, onPause, onResume, onCancel, onResendToPeer }: {
                 {/* P1-3: store supports receiver-driven pause/resume — render
                     the same button for inbound transfers so a user can stop
                     a large incoming file without cancelling it outright. */}
-                <MisakaButton variant="pill" size="sm" className="flex-1 text-xs py-1" onClick={() => onPause(t.id)}>⏸ 暂停</MisakaButton>
-                <MisakaButton variant="pill" size="sm" className="flex-1 text-xs py-1" onClick={() => onCancel(t.id)}>✕ 取消</MisakaButton>
+                <MisakaButton variant="pill" size="sm" className="flex-1 text-xs py-1" onClick={() => onPause(t.id)}>{xferCopy.pause}</MisakaButton>
+                <MisakaButton
+                  variant="pill"
+                  size="sm"
+                  className="flex-1 text-xs py-1"
+                  data-testid={`cancel-transfer-${t.id}`}
+                  onClick={() => requestCancel(t)}
+                >
+                  {xferCopy.cancel}
+                </MisakaButton>
               </div>
             </>
           )}
           {t.status === 'paused' && (
             <>
-              <MisakaProgressBar value={t.progress} className="mb-1.5 opacity-50" />
+              <MisakaProgressBar
+                value={t.progress}
+                className="mb-1.5 opacity-50"
+                label={xferCopy.progressLabel(t.direction, t.fileName)}
+              />
               <div className="flex justify-between text-[10px] font-mono text-[var(--text-on-white-2)]">
-                <span style={{ color: 'var(--state-warn)' }}>{Math.round(t.progress * 100)}%</span>
-                <span style={{ color: 'var(--text-muted)' }}>已暂停</span>
+                <span style={{ color: 'var(--state-warn-on-light)' }}>{Math.round(t.progress * 100)}%</span>
+                <span style={{ color: 'var(--text-muted-on-light)' }}>{xferCopy.paused}</span>
               </div>
               <div className="flex gap-1.5 mt-2">
-                <MisakaButton variant="primary" size="sm" className="flex-1 text-xs py-1" onClick={() => onResume(t.id, t.peerSessionId)}>▶ 继续</MisakaButton>
-                <MisakaButton variant="pill" size="sm" className="flex-1 text-xs py-1" onClick={() => onCancel(t.id)}>✕ 取消</MisakaButton>
+                <MisakaButton variant="primary" size="sm" className="flex-1 text-xs py-1" onClick={() => onResume(t.id, t.peerSessionId)}>{xferCopy.resume}</MisakaButton>
+                <MisakaButton
+                  variant="pill"
+                  size="sm"
+                  className="flex-1 text-xs py-1"
+                  data-testid={`cancel-transfer-${t.id}`}
+                  onClick={() => requestCancel(t)}
+                >
+                  {xferCopy.cancel}
+                </MisakaButton>
               </div>
             </>
           )}
           {t.status === 'pending' && (
             <div className="flex items-center gap-2 mt-1">
-              <span style={{ color: 'var(--text-muted)' }} className="font-mono text-xs">⏳ 等待中</span>
-              <MisakaButton variant="pill" size="sm" className="ml-auto text-xs py-1 px-3" onClick={() => onCancel(t.id)}>✕ 取消</MisakaButton>
+              <span style={{ color: 'var(--text-muted-on-light)' }} className="font-mono text-xs">{xferCopy.pending}</span>
+              <MisakaButton
+                variant="pill"
+                size="sm"
+                className="ml-auto text-xs py-1 px-3"
+                data-testid={`cancel-transfer-${t.id}`}
+                onClick={() => requestCancel(t)}
+              >
+                {xferCopy.cancel}
+              </MisakaButton>
             </div>
           )}
           {t.status === 'completed' && (
-            <div className="flex items-center gap-2 mt-1">
+            <div className="flex flex-wrap items-center gap-2 mt-1">
               <span style={{ color: 'var(--state-success-on-light)' }} className="font-mono text-xs">
                 ✓ {t.direction === 'send'
-                  ? getTransferDeliveryState(t.id) === 'saved' ? '已保存' : '已送达'
-                  : t.storageMode === 'fsa' ? '已保存到所选位置' : '接收完成'}
+                  ? getTransferDeliveryState(t.id) === 'saved' ? xferCopy.saved : xferCopy.delivered
+                  : t.storageMode === 'fsa' ? xferCopy.recvToFsa : xferCopy.recvDone}
               </span>
-              {/* P2-12: give the completed card a meaningful next-action so
-                  it's not just an inert green badge.
-                  - send: original File is held by the engine and may already
-                    be garbage-collected; offer "再发文件给此节点" which
-                    re-opens the file picker scoped to that peer.
-                  - recv: re-download is FSA-path specific (we'd have to hold
-                    a Blob/Handle) — show a hint instead so behaviour is
-                    consistent regardless of receive backend. */}
+              {/* 08 P2: wrap so status + resend + waiting-ack don't overflow
+                  the ~188px right column at 768px. Keep v2 delivered→saved
+                  copy semantics intact. */}
+              {t.direction === 'send' && getTransferDeliveryState(t.id) !== 'saved' && (
+                <span className="w-full font-kanji text-[10px]" style={{ color: 'var(--state-warn-on-light)' }}>
+                  {xferCopy.waitingSaveAck}
+                </span>
+              )}
               {t.direction === 'send' && (
                 <MisakaButton
                   variant="pill"
                   size="sm"
-                  className="ml-auto text-xs py-1 px-3"
+                  className="w-full text-xs py-1 px-3"
                   onClick={() => onResendToPeer(t.peerSessionId)}
                 >
-                  再发文件给此节点
+                  {xferCopy.resendToPeer}
                 </MisakaButton>
               )}
               {t.direction === 'recv' && (
-                <span className="ml-auto font-kanji text-[10px]" style={{ color: 'var(--text-muted-on-light)' }}>
-                  {t.storageMode === 'fsa' ? '文件已写入所选位置' : '请在消息中下载'}
-                </span>
-              )}
-              {t.direction === 'send' && getTransferDeliveryState(t.id) !== 'saved' && (
-                <span className="ml-auto font-kanji text-[10px]" style={{ color: 'var(--state-warn-on-light)' }}>
-                  等待对方保存确认
+                <span className="w-full font-kanji text-[10px]" style={{ color: 'var(--text-muted-on-light)' }}>
+                  {t.storageMode === 'fsa' ? xferCopy.fsaHint : xferCopy.downloadInChat}
                 </span>
               )}
             </div>
@@ -751,12 +967,12 @@ function TaskPanel({ transfers, onPause, onResume, onCancel, onResendToPeer }: {
           {t.status === 'failed' && (
             <>
               <div className="flex items-center gap-2 mt-1">
-                <span style={{ color: 'var(--state-danger)' }} className="font-mono text-xs">✗ 失败</span>
-                <MisakaButton variant="pill" size="sm" className="ml-auto text-xs py-1 px-3" onClick={() => onResume(t.id, t.peerSessionId)}>重试</MisakaButton>
+                <span style={{ color: 'var(--state-danger-on-light)' }} className="font-mono text-xs">{xferCopy.failed}</span>
+                <MisakaButton variant="pill" size="sm" className="ml-auto text-xs py-1 px-3" onClick={() => onResume(t.id, t.peerSessionId)}>{xferCopy.retry}</MisakaButton>
               </div>
               {t.error && (
                 <div className="mt-1 text-[10px] font-kanji" style={{ color: 'var(--text-on-white-2)' }}>
-                  {humanizeError(t.error)}
+                  {toUserMessageFromUnknown(t.error) || humanizeError(t.error)}
                 </div>
               )}
             </>
@@ -764,12 +980,12 @@ function TaskPanel({ transfers, onPause, onResume, onCancel, onResendToPeer }: {
           {t.status === 'failed:unsupported' && (
             <>
               <div className="flex items-center gap-2 mt-1">
-                <span style={{ color: 'var(--state-danger)' }} className="font-mono text-xs">✗ 浏览器不支持</span>
-                <MisakaButton variant="pill" size="sm" className="ml-auto text-xs py-1 px-3" onClick={() => onCancel(t.id)}>✕ 移除</MisakaButton>
+                <span style={{ color: 'var(--state-danger-on-light)' }} className="font-mono text-xs">{xferCopy.unsupported}</span>
+                <MisakaButton variant="pill" size="sm" className="ml-auto text-xs py-1 px-3" onClick={() => onCancel(t.id)}>{xferCopy.remove}</MisakaButton>
               </div>
               {t.error && (
                 <div className="mt-1 text-[10px] font-kanji leading-snug" style={{ color: 'var(--text-on-white-2)' }}>
-                  {t.error}
+                  {toUserMessageFromUnknown(t.error) || humanizeError(t.error)}
                 </div>
               )}
             </>
@@ -777,10 +993,70 @@ function TaskPanel({ transfers, onPause, onResume, onCancel, onResendToPeer }: {
         </MisakaCard>
       ))}
 
-      {transfers.length === 0 && (
+      {transfers.length === 0 && displayTransfers.every(t => t.exiting) && (
         <MisakaCard padding="md" className="text-center">
-          <p className="font-kanji text-sm text-[var(--text-on-white-2)]">暂无传输任务</p>
+          <p className="font-kanji text-sm text-[var(--text-on-white-2)]">{xferCopy.noTasks}</p>
         </MisakaCard>
+      )}
+
+      {pendingCancel && (
+        <MisakaDialog
+          title={xferCopy.cancelConfirmTitle}
+          description={xferCopy.cancelConfirmBody({
+            fileName: pendingCancel.fileName,
+            direction: pendingCancel.direction,
+            percent: Math.round(pendingCancel.progress * 100),
+          })}
+          onRequestClose={() => setPendingCancel(null)}
+          initialFocusRef={continueFocusRef}
+          panelClassName="relative w-full max-w-sm rounded-2xl p-5"
+          panelStyle={{ background: 'var(--surface)', boxShadow: 'var(--shadow-float)' }}
+          backdropStyle={{ background: 'rgba(14,42,107,0.55)', backdropFilter: 'blur(8px)' }}
+          renderHeader={({ titleId, descriptionId }) => (
+            <div className="mb-3">
+              <h2 id={titleId} className="font-kanji font-bold text-base text-[var(--text-on-white)] m-0">
+                {xferCopy.cancelConfirmTitle}
+              </h2>
+              <p id={descriptionId} className="font-kanji text-sm text-[var(--text-on-white-2)] mt-2 mb-0 leading-relaxed">
+                {xferCopy.cancelConfirmBody({
+                  fileName: pendingCancel.fileName,
+                  direction: pendingCancel.direction,
+                  percent: Math.round(pendingCancel.progress * 100),
+                })}
+              </p>
+              <p
+                className="font-kanji text-sm mt-2 mb-0 font-semibold"
+                style={{ color: 'var(--state-danger-on-light)' }}
+                data-testid="cancel-partial-warning"
+              >
+                {xferCopy.cancelPartialWarning}
+              </p>
+            </div>
+          )}
+        >
+          <div className="flex gap-2 mt-4">
+            <MisakaButton
+              ref={continueFocusRef}
+              variant="primary"
+              size="sm"
+              className="flex-1"
+              data-testid="cancel-dialog-continue"
+              onClick={() => setPendingCancel(null)}
+            >
+              {xferCopy.cancelConfirmContinue}
+            </MisakaButton>
+            <MisakaButton
+              variant="pill"
+              size="sm"
+              className="flex-1"
+              data-testid="cancel-dialog-confirm"
+              onClick={confirmCancel}
+              style={{ color: 'var(--state-danger-on-light)', borderColor: 'var(--state-danger-on-light)' }}
+            >
+              {xferCopy.cancelConfirmAction}
+            </MisakaButton>
+          </div>
+        </MisakaDialog>
       )}
     </div>
   )
@@ -797,18 +1073,25 @@ function MobileBottomBar({
   onShowQR: () => void
 }) {
   const items = [
-    { kanji: '任', label: '任务', onClick: onShowFiles },
-    { kanji: '道', label: '信道', onClick: onShowChannel },
-    { kanji: '码', label: 'QR',   onClick: onShowQR },
+    { kanji: '任', label: netCopy.bottomBar.tasks, onClick: onShowFiles },
+    { kanji: '道', label: netCopy.bottomBar.channel, onClick: onShowChannel },
+    { kanji: '码', label: netCopy.bottomBar.qr, onClick: onShowQR },
   ]
   return (
     <div
-      className="flex items-center justify-around"
+      data-testid="mobile-bottom-bar"
+      className="flex items-center justify-around shrink-0"
       style={{
-        // Reserve home-indicator space on notched iPhones; without this the
-        // bar sits on top of the gesture indicator and tap targets clip.
-        height: 'calc(96px + env(safe-area-inset-bottom))',
-        paddingBottom: 'env(safe-area-inset-bottom)',
+        // 08 P1: stay viewport-attached. A sticky bar inside a minHeight-only
+        // parent still leaves the document with the footer; fixed + safe-area
+        // keeps the bar visible, and the scroll area already pads for it.
+        position: 'fixed',
+        left: 0,
+        right: 0,
+        bottom: 0,
+        zIndex: 40,
+        height: 'calc(96px + env(safe-area-inset-bottom, 0px))',
+        paddingBottom: 'env(safe-area-inset-bottom, 0px)',
         background: 'rgba(14,42,107,0.92)',
         backdropFilter: 'blur(12px)',
         borderTop: '1px solid rgba(255,255,255,0.1)',
@@ -833,9 +1116,9 @@ function MobileBottomBar({
 // ── Mobile Tab Bar ────────────────────────────────────────────────
 type TabId = 'radar' | 'channel' | 'tasks'
 const TABS: { id: TabId; kanji: string; label: string }[] = [
-  { id: 'radar',   kanji: '点', label: '节点' },
-  { id: 'channel', kanji: '道', label: '信道' },
-  { id: 'tasks',   kanji: '流', label: '任务' },
+  { id: 'radar',   kanji: '点', label: netCopy.tabs.radar },
+  { id: 'channel', kanji: '道', label: netCopy.tabs.channel },
+  { id: 'tasks',   kanji: '流', label: netCopy.tabs.tasks },
 ]
 
 // ── NAT-unreachability banner ────────────────────────────────────
@@ -861,7 +1144,7 @@ function NatUnreachableBanner({ onOpenSettings }: { onOpenSettings: () => void }
     >
       <span aria-hidden="true">⚠</span>
       <div className="flex-1 leading-snug">
-        检测到本机为对称 NAT 且 TURN 中继不可用 — 与某些对端可能无法直接建立连接。
+        {netCopy.natUnreachable}
       </div>
       <button
         type="button"
@@ -869,13 +1152,13 @@ function NatUnreachableBanner({ onOpenSettings }: { onOpenSettings: () => void }
         className="text-xs underline decoration-dotted cursor-pointer shrink-0"
         style={{ background: 'transparent', border: 'none', color: 'var(--accent-cyan)', padding: 0 }}
       >
-        打开设置
+        {netCopy.openServerAssisted}
       </button>
       <button
         type="button"
         onClick={() => setDismissed(true)}
         className="text-xs cursor-pointer shrink-0"
-        aria-label="忽略提示"
+        aria-label={netCopy.dismissHint}
         style={{ background: 'transparent', border: 'none', color: 'var(--text-on-blue-2)', padding: '0 4px' }}
       >
         ✕
@@ -964,12 +1247,12 @@ export default function Network() {
       })
       const link = appUrl(`/join?${params.toString()}`)
       await navigator.clipboard.writeText(link)
-      showToast('链接已复制到剪贴板')
+      showToast(netCopy.linkCopied)
     } catch (e) {
       if (e instanceof AuthRequiredError) {
-        showToast('会话已失效，请重新接入后再试')
+        showToast(toUserMessageFromUnknown('session expired'))
       } else {
-        showToast(`复制失败：${String(e)}`)
+        showToast(toUserMessageFromUnknown(e instanceof Error ? e : String(e)))
       }
     }
   }
@@ -1000,7 +1283,7 @@ export default function Network() {
   }
 
   function handleEmptyDropAttempt() {
-    showToast('请先在左侧选择一个目标节点，再拖入文件')
+    showToast(netCopy.emptyDrop)
   }
 
   async function handleSendFilesToAll(files: File[]) {
@@ -1008,7 +1291,7 @@ export default function Network() {
       await store.sendFilesToAll(files)
     } catch (e) {
       console.error('Fanout send failed:', e)
-      showToast(e instanceof Error ? e.message : '群发失败，请稍后再试')
+      showToast(toUserMessageFromUnknown(e instanceof Error ? e : String(e)) || netCopy.fanoutFailed)
     }
   }
 
@@ -1039,7 +1322,8 @@ export default function Network() {
       ? useNetworkStore.getState().resumeReceiveTransfer(transferId)
       : store.resumeTransfer(transferId, peerSid)
     void Promise.resolve(run).catch((e: unknown) => {
-      showToast(e instanceof Error ? e.message : '无法继续该传输')
+      console.error('Resume transfer failed:', e)
+      showToast(toUserMessageFromUnknown(e instanceof Error ? e : String(e)) || netCopy.cannotResume)
     })
   }
   function dispatchCancel(transferId: string) {
@@ -1059,12 +1343,12 @@ export default function Network() {
   })
 
   return (
-    <div className="pt-16 flex flex-col" style={{ background: 'var(--bg-primary)', minHeight: '100dvh' }}>
+    <div className="pt-nav flex flex-col" style={{ background: 'var(--bg-primary)', minHeight: '100dvh' }} data-testid="network-page">
       {unreachable && (
         <NatUnreachableBanner onOpenSettings={() => setShowSettings(true)} />
       )}
-      {/* Desktop 3-column */}
-      <div className="hidden md:grid gap-6 p-6" style={{ gridTemplateColumns: 'minmax(220px, 1fr) minmax(0, 2fr) minmax(220px, 1fr)', minHeight: 'calc(100dvh - 64px - 73px)' }}>
+      {/* Desktop 3-column — 08 P1: use --nav-h-total, never bare 64px. */}
+      <div className="hidden md:grid gap-6 p-6" style={{ gridTemplateColumns: 'minmax(220px, 1fr) minmax(0, 2fr) minmax(220px, 1fr)', minHeight: 'calc(100dvh - var(--nav-h-total) - 73px)' }}>
         <div className="overflow-y-auto">
           <NodeRadar
             peers={store.peers}
@@ -1098,12 +1382,16 @@ export default function Network() {
             onResume={dispatchResume}
             onCancel={dispatchCancel}
             onResendToPeer={handleResendToPeer}
+            onToast={showToast}
           />
         </div>
       </div>
 
-      {/* Mobile tabs */}
-      <div className="md:hidden flex flex-col" style={{ minHeight: 'calc(100svh - 64px)' }}>
+      {/* Mobile tabs — 08 P1: --nav-h-total accounts for safe-area inset.
+          Bound height so the bottom bar cannot scroll out of the viewport
+          with the document (sticky alone is not enough when the parent only
+          has minHeight and the footer sits below). */}
+      <div className="md:hidden flex flex-col min-h-0" style={{ height: 'calc(100svh - var(--nav-h-total))' }}>
         <div className="flex border-b" style={{
           background: 'rgba(14,42,107,0.85)', backdropFilter: 'blur(12px)',
           borderColor: 'rgba(255,255,255,0.12)',
@@ -1175,6 +1463,7 @@ export default function Network() {
               onResume={dispatchResume}
               onCancel={dispatchCancel}
               onResendToPeer={handleResendToPeer}
+              onToast={showToast}
             />
           )}
         </div>
@@ -1186,26 +1475,20 @@ export default function Network() {
         />
       </div>
 
-      {/* P2-11: announce toast via aria-live so screen readers don't miss
-          quick feedback (copy result, error, etc). polite + status is the
-          right pairing for non-critical, transient messages. The container
-          stays mounted as a region so SR users learn its purpose. */}
-      <div
-        className="misaka-toast-region"
-        role="status"
-        aria-live="polite"
-        aria-atomic="true"
-        style={{ position: 'fixed', left: 0, right: 0, bottom: 0, pointerEvents: 'none', zIndex: 120 }}
-      >
-        {toast && (
-          <div
-            className="misaka-toast fixed left-1/2 -translate-x-1/2 z-[120] px-4 py-2 rounded-lg text-sm font-kanji shadow-lg"
-            style={{ background: 'var(--bg-deep)', color: '#fff', pointerEvents: 'auto' }}
-          >
-            {toast}
-          </div>
-        )}
-      </div>
+      {/* P2-11 / 08 P2: reuse .misaka-notify so toast sits below dialogs
+          (z=90) and hides under body[data-dialog-open]. */}
+      {toast && (
+        <div
+          className="misaka-notify px-4 py-2 rounded-lg text-sm font-kanji shadow-lg"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          data-testid="network-toast"
+          style={{ background: 'var(--bg-deep)', color: '#fff' }}
+        >
+          {toast}
+        </div>
+      )}
 
       {/* P2-12: shared picker for the "再发文件给此节点" action. Mounted
           once at page level so it survives TransferChannel remounts. */}

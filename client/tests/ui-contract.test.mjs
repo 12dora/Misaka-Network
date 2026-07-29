@@ -64,17 +64,22 @@ assert.match(settings, /editingServer\?\.id === id/)
 assert.match(settings, /setEditingServer\(null\)/)
 
 // #30 — footer must surface Privacy + Terms links; pages must cross-link.
+// Labels live in copy/zh-CN/legal.ts after the copy migration.
+const legalCopy = read('src/copy/zh-CN/legal.ts')
 assert.match(footer, /to="\/privacy"/)
 assert.match(footer, /to="\/tos"/)
 assert.match(privacy, /to="\/tos"/)
-assert.match(privacy, /查看服务条款/)
+assert.match(legalCopy, /查看服务条款/)
 assert.match(terms, /to="\/privacy"/)
-assert.match(terms, /查看隐私政策/)
+assert.match(legalCopy, /查看隐私政策/)
 
 assert.match(qr, /QRCode\.toCanvas/)
 assert.match(qr, /QRCode\.toDataURL/)
 assert.match(qr, /qrImageUrl/)
-assert.match(qr, /QR 渲染失败/)
+// Copy may live in zh-CN/network.ts (tokenRenderFailed) or inline.
+assert.match(qr, /tokenRenderFailed|二维码渲染失败|QR 渲染失败/)
+const networkCopy = read('src/copy/zh-CN/network.ts')
+assert.match(networkCopy, /tokenRenderFailed:.*二维码渲染失败|二维码渲染失败/)
 
 // authedFetch core contract: retry once with a fresh token after 401, then
 // throw AuthRequiredError (not just resolve a 401 response).
@@ -94,7 +99,9 @@ assert.match(authStore, /void store\.connect\(\)/)
 
 assert.match(network, /type="file" multiple/)
 assert.match(network, /webkitdirectory/)
-assert.match(network, /待发送 \{pendingFiles\.length\} 个项目/)
+// Pending-items copy lives in zh-CN/network.ts after the copy migration.
+assert.match(network, /pendingItems\(|待发送 \{pendingFiles\.length\} 个项目/)
+assert.match(networkCopy, /pendingItems:\s*\(n:\s*number\)\s*=>\s*`待发送 \$\{n\} 个项目`|待发送/)
 
 assert.match(networkStore, /startQueuedDelivery\(peerSessionId\)/)
 assert.match(networkStore, /ensureConnected\(peerSessionId\)/)

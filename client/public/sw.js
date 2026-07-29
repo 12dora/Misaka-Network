@@ -71,7 +71,7 @@ self.addEventListener('fetch', (event) => {
       } catch {
         const cached = await caches.match('./index.html')
         if (cached) return cached
-        return new Response('Offline', { status: 503, statusText: 'Offline' })
+        return new Response('当前处于离线状态，无法加载此内容。恢复网络后请重试。', { status: 503, statusText: 'Offline' })
       }
     })())
     return
@@ -88,7 +88,7 @@ self.addEventListener('fetch', (event) => {
     } catch {
       const cached = await caches.match(req)
       if (cached) return cached
-      return new Response('Offline', { status: 503, statusText: 'Offline' })
+      return new Response('当前处于离线状态，无法加载此内容。恢复网络后请重试。', { status: 503, statusText: 'Offline' })
     }
   })())
 })

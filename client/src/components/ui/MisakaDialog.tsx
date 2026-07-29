@@ -127,7 +127,11 @@ export default function MisakaDialog({
   backdropStyle,
   panelStyle,
   panelClassName = '',
-  backdropClassName = 'flex items-center justify-center p-4',
+  // Safe-area padding: QR/Scan panels may be up to 90svh tall. Flat 16px
+  // padding puts the close button and its 44px hit target under the notch on
+  // a 393×852 iPhone. Default uses max(1rem, safe-*) so every consumer gets
+  // the inset without re-computing it.
+  backdropClassName = 'flex items-center justify-center misaka-dialog-backdrop',
   initialFocusRef,
 }: Props) {
   const reactId = useId()
@@ -261,7 +265,7 @@ export default function MisakaDialog({
         aria-labelledby={titleId}
         aria-describedby={description ? descriptionId : undefined}
         tabIndex={-1}
-        className={`${panelClassName} ${panelClass}`}
+        className={`misaka-dialog-panel ${panelClassName} ${panelClass}`}
         style={{ outline: 'none', ...panelStyle }}
         onMouseDown={e => e.stopPropagation()}
       >
