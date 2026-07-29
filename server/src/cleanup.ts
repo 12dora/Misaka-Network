@@ -1,18 +1,16 @@
-import { nodes, channels, qrTokens, reports, attemptLocks, nodeFreezes, isSessionExpired, unmarkSocket } from './store.js'
-import { broadcast } from './activity.js'
+import { nodes, qrTokens, reports, attemptLocks, nodeFreezes, isSessionExpired, markTokenExpired, cleanupExpiredTombstones } from './store.js'
+import { terminateSession } from './session-lifecycle.js'
 import { cleanupRateLimitWindows } from './ratelimit.js'
 import {
   CLEANUP_INTERVAL_MS, DISCONNECTED_TTL_MS, LOCK_DURATION_MS, REPORT_TTL_MS,
   NODE_FREEZE_WINDOW_MS,
 } from './config.js'
+import { channels } from './store.js'
 
 let cleanupTimer: NodeJS.Timeout | null = null
 
-export function startCleanupTask() {
-  if (cleanupTimer) return
-  cleanupTimer = setInterval(() => {
-    const now = Date.now()
-
+/** One cleanup tick — shared by the interval and tests. */
+export function runCleanupTick(now = Date.now()): void {
     // --- Session cleanup. Two independent reasons to purge:
     //
     //   1. Expiry (SECURITY-001). The advertised absolute TTL is enforced
@@ -24,28 +22,25 @@ export function startCleanupTask() {
     //      DISCONNECTED_TTL_MS. The old "only when activeCount === 0" gate
     //      meant a single long-lived user pinned every zombie session in the
     //      map indefinitely, eating per-IP slots on shared egress IPs.
-    for (const [sessionId, session] of nodes) {
+    //
+    // Both paths go through terminateSession (Contract 5) so PEER_LEFT is
+    // always delivered and channel membership stays consistent.
+    const toPurge: Array<{ session: import('./types.js').NodeSession; expired: boolean }> = []
+    for (const session of nodes.values()) {
       const expired = isSessionExpired(session, now)
       if (!expired) {
         if (session.socket !== null) continue
         if (now - session.lastSeen < DISCONNECTED_TTL_MS) continue
       }
-      if (session.socket) {
-        unmarkSocket(session.socket)
-        try { session.socket.close(4002, 'SESSION_EXPIRED') } catch { /* already gone */ }
-        session.socket = null
-      }
-      nodes.delete(sessionId)
-      if (session.channelId) {
-        const ch = channels.get(session.channelId)
-        if (ch) {
-          ch.delete(sessionId)
-          if (ch.size === 0) channels.delete(session.channelId)
-        }
-      }
-      if (expired) {
-        broadcast({ type: 'leave', nodeId: session.nodeId, message: `御坂 ${session.nodeId} 号通信终止` })
-      }
+      toPurge.push({ session, expired })
+    }
+    for (const { session, expired } of toPurge) {
+      if (expired) markTokenExpired(session.token)
+      terminateSession(session, {
+        closeCode: expired ? 4002 : 1000,
+        closeReason: expired ? 'SESSION_EXPIRED' : 'DISCONNECTED_TTL',
+        broadcastLeave: expired,
+      })
     }
 
     // Unlock expired locks
@@ -108,6 +103,17 @@ export function startCleanupTask() {
 
     // Purge stale rate limit windows
     cleanupRateLimitWindows()
+
+    // Purge expired token / re-register-proof tombstones so the maps cannot
+    // grow without bound for the life of the process (lazy-on-lookup alone
+    // never reclaims keys that no client will present again).
+    cleanupExpiredTombstones(now)
+}
+
+export function startCleanupTask() {
+  if (cleanupTimer) return
+  cleanupTimer = setInterval(() => {
+    runCleanupTick(Date.now())
   }, CLEANUP_INTERVAL_MS)
   cleanupTimer.unref?.()
 }

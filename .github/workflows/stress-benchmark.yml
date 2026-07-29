@@ -1,4 +1,9 @@
-name: Transfer stress benchmark
+name: AES-GCM micro-benchmark (non-gating)
+
+# This is a Node crypto micro-benchmark, NOT a product transfer / byte-integrity
+# gate. Production transfer uses the browser engine at 252 KiB chunks; this job
+# only measures synthetic AES-GCM throughput and RSS under a 64 KiB chunk size.
+# Failures here are informational — they do not block merge or deploy.
 
 on:
   workflow_dispatch:
@@ -6,10 +11,11 @@ on:
     - cron: "17 3 1 * *"
 
 jobs:
-  byte-integrity-and-memory:
-    name: 256 MiB byte integrity + streaming memory budget
+  aes-gcm-microbench:
+    name: Node AES-GCM micro-benchmark (non-gating)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -20,7 +26,7 @@ jobs:
       - name: Install server dependencies
         working-directory: server
         run: npm ci
-      - name: Run bounded stress benchmark
+      - name: Run AES-GCM micro-benchmark
         working-directory: server
         env:
           STRESS_FILE_SIZE_MB: 256

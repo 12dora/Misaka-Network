@@ -19,6 +19,18 @@
 // keep passing without each test having to know about the allow-list.
 
 import { IncomingMessage } from 'http'
+import { TRUST_PROXY_ENABLED } from './config.js'
+
+// Express' compiled `trust proxy fn`, installed from index.ts. Same predicate
+// the WS IP path uses — Origin scheme resolution must never honour
+// X-Forwarded-Proto from an untrusted peer just because *some* trust policy
+// is configured (CIDR/preset).
+type TrustFn = (addr: string, hopIndex: number) => boolean
+let trustProxyFn: TrustFn | null = null
+
+export function setOriginTrustProxyFn(fn: TrustFn) {
+  trustProxyFn = fn
+}
 
 const DEFAULT_ORIGINS = [
   'http://localhost:5173',
@@ -52,14 +64,24 @@ export function isWildcardOriginMode(): boolean {
   return cachedWildcard
 }
 
+/**
+ * Three distinct modes:
+ *   - unset / `*`  → wildcard (public signaling); allowlist is just dev defaults
+ *   - explicit empty (`ALLOWED_ORIGINS=`) → total lockdown: NO browser origin,
+ *     not even the localhost defaults
+ *   - comma list → those origins UNION the localhost defaults (so `npm run dev`
+ *     still works without every private deploy listing localhost)
+ */
 export function allowedOrigins(): string[] {
   if (cachedList) return cachedList
-  const raw = process.env.ALLOWED_ORIGINS ?? ''
-  if (raw.trim() === '*') {
-    // Wildcard mode — return the dev defaults only (callers should use
-    // isWildcardOriginMode() to short-circuit, but a non-empty list keeps
-    // legacy paths safe).
+  const raw = process.env.ALLOWED_ORIGINS
+  if (raw === undefined || raw.trim() === '*') {
     cachedList = [...DEFAULT_ORIGINS]
+    return cachedList
+  }
+  // Explicit empty → total lockdown. Documented as "no browser origin".
+  if (raw.trim() === '') {
+    cachedList = []
     return cachedList
   }
   const fromEnv = raw.split(',').map(s => s.trim()).filter(s => s.length > 0 && s !== '*')
@@ -81,14 +103,62 @@ export function _resetAllowedOriginsCache() {
  * would need to manually echo their own domain in ALLOWED_ORIGINS, which is
  * a foot-gun that broke production after the Origin check landed.
  */
-function isSameOrigin(origin: string, req: { headers: Record<string, unknown> | IncomingMessage['headers'] }): boolean {
+/**
+ * Derive the single external scheme the request was served under.
+ *
+ * Prefer Express's request-aware `protocol` (already applies the compiled
+ * trust-proxy predicate to the immediate peer). Fall back to the same
+ * predicate for plain IncomingMessage / test stubs: X-Forwarded-Proto is
+ * honoured ONLY when the peer address is a trusted hop. `TRUST_PROXY_ENABLED`
+ * alone is not enough — under a CIDR/preset, a direct untrusted caller must
+ * not unlock `Origin: https://Host` by spoofing XFP.
+ */
+function externalScheme(req: {
+  headers: Record<string, unknown> | IncomingMessage['headers']
+  secure?: boolean
+  protocol?: string
+  socket?: { encrypted?: boolean; remoteAddress?: string | null }
+}): string {
+  // Express Request: protocol getter already walks trust-proxy correctly.
+  if (typeof req.protocol === 'string') {
+    const p = req.protocol.toLowerCase()
+    if (p === 'http' || p === 'https') return p
+  }
+
+  const peer = req.socket?.remoteAddress ?? undefined
+  const peerTrusted = Boolean(
+    TRUST_PROXY_ENABLED
+    && trustProxyFn
+    && peer
+    && trustProxyFn(peer, 0),
+  )
+  if (peerTrusted) {
+    const h = req.headers as Record<string, string | string[] | undefined>
+    const xfRaw = h['x-forwarded-proto']
+    const xf = typeof xfRaw === 'string' ? xfRaw.split(',')[0]?.trim().toLowerCase() : undefined
+    if (xf === 'http' || xf === 'https') return xf
+  }
+  if (req.secure === true) return 'https'
+  if (req.socket?.encrypted === true) return 'https'
+  return 'http'
+}
+
+/** True when the operator set ALLOWED_ORIGINS= (empty) for total lockdown. */
+export function isEmptyOriginLockdown(): boolean {
+  return !isWildcardOriginMode() && allowedOrigins().length === 0
+}
+
+function isSameOrigin(origin: string, req: {
+  headers: Record<string, unknown> | IncomingMessage['headers']
+  secure?: boolean
+  protocol?: string
+  socket?: { encrypted?: boolean; remoteAddress?: string | null }
+}): boolean {
   const h = req.headers as Record<string, string | string[] | undefined>
   const host = typeof h['host'] === 'string' ? h['host'] : undefined
   if (!host) return false
-  // Behind Caddy/nginx the original scheme is in X-Forwarded-Proto.
-  const xfProto = typeof h['x-forwarded-proto'] === 'string' ? h['x-forwarded-proto'] : undefined
-  const scheme = xfProto || (typeof (h as { encrypted?: unknown }).encrypted !== 'undefined' ? 'https' : 'http')
-  return origin === `${scheme}://${host}` || origin === `https://${host}` || origin === `http://${host}`
+  const scheme = externalScheme(req)
+  return origin === `${scheme}://${host}`
 }
 
 /**
@@ -108,12 +178,17 @@ export function isOriginAllowed(originOrNull: string | null | undefined): boolea
  *   - No Origin header (non-browser caller — not a CSRF vector).
  *   - Origin in the configured allow-list.
  *   - Origin equals the request's own host (same-origin deployment).
+ *
+ * Explicit empty lockdown (`ALLOWED_ORIGINS=`) short-circuits browser Origins
+ * — same-origin auto-allow is intentionally OFF so the operator's lockdown
+ * is total.
  */
 export function isOriginAllowedForRequest(req: { headers: Record<string, unknown> | IncomingMessage['headers'] }): boolean {
   if (isWildcardOriginMode()) return true
   const h = req.headers as Record<string, string | string[] | undefined>
   const origin = typeof h['origin'] === 'string' ? h['origin'] : undefined
   if (!origin) return true
+  if (isEmptyOriginLockdown()) return false
   if (allowedOrigins().includes(origin)) return true
   return isSameOrigin(origin, req)
 }
@@ -139,11 +214,14 @@ export function getRequestOrigin(req: { headers: Record<string, unknown> | Incom
  * OR Referer is present they MUST be in the allow-list OR same-origin. This
  * blocks the classic CSRF where the attacker's page can't suppress Origin,
  * while still letting same-host production deployments work zero-config.
+ *
+ * Explicit empty lockdown refuses every browser-supplied Origin/Referer.
  */
 export function isHttpOriginAllowed(req: { headers: Record<string, unknown> | IncomingMessage['headers'] }): boolean {
   if (isWildcardOriginMode()) return true
   const origin = getRequestOrigin(req)
   if (!origin) return true
+  if (isEmptyOriginLockdown()) return false
   if (allowedOrigins().includes(origin)) return true
   return isSameOrigin(origin, req)
 }

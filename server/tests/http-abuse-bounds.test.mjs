@@ -74,7 +74,8 @@ async function main() {
 let statsServer = null
 async function ensureStatsServer() {
   if (statsServer) return
-  statsServer = startServer(PORT_STATS, { TRANSFER_DONE_RATE_LIMIT: '5' })
+  // Room for shape/overflow cases; the exact-boundary rate test uses its own process.
+  statsServer = startServer(PORT_STATS, { TRANSFER_DONE_RATE_LIMIT: '1000' })
   procs.push(statsServer)
   await waitForServer(PORT_STATS)
 }
@@ -124,17 +125,28 @@ async function testUnrealisticBytesRejected() {
 }
 
 async function testReportRateLimited() {
-  await ensureStatsServer()
-  const reg = await register(PORT_STATS, 15503, '444444')
+  // Clean process with exact TRANSFER_DONE_RATE_LIMIT=5 (shared stats server
+  // uses a high limit so overflow cases do not burn this budget).
+  const PORT_RL = 18967
+  const LIMIT = 5
+  const proc = startServer(PORT_RL, { TRANSFER_DONE_RATE_LIMIT: String(LIMIT) })
+  procs.push(proc)
+  await waitForServer(PORT_RL)
+  const reg = await register(PORT_RL, 15503, '444444')
 
-  let limited = 0
-  for (let i = 0; i < 12; i++) {
-    const res = await transferDone(PORT_STATS, reg.token, 1)
-    if (res.status === 429) limited++
+  for (let i = 0; i < LIMIT; i++) {
+    const res = await transferDone(PORT_RL, reg.token, 1)
+    assert(
+      res.status === 200 || res.status === 204,
+      `attempt ${i + 1}/${LIMIT} must succeed (200/204), got ${res.status}`,
+    )
   }
-  assert(limited > 0, '重复上报必须触发专用频率限制（否则计数可被循环刷高）')
+  const trip = await transferDone(PORT_RL, reg.token, 1)
+  assertEq(trip.status, 429, `attempt ${LIMIT + 1} must be 429`)
+  const again = await transferDone(PORT_RL, reg.token, 1)
+  assertEq(again.status, 429, `attempt ${LIMIT + 2} must still be 429`)
 
-  const after = await stats(PORT_STATS)
+  const after = await stats(PORT_RL)
   assert(Number.isFinite(after.totalBytes) && Number.isFinite(after.totalTransfers), '计数保持有限')
 }
 
@@ -223,6 +235,7 @@ function startServer(port, extraEnv) {
       MAX_NODES: '200',
       TURN_AUTO_ENABLED: 'false',
       RATE_LIMIT_PER_MIN: '100000',
+      TRANSFER_DONE_RATE_LIMIT: '5',
       DISCONNECTED_TTL_MS: '60000',
       ...extraEnv,
     },

@@ -43,7 +43,7 @@ async function main() {
     ['disallowed Origin → upgrade 403 BAD_ORIGIN',     testDisallowedOrigin],
     ['allowed Origin → handshake succeeds → AUTH ok',  testAllowedOrigin],
     ['missing Origin → handshake succeeds (CLI path)', testMissingOrigin],
-    ['no AUTH within grace window → close 4001 AUTH_TIMEOUT', testAuthTimeout],
+    ['no AUTH within grace window → close 4003 AUTH_TIMEOUT', testAuthTimeout],
   ]
 
   for (const [name, fn] of cases) {
@@ -121,9 +121,9 @@ async function testAuthTimeout() {
   const ws = new WebSocket(WS_URL, { origin: ALLOWED })
   await openWS(ws)
   const closure = await waitForClose(ws, 3000)
-  if (closure.code !== 4001) throw new Error(`期待 close 4001，实际 ${closure.code}`)
+  if (closure.code !== 4003) throw new Error(`期待 close 4003，实际 ${closure.code}`)
   // Reason buffer should mention AUTH_TIMEOUT (helpful for debugging logs).
-  if (!closure.reason.includes('AUTH_TIMEOUT') && !closure.reason.includes('AUTH_REQUIRED')) {
+  if (!closure.reason.includes('AUTH_TIMEOUT') && !closure.reason.includes('AUTH_EXPECTED')) {
     // Allow either reason string — the close code is the load-bearing part.
     console.warn(`    (reason='${closure.reason}', acceptable)`)
   }
