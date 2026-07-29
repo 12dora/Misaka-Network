@@ -1,16 +1,24 @@
-// E2E: offline peer banner exposes "立即重连此节点" affordance.
+// E2E: offline peer banner exposes reconnect affordance.
 //
 // Replays the bug where a peer whose WS dropped (or whose ICE failed) left
 // the user staring at a red banner with no recovery affordance. Network.tsx
 // now wires reconnectPeer(sessionId) into the banner; this test asserts the
 // button appears, is clickable, and the peer card transitions away from
-// 'offline'.
+// 'offline'. Status strings come from the zh-CN copy module (07 P2).
 
-import { test, expect, type Page, type BrowserContext } from '@playwright/test'
+import { test, expect, type Page } from '@playwright/test'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { cleanupE2eSessions } from './helpers'
+import {
+  cleanupE2eSessions,
+  authCopy,
+  netCopy,
+  xferCopy,
+  escapeRegExp,
+  OUTAGE_STATUS_MARKERS,
+  OUTAGE_STATUS_RE,
+} from './helpers'
 
 const NODE_A = '11001'
 // Clusters are identity-scoped on the server (clusterChannelId = nodeId +
@@ -31,7 +39,7 @@ async function login(page: Page, nodeId: string) {
   await section.locator('input[type="number"]').fill(nodeId)
   const passInputs = section.locator('input[maxlength="1"]')
   for (let i = 0; i < PASS_CODE.length; i++) await passInputs.nth(i).fill(PASS_CODE[i])
-  await section.locator('button:has-text("接入网络")').click()
+  await section.locator(`button:has-text("${authCopy.accessNetwork}")`).click()
   await page.waitForURL('**/network', { timeout: 30_000 })
 }
 
@@ -40,14 +48,19 @@ async function openContext(browser: Parameters<typeof test>[1] extends never ? n
   return { ctx, page: await ctx.newPage() }
 }
 
-test('offline-peer banner offers and acts on 立即重连', async ({ browser }) => {
+test('offline-peer banner offers and acts on reconnect', async ({ browser }) => {
   const a = await openContext(browser)
   const b = await openContext(browser)
   let replacement: Awaited<ReturnType<typeof openContext>> | undefined
   const observedStates = new Set<string>()
+  const trackMarkers = [
+    ...OUTAGE_STATUS_MARKERS,
+    netCopy.peerStatus.online,
+    xferCopy.recvDone,
+  ]
   const observer = setInterval(async () => {
     const text = await a.page.locator('body').innerText().catch(() => '')
-    for (const state of ['连接已断开', '正在尝试重新协商连接', '已连接', '传输完成']) {
+    for (const state of trackMarkers) {
       if (text.includes(state)) observedStates.add(state)
     }
   }, 100)
@@ -56,7 +69,7 @@ test('offline-peer banner offers and acts on 立即重连', async ({ browser }) 
     await login(b.page, NODE_B)
 
     // Wait for A to see B in the radar.
-    await expect(a.page.getByText(`御坂 ${NODE_B} 号`, { exact: false }).first())
+    await expect(a.page.getByText(netCopy.misakaNumber(Number(NODE_B)), { exact: false }).first())
       .toBeVisible({ timeout: 20_000 })
 
     // Close B entirely → A's PEER_LEFT path fires; if PC still alive via TURN it
@@ -64,16 +77,19 @@ test('offline-peer banner offers and acts on 立即重连', async ({ browser }) 
     await b.ctx.close()
 
     // Force-select B in A's radar so the right pane shows the banner.
-    await a.page.getByText(`御坂 ${NODE_B} 号`, { exact: false }).first().click()
+    await a.page.getByText(netCopy.misakaNumber(Number(NODE_B)), { exact: false }).first().click()
 
     // Wait for status to surface as offline or reconnecting (banner shows on either).
     await expect.poll(
-      async () => await a.page.locator('text=/连接已断开|正在尝试重新协商连接/').count(),
+      async () => await a.page.getByText(OUTAGE_STATUS_RE).count(),
       { timeout: 30_000, intervals: [500, 1_000, 2_000] },
     ).toBeGreaterThan(0)
 
-    // "立即重连此节点" button must be present and clickable.
-    const reconnectBtn = a.page.locator('button:has-text("立即重连")')
+    // Offline uses reconnectThisDevice; reconnecting uses reconnectNow — both
+    // share the reconnect prefix from the copy module.
+    const reconnectBtn = a.page.locator(
+      `button:has-text("${netCopy.reconnectNow}"), button:has-text("${netCopy.reconnectThisDevice}")`,
+    )
     await expect(reconnectBtn.first()).toBeVisible({ timeout: 10_000 })
     await reconnectBtn.first().click()
 
@@ -82,13 +98,18 @@ test('offline-peer banner offers and acts on 立即重连', async ({ browser }) 
     // after the observed outage proves discovery and communication recovered.
     replacement = await openContext(browser)
     await login(replacement.page, NODE_B)
-    await expect(replacement.page.getByText(`御坂 ${NODE_A} 号`, { exact: false }).first())
+    await expect(replacement.page.getByText(netCopy.misakaNumber(Number(NODE_A)), { exact: false }).first())
       .toBeVisible({ timeout: 20_000 })
     // A still has the deliberately retained offline card for B's old
-    // session. Wait for and select the replacement's genuinely encrypted
-    // online card so same-node duplicate labels cannot leave the test (or
-    // user) operating on the stale session.
-    const replacementOnline = a.page.getByText('脑波同步中', { exact: true }).last()
+    // session. Wait for and select the replacement's genuinely online card
+    // so same-node duplicate labels cannot leave the test (or user)
+    // operating on the stale session. Prefer the radar card aria-label
+    // (includes peerStatus). Anchor on `，连接$` so reconnecting/connecting
+    // labels that merely contain the online token do not match.
+    const onlineLabel = new RegExp(
+      `选择御坂 ${NODE_B} 号设备.*，${escapeRegExp(netCopy.peerStatus.online)}$`,
+    )
+    const replacementOnline = a.page.getByRole('button', { name: onlineLabel }).last()
     await expect(replacementOnline).toBeVisible({ timeout: 30_000 })
     await replacementOnline.click()
 
@@ -96,10 +117,12 @@ test('offline-peer banner offers and acts on 立即重连', async ({ browser }) 
     const path = join(dir, 'after-reconnect.bin')
     writeFileSync(path, Buffer.from('communication recovered after offline transition'))
     try {
-      await replacement.page.getByText(`御坂 ${NODE_A} 号`, { exact: false }).first().click()
+      await replacement.page.getByText(netCopy.misakaNumber(Number(NODE_A)), { exact: false }).first().click()
       const replacementReady = replacement.page
-        .getByText('连接成功。现在可以发送消息或文件。', { exact: false }).first()
-      const retry = replacement.page.locator('button:has-text("立即重连")').first()
+        .getByText(netCopy.peerConnected, { exact: false }).first()
+      const retry = replacement.page.locator(
+        `button:has-text("${netCopy.reconnectNow}"), button:has-text("${netCopy.reconnectThisDevice}")`,
+      ).first()
       const firstOutcome = await expect.poll(async () => {
         if (await replacementReady.isVisible().catch(() => false)) return 'ready'
         if (await retry.isVisible().catch(() => false)) return 'retry'
@@ -112,23 +135,26 @@ test('offline-peer banner offers and acts on 立即重连', async ({ browser }) 
       await expect(replacementReady).toBeVisible({ timeout: 30_000 })
       const [chooser] = await Promise.all([
         replacement.page.waitForEvent('filechooser'),
-        replacement.page.locator('button:has-text("选择文件")').first().click(),
+        replacement.page.getByRole('button', { name: netCopy.selectFile }).first().click(),
       ])
       await chooser.setFiles(path)
       await replacement.page.locator('[data-testid="send-pending-file"]').first().click()
       await expect.poll(
-        async () => await a.page.getByText('接收完成', { exact: false }).count(),
+        async () => await a.page.getByText(xferCopy.recvDone, { exact: false }).count(),
         { timeout: 60_000, intervals: [500, 1_000, 2_000] },
       ).toBeGreaterThan(0)
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
 
+    const sawOutage = OUTAGE_STATUS_MARKERS.some(marker => observedStates.has(marker))
+    expect(sawOutage).toBe(true)
+    expect(await a.page.getByText(xferCopy.recvDone, { exact: false }).count()).toBeGreaterThan(0)
+    // Online peer badge uses peerStatus.online ("连接"), not the retired
+    // ACGN lore term "脑波同步中".
     expect(
-      observedStates.has('连接已断开') || observedStates.has('正在尝试重新协商连接'),
-    ).toBe(true)
-    expect(await a.page.getByText('接收完成', { exact: false }).count()).toBeGreaterThan(0)
-    expect(await a.page.getByText('脑波同步中', { exact: false }).count()).toBeGreaterThan(0)
+      await a.page.getByText(netCopy.peerStatus.online, { exact: true }).count(),
+    ).toBeGreaterThan(0)
   } finally {
     clearInterval(observer)
     await a.ctx.close().catch(() => {})

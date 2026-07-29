@@ -1,15 +1,24 @@
 // End-to-end: real Vite + real signaling + real WebRTC DataChannel between two
 // (or more) browser contexts. Mocking any of those layers would defeat the
 // point — the regressions this suite catches (chunk-frame layout, IV
-// derivation, SDP races, session 401 recovery, spurious "重新协商中" on LAN
-// peers) all live in the unmocked path.
+// derivation, SDP races, session 401 recovery, spurious reconnect banners on
+// LAN peers) all live in the unmocked path.
 
 import { test, expect, type Page, type BrowserContext } from '@playwright/test'
 import { createHash } from 'node:crypto'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { cleanupE2eSessions, assertE2eHostIceConfig } from './helpers'
+import {
+  cleanupE2eSessions,
+  assertE2eHostIceConfig,
+  authCopy,
+  netCopy,
+  xferCopy,
+  escapeRegExp,
+  installConnectionFailureObserver,
+  expectNoReconnectingBanner,
+} from './helpers'
 
 const NODE_ID = '10001'
 const PASS_CODE = '123456'
@@ -71,7 +80,7 @@ async function login(page: Page, nodeId: string, passCode: string) {
     await passInputs.nth(i).fill(passCode[i])
   }
 
-  const connectBtn = desktopSection.locator('button:has-text("接入网络")')
+  const connectBtn = desktopSection.locator(`button:has-text("${authCopy.accessNetwork}")`)
   await expect(connectBtn).toBeEnabled({ timeout: 5_000 })
   await connectBtn.click()
 
@@ -79,23 +88,25 @@ async function login(page: Page, nodeId: string, passCode: string) {
 }
 
 async function waitForPeer(page: Page, nodeId: string) {
-  await expect(page.getByText(`御坂 ${nodeId} 号`, { exact: false }).first()).toBeVisible({ timeout: 15_000 })
+  await expect(page.getByText(netCopy.misakaNumber(Number(nodeId)), { exact: false }).first()).toBeVisible({ timeout: 15_000 })
 }
 
 async function waitForPeerCount(page: Page, nodeId: string, count: number) {
   await expect.poll(
-    async () => await page.getByText(`御坂 ${nodeId} 号`, { exact: false }).count(),
+    async () => await page.getByText(netCopy.misakaNumber(Number(nodeId)), { exact: false }).count(),
     { timeout: 20_000, intervals: [500, 1_000, 2_000] },
   ).toBeGreaterThanOrEqual(count)
 }
 
 async function selectPeer(page: Page, nodeId: string) {
-  await page.getByText(`御坂 ${nodeId} 号`, { exact: false }).first().click()
+  await page.getByText(netCopy.misakaNumber(Number(nodeId)), { exact: false }).first().click()
 }
 
 async function waitForSelectedChannelReady(page: Page) {
-  const ready = page.getByText('连接成功。现在可以发送消息或文件。', { exact: false }).first()
-  const retry = page.locator('button:has-text("立即重连")').first()
+  const ready = page.getByText(netCopy.peerConnected, { exact: false }).first()
+  const retry = page.locator(
+    `button:has-text("${netCopy.reconnectNow}"), button:has-text("${netCopy.reconnectThisDevice}")`,
+  ).first()
   await expect.poll(async () => {
     if (await ready.isVisible().catch(() => false)) return 'ready'
     if (await retry.isVisible().catch(() => false)) return 'retry'
@@ -110,7 +121,7 @@ async function waitForSelectedChannelReady(page: Page) {
 async function uploadFiles(page: Page, paths: string[]) {
   const [chooser] = await Promise.all([
     page.waitForEvent('filechooser'),
-    page.locator('button:has-text("选择文件")').first().click(),
+    page.getByRole('button', { name: netCopy.selectFile }).first().click(),
   ])
   await chooser.setFiles(paths)
 }
@@ -118,7 +129,7 @@ async function uploadFiles(page: Page, paths: string[]) {
 async function uploadFolder(page: Page, folderPath: string) {
   const [chooser] = await Promise.all([
     page.waitForEvent('filechooser'),
-    page.locator('button:has-text("选择文件夹")').first().click(),
+    page.getByRole('button', { name: netCopy.selectFolder }).first().click(),
   ])
   // webkitdirectory inputs require the directory path itself, not the files.
   await chooser.setFiles(folderPath)
@@ -127,7 +138,7 @@ async function uploadFolder(page: Page, folderPath: string) {
 async function broadcastFiles(page: Page, paths: string[]) {
   const [chooser] = await Promise.all([
     page.waitForEvent('filechooser'),
-    page.locator('button:has-text("群发文件到全部节点")').first().click(),
+    page.getByRole('button', { name: netCopy.fanoutAllDevicesShort }).first().click(),
   ])
   await chooser.setFiles(paths)
 }
@@ -136,44 +147,30 @@ async function clickSend(page: Page) {
   await page.locator('[data-testid="send-pending-file"]').first().click()
 }
 
-/** Sender durability: "✓ 已保存" on a send-direction card (📤). */
+/** Sender durability: saved state on a send-direction card (📤). */
 async function expectSenderSaved(page: Page, atLeast = 1) {
+  const savedRe = new RegExp(escapeRegExp(xferCopy.saved))
   await expect.poll(
     async () => page.locator('[data-testid^="transfer-card-"]')
       .filter({ hasText: '📤' })
-      .filter({ hasText: /已保存/ })
+      .filter({ hasText: savedRe })
       .count(),
     { timeout: 60_000, intervals: [500, 1_000, 2_000] },
   ).toBeGreaterThanOrEqual(atLeast)
 }
 
-/** Receiver availability: "接收完成" or FSA "已保存到所选位置" on a recv card (📥). */
+/** Receiver availability: recvDone or FSA recvToFsa on a recv card (📥). */
 async function expectReceiverComplete(page: Page, atLeast = 1) {
+  const completeRe = new RegExp(
+    `${escapeRegExp(xferCopy.recvDone)}|${escapeRegExp(xferCopy.recvToFsa)}`,
+  )
   await expect.poll(
     async () => page.locator('[data-testid^="transfer-card-"]')
       .filter({ hasText: '📥' })
-      .filter({ hasText: /接收完成|已保存到所选位置/ })
+      .filter({ hasText: completeRe })
       .count(),
     { timeout: 60_000, intervals: [500, 1_000, 2_000] },
   ).toBeGreaterThanOrEqual(atLeast)
-}
-
-async function installConnectionFailureObserver(page: Page) {
-  await page.evaluate(() => {
-    const state = window as Window & { __misakaConnectionFailureSeen?: boolean; __misakaConnectionObserver?: MutationObserver }
-    state.__misakaConnectionFailureSeen = false
-    state.__misakaConnectionObserver?.disconnect()
-    const inspect = () => {
-      const text = document.body.innerText
-      if (text.includes('正在尝试重新协商连接') || text.includes('连接已断开')) {
-        state.__misakaConnectionFailureSeen = true
-      }
-    }
-    const observer = new MutationObserver(inspect)
-    observer.observe(document.body, { subtree: true, childList: true, characterData: true })
-    state.__misakaConnectionObserver = observer
-    inspect()
-  })
 }
 
 async function installArtifactCapture(page: Page) {
@@ -222,17 +219,6 @@ function expectedArtifact(path: string, name?: string): CapturedArtifact {
     size: bytes.byteLength,
     sha256: createHash('sha256').update(bytes).digest('hex'),
   }
-}
-
-async function expectNoReconnectingBanner(page: Page) {
-  // The bug under test: a stray cleanup on the WebRTC PC fired dc.onclose
-  // → attemptIceRestart → status='reconnecting' → "正在尝试重新协商连接…"
-  // banner appears for a peer that's actually healthy. Read the observer
-  // installed before transfer so a transient error cannot disappear between
-  // two point-in-time assertions.
-  expect(await page.evaluate(() =>
-    (window as Window & { __misakaConnectionFailureSeen?: boolean }).__misakaConnectionFailureSeen,
-  )).toBe(false)
 }
 
 test.describe('two-peer file transfer (happy path)', () => {
@@ -366,7 +352,7 @@ test.describe('folder transfer', () => {
 })
 
 test.describe('broadcast to all peers', () => {
-  test('"群发文件到全部节点" preserves every file at every connected peer', async ({ browser }) => {
+  test('fan-out preserves every file at every connected peer', async ({ browser }) => {
     // Three nodes in the same identity cluster: A broadcasts, B and C both receive.
     const ctxs: BrowserContext[] = []
     const pages: Page[] = []
@@ -395,7 +381,7 @@ test.describe('broadcast to all peers', () => {
         // Selecting a peer just makes the button reachable via the same DOM
         // path the test helper uses.
         for (let peerIndex = 0; peerIndex < 2; peerIndex++) {
-          await pageA.getByText(`御坂 ${NODE_ID} 号`, { exact: false }).nth(peerIndex).click()
+          await pageA.getByText(netCopy.misakaNumber(Number(NODE_ID)), { exact: false }).nth(peerIndex).click()
           await waitForSelectedChannelReady(pageA)
         }
         for (const page of pages) await installConnectionFailureObserver(page)

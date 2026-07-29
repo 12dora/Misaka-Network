@@ -10,7 +10,7 @@
 // pipeline actually work end-to-end.
 
 import { test, expect, type Page } from '@playwright/test'
-import { assertE2eHostIceConfig } from './helpers'
+import { assertE2eHostIceConfig, authCopy, netCopy } from './helpers'
 
 async function login(page: Page) {
   const NODE_ID = '20001'
@@ -24,7 +24,7 @@ async function login(page: Page) {
   const passInputs = desktopSection.locator('input[maxlength="1"]')
   await passInputs.nth(0).click()
   await page.keyboard.type(PASS_CODE, { delay: 20 })
-  await desktopSection.locator('button:has-text("接入网络")').click()
+  await desktopSection.locator(`button:has-text("${authCopy.accessNetwork}")`).click()
 
   await page.waitForURL('**/network', { timeout: 15_000 })
 }
@@ -53,17 +53,17 @@ test.describe('401 self-heal (QR path)', () => {
       // test nonce, and that the real peer factory has no public ICE URLs.
       await assertE2eHostIceConfig(page, request)
 
-      await page.locator('button:has-text("显示我的 QR")').first().click()
+      await page.getByRole('button', { name: netCopy.showMyQr }).first().click()
 
       // The QR modal opens when recovery succeeds. The authedFetch 401 →
       // reAuth → retry cycle produces a valid QR token, which the modal
-      // renders inside an <img alt="接入 QR">.
+      // renders inside an <img alt="接入二维码">.
       await expect(
-        page.getByText('我的接入 QR'),
+        page.getByText(netCopy.qr.myAccessQr),
       ).toBeVisible({ timeout: 10_000 })
 
       await expect(
-        page.locator('img[alt="接入 QR"]'),
+        page.locator(`img[alt="${netCopy.qr.accessQr}"]`),
       ).toBeVisible({ timeout: 10_000 })
 
       // The stale-token error message should never appear.

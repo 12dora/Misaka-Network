@@ -1,7 +1,7 @@
 // E2E: QR invite flow end-to-end.
 //
 // Pins:
-//   1. The QR modal opens and renders an <img alt="接入 QR"> or canvas.
+//   1. The QR modal opens and renders an <img alt="接入二维码"> or canvas.
 //   2. The "复制链接" button writes a valid /join URL to the clipboard.
 //   3. Visiting /join?token=… from a fresh context lands on either the
 //      passcode prompt or directly on /network (depending on whether the QR
@@ -12,7 +12,7 @@
 import { test, expect, type Page } from '@playwright/test'
 import jsQR from 'jsqr'
 import { PNG } from 'pngjs'
-import { cleanupE2eSessions } from './helpers'
+import { cleanupE2eSessions, authCopy, netCopy } from './helpers'
 
 const HOST_NODE = '12001'
 const HOST_PASS = '424242'
@@ -27,7 +27,7 @@ async function loginHost(page: Page) {
   await section.locator('input[type="number"]').fill(HOST_NODE)
   const passInputs = section.locator('input[maxlength="1"]')
   for (let i = 0; i < HOST_PASS.length; i++) await passInputs.nth(i).fill(HOST_PASS[i])
-  await section.locator('button:has-text("接入网络")').click()
+  await section.locator(`button:has-text("${authCopy.accessNetwork}")`).click()
   await page.waitForURL('**/network', { timeout: 30_000 })
 }
 
@@ -46,8 +46,8 @@ test('rendered QR image decodes and admits a fresh device', async ({ browser }) 
   try {
     await loginHost(page)
 
-    await page.locator('button:has-text("显示我的 QR")').first().click()
-    await expect(page.getByText('我的接入 QR')).toBeVisible({ timeout: 10_000 })
+    await page.getByRole('button', { name: netCopy.showMyQr }).first().click()
+    await expect(page.getByText(netCopy.qr.myAccessQr)).toBeVisible({ timeout: 10_000 })
 
     // The radar empty-state ALSO renders a "复制链接" button, so an unscoped
     // `.first()` resolves to it — and it sits behind the modal backdrop, so the
@@ -55,7 +55,7 @@ test('rendered QR image decodes and admits a fresh device', async ({ browser }) 
     const modal = page.locator('.modal-panel-in')
 
     // QR canvas/img is rendered (alt text or canvas presence).
-    const qrImage = modal.locator('img[alt="接入 QR"]')
+    const qrImage = modal.locator(`img[alt="${netCopy.qr.accessQr}"]`)
     await expect(qrImage).toBeVisible({ timeout: 10_000 })
     await expect.poll(async () => qrImage.getAttribute('src')).toMatch(/^data:image\/png;base64,.+/)
     const imageUrl = await qrImage.getAttribute('src')
@@ -65,7 +65,7 @@ test('rendered QR image decodes and admits a fresh device', async ({ browser }) 
     expect(scannedUrl).not.toMatch(/[?&]c=/)
 
     // Click 复制链接 — modal toast confirms; clipboard content matches /join?token=
-    const copyBtn = modal.locator('button:has-text("复制链接")')
+    const copyBtn = modal.getByRole('button', { name: netCopy.qr.copyLink })
     await expect(copyBtn).toBeVisible({ timeout: 5_000 })
     await copyBtn.click()
 
@@ -84,9 +84,10 @@ test('rendered QR image decodes and admits a fresh device', async ({ browser }) 
       const passInput = guestPage.locator('#join-passcode')
       await expect(passInput).toBeVisible()
       await passInput.fill(HOST_PASS)
+      // Join page primary action is a short "接入" label (not auth.accessNetwork).
       await guestPage.locator('button:has-text("接入")').click()
       await guestPage.waitForURL('**/network', { timeout: 30_000 })
-      await expect(page.getByText(`御坂 ${HOST_NODE} 号`, { exact: false }).first())
+      await expect(page.getByText(netCopy.misakaNumber(Number(HOST_NODE)), { exact: false }).first())
         .toBeVisible({ timeout: 20_000 })
     } finally {
       await guestCtx.close().catch(() => {})
@@ -101,13 +102,13 @@ test('wrong passcode at /join surfaces inline error', async ({ browser }) => {
   const hostPage = await hostCtx.newPage()
   try {
     await loginHost(hostPage)
-    await hostPage.locator('button:has-text("显示我的 QR")').first().click()
+    await hostPage.getByRole('button', { name: netCopy.showMyQr }).first().click()
     // Scope to the QR modal — the radar empty-state also has a 复制链接 button
     // that sits behind the modal backdrop (unscoped `.first()` picks it and the
     // click is intercepted).
     const hostModal = hostPage.locator('.modal-panel-in')
-    await expect(hostModal.getByText('我的接入 QR')).toBeVisible({ timeout: 10_000 })
-    await hostModal.locator('button:has-text("复制链接")').click()
+    await expect(hostModal.getByText(netCopy.qr.myAccessQr)).toBeVisible({ timeout: 10_000 })
+    await hostModal.getByRole('button', { name: netCopy.qr.copyLink }).click()
     const joinUrl = await hostPage.evaluate(() => navigator.clipboard.readText())
     expect(joinUrl).toBeTruthy()
 

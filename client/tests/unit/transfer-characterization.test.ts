@@ -41,6 +41,18 @@ async function ensurePeerKey(peerSessionId: string): Promise<CryptoKey> {
   return key
 }
 
+// Node 20's webcrypto brand-checks BufferSource across realms; jsdom's typed
+// arrays are a different realm. Copy into this realm so the mock behaves the
+// same on Node 20 (CI) and Node 26 (local). Browsers share one realm and are
+// unaffected — this is a harness concern only.
+const intoRealm = (b: ArrayBuffer | ArrayBufferView): Uint8Array<ArrayBuffer> => {
+  const view = ArrayBuffer.isView(b)
+    ? new Uint8Array(b.buffer, b.byteOffset, b.byteLength)
+    : new Uint8Array(b)
+  // `new Uint8Array(view)` copies into a fresh ArrayBuffer in this realm.
+  return new Uint8Array(view)
+}
+
 vi.mock('../../src/lib/crypto', async () => {
   const actual = await vi.importActual<typeof import('../../src/lib/crypto')>('../../src/lib/crypto')
   return {
@@ -52,12 +64,12 @@ vi.mock('../../src/lib/crypto', async () => {
       additionalData?: Uint8Array,
     ) => {
       const key = await ensurePeerKey(peerSessionId)
-      const actualIv = iv ?? crypto.getRandomValues(new Uint8Array(12))
+      const actualIv = iv ? intoRealm(iv) : crypto.getRandomValues(new Uint8Array(12))
       const params: AesGcmParams = { name: 'AES-GCM', iv: actualIv as BufferSource }
       if (additionalData && additionalData.byteLength > 0) {
-        params.additionalData = additionalData as BufferSource
+        params.additionalData = intoRealm(additionalData) as BufferSource
       }
-      const encrypted = await crypto.subtle.encrypt(params, key, data)
+      const encrypted = await crypto.subtle.encrypt(params, key, intoRealm(data))
       return { iv: actualIv as Uint8Array<ArrayBuffer>, encrypted }
     }),
     decryptChunk: vi.fn(async (
@@ -67,11 +79,11 @@ vi.mock('../../src/lib/crypto', async () => {
       additionalData?: Uint8Array,
     ) => {
       const key = await ensurePeerKey(peerSessionId)
-      const params: AesGcmParams = { name: 'AES-GCM', iv: iv as BufferSource }
+      const params: AesGcmParams = { name: 'AES-GCM', iv: intoRealm(iv) as BufferSource }
       if (additionalData && additionalData.byteLength > 0) {
-        params.additionalData = additionalData as BufferSource
+        params.additionalData = intoRealm(additionalData) as BufferSource
       }
-      return crypto.subtle.decrypt(params, key, encrypted)
+      return crypto.subtle.decrypt(params, key, intoRealm(encrypted))
     }),
   }
 })
