@@ -1,7 +1,44 @@
-import type { APIRequestContext, Page } from '@playwright/test'
+import { expect, type APIRequestContext, type Page } from '@playwright/test'
+import { network as netCopy } from '../../src/copy/zh-CN/network'
+import { transfer as xferCopy } from '../../src/copy/zh-CN/transfer'
+import { auth as authCopy } from '../../src/copy/zh-CN/auth'
+
+export { netCopy, xferCopy, authCopy }
 
 const SIGNAL_BASE = 'http://localhost:19180/api'
 const E2E_BUILD_NONCE = 'misaka-playwright-v1'
+
+/** Escape a string for safe use inside a RegExp source. */
+export function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * Functional-page outage vocabulary after 07 P2.
+ * Badge: offline / reconnecting; banners may use the longer connectionDropped /
+ * restoringConnection forms (which contain the short badge labels as substrings
+ * or close variants).
+ */
+export const OUTAGE_STATUS_MARKERS = [
+  netCopy.peerStatus.offline,
+  netCopy.peerStatus.reconnecting,
+  netCopy.connectionDropped,
+  netCopy.restoringConnection,
+] as const
+
+export const OUTAGE_STATUS_RE = new RegExp(
+  [netCopy.peerStatus.offline, netCopy.peerStatus.reconnecting]
+    .map(escapeRegExp)
+    .join('|'),
+)
+
+/** UI strings that indicate a spurious reconnect/offline during a healthy transfer. */
+export const CONNECTION_FAILURE_MARKERS = [
+  netCopy.peerStatus.reconnecting,
+  netCopy.peerStatus.offline,
+  netCopy.restoringConnection,
+  netCopy.connectionDropped,
+] as const
 
 export async function assertE2eBackend(request: APIRequestContext) {
   let ready: Awaited<ReturnType<APIRequestContext['get']>> | undefined
@@ -69,4 +106,39 @@ export async function cleanupE2eSessions(request: APIRequestContext) {
     throw new Error(`E2E cleanup returned an invalid result: ${JSON.stringify(body)}`)
   }
   return body.released
+}
+
+/**
+ * Watch the DOM for reconnect/offline banners that should not appear on a
+ * healthy LAN transfer. Markers come from the zh-CN copy module so a future
+ * vocabulary rename only needs one source of truth.
+ */
+export async function installConnectionFailureObserver(page: Page) {
+  const markers = [...CONNECTION_FAILURE_MARKERS]
+  await page.evaluate((failureMarkers) => {
+    const state = window as Window & {
+      __misakaConnectionFailureSeen?: boolean
+      __misakaConnectionObserver?: MutationObserver
+    }
+    state.__misakaConnectionFailureSeen = false
+    state.__misakaConnectionObserver?.disconnect()
+    const inspect = () => {
+      const text = document.body.innerText
+      if (failureMarkers.some(marker => text.includes(marker))) {
+        state.__misakaConnectionFailureSeen = true
+      }
+    }
+    const observer = new MutationObserver(inspect)
+    observer.observe(document.body, { subtree: true, childList: true, characterData: true })
+    state.__misakaConnectionObserver = observer
+    inspect()
+  }, markers)
+}
+
+export async function expectNoReconnectingBanner(page: Page) {
+  // Spurious cleanup used to fire dc.onclose → attemptIceRestart →
+  // status='reconnecting' → outage banner on a peer that is actually healthy.
+  expect(await page.evaluate(() =>
+    (window as Window & { __misakaConnectionFailureSeen?: boolean }).__misakaConnectionFailureSeen,
+  )).toBe(false)
 }
