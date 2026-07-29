@@ -21,9 +21,11 @@ COPY --from=build /app/dist ./dist
 COPY package.json ./
 # TURN auto-provisioning persists state (monthly bytes, deny list, active
 # credentials) into /app/data. Mount a host volume in production so kill-switch
-# / bans survive restarts. Default permissions are fine for the node user.
-RUN mkdir -p /app/data
+# / bans survive restarts. Run as the non-root `node` user (uid 1000 in the
+# official image) so a container breakout does not start as root.
+RUN mkdir -p /app/data && chown -R node:node /app
 VOLUME ["/app/data"]
+USER node
 # Must match the runtime default in src/config.ts (PORT=9080) and the port
 # published by docker-compose.yml / deploy/docker-compose.prod.yml.
 EXPOSE 9080

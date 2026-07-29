@@ -4,15 +4,17 @@ import { z } from 'zod'
 import {
   nodes, channels, clusterChannelId, updatePeakConcurrent,
   markSocketAuthenticated, unmarkSocket, isSessionExpired,
+  resolveSessionByToken,
 } from './store.js'
 import { broadcast } from './activity.js'
-import { authMiddleware } from './http.js'
 import {
   WS_AUTH_GRACE_MS, TRUST_PROXY_ENABLED,
   WS_MAX_MESSAGE_BYTES, WS_MAX_OVERSIZE_STRIKES,
-  WS_MSG_BURST, WS_MSG_RATE_PER_SEC, WS_MAX_RATE_VIOLATIONS,
+  WS_MSG_BURST, WS_MSG_RATE_PER_SEC, WS_MAX_RATE_VIOLATIONS, WS_RATE_VIOLATION_WINDOW_MS,
   WS_MAX_BUFFERED_BYTES, WS_MAX_BUFFERED_HARD_BYTES, WS_SLOW_CONSUMER_GRACE_MS,
+  WS_MAX_PENDING_AUTH, WS_MAX_PENDING_AUTH_PER_IP,
 } from './config.js'
+import { terminateSession } from './session-lifecycle.js'
 import type { NodeSession } from './types.js'
 
 // Upper bound on how many peers a single session may block. Without a cap a
@@ -75,14 +77,47 @@ const wsMessageSchema = z.discriminatedUnion('t', [
  * Returns whether the frame was actually enqueued.
  */
 const slowConsumerSince = new WeakMap<WebSocket, number>()
+const slowConsumerTimers = new WeakMap<WebSocket, NodeJS.Timeout>()
+
+function clearSlowConsumerTimer(ws: WebSocket) {
+  const t = slowConsumerTimers.get(ws)
+  if (t) {
+    clearTimeout(t)
+    slowConsumerTimers.delete(ws)
+  }
+}
 
 function shedSlowConsumer(ws: WebSocket) {
   slowConsumerSince.delete(ws)
+  clearSlowConsumerTimer(ws)
   try { ws.close(1008, 'SLOW_CONSUMER') } catch { /* already gone */ }
   const t = setTimeout(() => {
     try { ws.terminate() } catch { /* already gone */ }
   }, 1000)
   t.unref?.()
+}
+
+function armSlowConsumerRecheck(ws: WebSocket) {
+  if (slowConsumerTimers.has(ws)) return
+  const t = setTimeout(() => {
+    slowConsumerTimers.delete(ws)
+    if (ws.readyState !== WebSocket.OPEN) return
+    const buffered = ws.bufferedAmount
+    if (buffered < WS_MAX_BUFFERED_BYTES) {
+      slowConsumerSince.delete(ws)
+      return
+    }
+    const since = slowConsumerSince.get(ws)
+    const now = Date.now()
+    if (buffered >= WS_MAX_BUFFERED_HARD_BYTES || (since !== undefined && now - since >= WS_SLOW_CONSUMER_GRACE_MS)) {
+      shedSlowConsumer(ws)
+      return
+    }
+    // Still over soft mark but within grace — re-arm.
+    armSlowConsumerRecheck(ws)
+  }, WS_SLOW_CONSUMER_GRACE_MS)
+  t.unref?.()
+  slowConsumerTimers.set(ws, t)
 }
 
 export function sendWithBackpressure(ws: WebSocket, payload: string): boolean {
@@ -93,12 +128,17 @@ export function sendWithBackpressure(ws: WebSocket, payload: string): boolean {
     const since = slowConsumerSince.get(ws)
     if (since === undefined) {
       slowConsumerSince.set(ws, now)
+      // Independent recheck timer: without this a peer that stops reading
+      // after the first soft-mark hit is never re-evaluated until the next
+      // send, and can hold ~1 MiB + socket + session until session TTL.
+      armSlowConsumerRecheck(ws)
     } else if (buffered >= WS_MAX_BUFFERED_HARD_BYTES || now - since >= WS_SLOW_CONSUMER_GRACE_MS) {
       shedSlowConsumer(ws)
     }
     return false
   }
   slowConsumerSince.delete(ws)
+  clearSlowConsumerTimer(ws)
   ws.send(payload)
   return true
 }
@@ -187,11 +227,16 @@ export function getWSIP(req: IncomingMessage): string {
  * There was no budget of any kind. Over-budget frames are dropped (dropping a
  * signaling frame is safe — the peers retry), and a socket that keeps
  * overrunning is closed.
+ *
+ * Violation counting is a SLIDING WINDOW, not a session-lifetime counter: an
+ * isolated burst ten minutes ago must not accumulate toward a close on a
+ * well-behaved client.
  */
 class RateBucket {
   private tokens = WS_MSG_BURST
   private last = Date.now()
-  violations = 0
+  /** Timestamps of recent over-budget frames (sliding window). */
+  private violationAt: number[] = []
 
   take(now = Date.now()): boolean {
     const elapsedSec = (now - this.last) / 1000
@@ -200,12 +245,130 @@ class RateBucket {
       this.last = now
     }
     if (this.tokens < 1) {
-      this.violations++
+      this.recordViolation(now)
       return false
     }
     this.tokens -= 1
     return true
   }
+
+  private recordViolation(now: number) {
+    const cutoff = now - WS_RATE_VIOLATION_WINDOW_MS
+    this.violationAt = this.violationAt.filter(t => t > cutoff)
+    this.violationAt.push(now)
+  }
+
+  get violations(): number {
+    const cutoff = Date.now() - WS_RATE_VIOLATION_WINDOW_MS
+    this.violationAt = this.violationAt.filter(t => t > cutoff)
+    return this.violationAt.length
+  }
+}
+
+// ── Pending-auth connection caps ─────────────────────────────────────
+//
+// Unauthenticated sockets used to be free: every upgrade allocated a socket,
+// listeners, a token bucket and a timer before AUTH, and MAX_NODES only
+// covered registered sessions. These counters gate admission at verifyClient
+// and release on AUTH / close / error / handshake-abort lease expiry.
+
+let pendingAuthGlobal = 0
+const pendingAuthByIp = new Map<string, number>()
+const pendingAuthSockets = new WeakSet<WebSocket>()
+
+/** How long a verifyClient reservation may sit unclaimed before auto-release. */
+const PENDING_AUTH_LEASE_MS = Number(process.env.WS_PENDING_AUTH_LEASE_MS) > 0
+  ? Number(process.env.WS_PENDING_AUTH_LEASE_MS)
+  : 10_000
+
+type PendingAuthReq = IncomingMessage & {
+  __pendingAuthIp?: string
+  __pendingAuthReleased?: boolean
+  __pendingAuthLease?: NodeJS.Timeout
+}
+
+function pendingIpOf(req: IncomingMessage): string {
+  return getWSIP(req)
+}
+
+/**
+ * Called from verifyClient BEFORE the socket is created. Returns ok:false
+ * with a reason when the pending-auth budget is exhausted.
+ *
+ * Reservation is leased: if the handshake aborts after admission and the
+ * `connection` event never fires, the lease timer releases the slot so a
+ * remote client cannot permanently pin the global/per-IP counters.
+ */
+export function checkPendingAuthAdmission(req: IncomingMessage): { ok: true } | { ok: false; reason: string } {
+  const ip = pendingIpOf(req)
+  if (pendingAuthGlobal >= WS_MAX_PENDING_AUTH) {
+    return { ok: false, reason: 'PENDING_AUTH_FULL' }
+  }
+  if ((pendingAuthByIp.get(ip) ?? 0) >= WS_MAX_PENDING_AUTH_PER_IP) {
+    return { ok: false, reason: 'PENDING_AUTH_IP_FULL' }
+  }
+  pendingAuthGlobal++
+  pendingAuthByIp.set(ip, (pendingAuthByIp.get(ip) ?? 0) + 1)
+  const r = req as PendingAuthReq
+  r.__pendingAuthIp = ip
+  r.__pendingAuthReleased = false
+  // Lease: release if connection never claims the reservation.
+  const lease = setTimeout(() => {
+    releasePendingAuth(req)
+  }, PENDING_AUTH_LEASE_MS)
+  lease.unref?.()
+  r.__pendingAuthLease = lease
+  return { ok: true }
+}
+
+/**
+ * Release a reservation reserved in verifyClient. Idempotent. Call from:
+ * connection close/error/AUTH success, or the lease timer on handshake abort.
+ */
+export function releasePendingAuth(req: IncomingMessage, ws?: WebSocket): void {
+  const r = req as PendingAuthReq
+  if (r.__pendingAuthReleased) return
+  if (ws && !pendingAuthSockets.has(ws)) {
+    // Socket path already released (AUTH success) — still clear lease.
+    if (r.__pendingAuthLease) {
+      clearTimeout(r.__pendingAuthLease)
+      r.__pendingAuthLease = undefined
+    }
+    return
+  }
+  if (ws) pendingAuthSockets.delete(ws)
+  if (r.__pendingAuthLease) {
+    clearTimeout(r.__pendingAuthLease)
+    r.__pendingAuthLease = undefined
+  }
+  r.__pendingAuthReleased = true
+  const ip = r.__pendingAuthIp ?? pendingIpOf(req)
+  pendingAuthGlobal = Math.max(0, pendingAuthGlobal - 1)
+  const n = (pendingAuthByIp.get(ip) ?? 1) - 1
+  if (n <= 0) pendingAuthByIp.delete(ip)
+  else pendingAuthByIp.set(ip, n)
+}
+
+function claimPendingAuthSocket(ws: WebSocket, req: IncomingMessage) {
+  pendingAuthSockets.add(ws)
+  // Connection owns release from here (AUTH / close / error). Cancel the
+  // handshake-abort lease so a long AUTH grace cannot free the slot early.
+  const r = req as PendingAuthReq
+  if (r.__pendingAuthLease) {
+    clearTimeout(r.__pendingAuthLease)
+    r.__pendingAuthLease = undefined
+  }
+}
+
+/** Test hooks. */
+export function _pendingAuthCountsForTest(): { global: number; byIp: Map<string, number> } {
+  return { global: pendingAuthGlobal, byIp: new Map(pendingAuthByIp) }
+}
+
+/** Test hook — force-clear all pending-auth counters (lease timers too). */
+export function _resetPendingAuthForTest(): void {
+  pendingAuthGlobal = 0
+  pendingAuthByIp.clear()
 }
 
 export function setupWS(wss: WebSocketServer) {
@@ -216,13 +379,30 @@ export function setupWS(wss: WebSocketServer) {
     // Only one ERROR reply per second while a socket is over budget — the
     // reply itself must not become the amplification.
     let lastRateNoticeAt = 0
+    let pendingReleased = false
+
+    // verifyClient already reserved a pending-auth slot; claim it on the socket.
+    claimPendingAuthSocket(ws, req)
+
+    const releasePendingOnce = () => {
+      if (pendingReleased) return
+      pendingReleased = true
+      releasePendingAuth(req, ws)
+    }
 
     // AUTH grace timer: a freshly-opened WS has WS_AUTH_GRACE_MS to send a
-    // valid AUTH frame. If it doesn't, we close 4001 AUTH_TIMEOUT. This
-    // prevents an attacker from cheaply holding idle sockets forever.
+    // valid AUTH frame. Contract 3: close with 4003 AUTH_TIMEOUT (not 4001)
+    // so the client reconnects with the same token instead of firing
+    // onAuthInvalid. A terminate backstop ensures a peer that ignores the
+    // close frame cannot hold the FD forever.
     const authTimer = setTimeout(() => {
       if (session) return  // raced an AUTH right before the timer fired; no-op
-      try { ws.close(4001, 'AUTH_TIMEOUT') } catch { /* already gone */ }
+      try { ws.close(4003, 'AUTH_TIMEOUT') } catch { /* already gone */ }
+      const term = setTimeout(() => {
+        try { ws.terminate() } catch { /* already gone */ }
+        releasePendingOnce()
+      }, 1000)
+      term.unref?.()
     }, WS_AUTH_GRACE_MS)
     authTimer.unref?.()
 
@@ -267,16 +447,27 @@ export function setupWS(wss: WebSocketServer) {
       if (!session) {
         if (msg.t !== 'AUTH') {
           clearTimeout(authTimer)
-          ws.close(4001, 'AUTH_REQUIRED')
+          // Contract 3: first frame was not AUTH → 4003 AUTH_EXPECTED.
+          ws.close(4003, 'AUTH_EXPECTED')
+          releasePendingOnce()
           return
         }
-        const s = authMiddleware(msg.token)
-        if (!s) {
+        // Contract 3: 4001 = invalid/unknown token; 4002 = expired session.
+        const resolved = resolveSessionByToken(msg.token)
+        if (resolved.kind !== 'ok') {
           clearTimeout(authTimer)
-          ws.close(4002, 'INVALID_TOKEN')
+          if (resolved.kind === 'expired') {
+            ws.close(4002, 'SESSION_EXPIRED')
+          } else {
+            ws.close(4001, 'INVALID_TOKEN')
+          }
+          releasePendingOnce()
           return
         }
+        const s = resolved.session
         clearTimeout(authTimer)
+        // Hand off from pending-auth quota to authenticated session.
+        releasePendingOnce()
         // Reconnect (mobile network handoff, sleep/wake) re-sends AUTH with the
         // same cached token, so `s` is the SAME shared NodeSession and its old
         // socket is still half-open. Close it BEFORE re-pointing, otherwise the
@@ -319,39 +510,27 @@ export function setupWS(wss: WebSocketServer) {
 
     ws.on('close', () => {
       clearTimeout(authTimer)
-      // Always drop the index entry, even on a superseded socket — the guard
-      // below returns early for those and would otherwise leak them.
-      unmarkSocket(ws)
-      if (!session) return
-      // A superseded socket (a reconnect already re-attached a newer ws to this
-      // shared session) must NOT tear the session down. Without this guard the
-      // stale socket's late close nulls session.socket — which now points at the
-      // live reconnected ws — deletes it from its channel, and broadcasts
-      // PEER_LEFT, rendering a fully-connected peer invisible/unreachable.
-      if (session.socket !== ws) return
-      session.socket = null
-      session.lastSeen = Date.now()
-
-      // Notify channel peers — by sessionId
-      if (session.channelId) {
-        const ch = channels.get(session.channelId)
-        if (ch) {
-          for (const peerSid of ch) {
-            if (peerSid !== session.sessionId) {
-              forwardToSession(peerSid, { t: 'PEER_LEFT', sessionId: session.sessionId, nodeId: session.nodeId })
-            }
-          }
-          ch.delete(session.sessionId)
-          if (ch.size === 0) channels.delete(session.channelId)
-        }
-        session.channelId = null
+      clearSlowConsumerTimer(ws)
+      releasePendingOnce()
+      if (!session) {
+        // Never authenticated — drop any partial auth index entry.
+        unmarkSocket(ws)
+        return
       }
-
-      broadcast({ type: 'leave', nodeId: session.nodeId, message: `御坂 ${session.nodeId} 号通信终止` })
+      // Contract 5: single terminal path. Clean WS disconnect preserves the
+      // session so the client can reconnect with the same token; full eviction
+      // is /api/release, expiry cleanup, or re-register.
+      terminateSession(session, {
+        onlyIfSocket: ws,
+        preserveSession: true,
+        closeSocket: false,
+      })
       updatePeakConcurrent()
     })
 
-    ws.on('error', () => { /* swallow */ })
+    ws.on('error', () => {
+      releasePendingOnce()
+    })
   })
 }
 

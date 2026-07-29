@@ -84,16 +84,32 @@ async function testQrTokenPasscodeShape() {
 }
 
 async function testQrRedeemRateLimit() {
-  // Issue 12 redeem attempts; with the dedicated limit at 5/min, we should
-  // see at least one 429 by the end. We feed garbage qrTokens — the rate
-  // limit MUST trip before we even look at the body, otherwise the cap
-  // would be bypassable by always using known-bad tokens that 400 fast.
-  let saw429 = false
-  for (let i = 0; i < 12; i++) {
+  // Restart with a known limit on a clean window so earlier cases in this
+  // file cannot burn the budget (exact-boundary requires a zeroed counter).
+  killChild(serverProcess)
+  const LIMIT = 5
+  serverProcess = startServer({ QR_REDEEM_RATE_LIMIT: String(LIMIT) })
+  await waitForServer()
+
+  // Exact boundary: QR_REDEEM_RATE_LIMIT=5.
+  //   1..5 → not 429 (may be 400 INVALID_QR_TOKEN for garbage tokens)
+  //   6    → 429
+  //   7    → still 429
+  // Garbage tokens still consume the dedicated budget (limit is before body).
+  for (let i = 0; i < LIMIT; i++) {
     const r = await postRaw('/qr-redeem', { qrToken: `bogus-${i}`, myNodeId: 1, myPassCode: '111111' })
-    if (r.status === 429) { saw429 = true; break }
+    if (r.status === 429) {
+      throw new Error(`attempt ${i + 1}/${LIMIT} must not be 429 yet, got 429`)
+    }
   }
-  if (!saw429) throw new Error('未触发 qr-redeem 专用速率限制')
+  const trip = await postRaw('/qr-redeem', { qrToken: 'bogus-trip', myNodeId: 1, myPassCode: '111111' })
+  if (trip.status !== 429) {
+    throw new Error(`attempt ${LIMIT + 1} must be 429, got ${trip.status}`)
+  }
+  const again = await postRaw('/qr-redeem', { qrToken: 'bogus-again', myNodeId: 1, myPassCode: '111111' })
+  if (again.status !== 429) {
+    throw new Error(`attempt ${LIMIT + 2} must still be 429, got ${again.status}`)
+  }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -111,7 +127,7 @@ async function postRaw(path, body) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
 
-function startServer() {
+function startServer(extraEnv = {}) {
   const proc = spawn('node', ['dist/index.js'], {
     cwd: SERVER_DIR,
     env: {
@@ -119,8 +135,10 @@ function startServer() {
       PORT: String(PORT),
       MAX_NODES: '200',
       TURN_AUTO_ENABLED: 'false',
-      // tighter cap for the test so we don't have to flood
-      QR_REDEEM_RATE_LIMIT: '5',
+      // Default roomy so shape tests don't trip the dedicated budget; the
+      // exact-boundary case restarts with QR_REDEEM_RATE_LIMIT=5.
+      QR_REDEEM_RATE_LIMIT: '100',
+      ...extraEnv,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   })

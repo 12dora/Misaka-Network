@@ -250,21 +250,32 @@ async function testSlowReaderDropped() {
   wsB.pause()
   wsB._socket.pause()
 
-  // A floods large-but-legal SDP frames at B. Without a bufferedAmount guard
-  // the server queues every one of them for B forever. Sustained for several
-  // seconds so the stuck-socket grace clock (500 ms here) actually elapses
-  // while forwards are still being attempted.
+  // Burst enough to push B over the soft mark, then STOP sending. The grace
+  // timer must fire on its own — a "next send only" implementation would
+  // leave B connected forever once the flood stops.
   const blob = 'x'.repeat(48 * 1024)
   const frame = JSON.stringify({ t: 'SIGNAL_SDP', targetSessionId: b.sessionId, sdp: { blob } })
-  for (let round = 0; round < 20; round++) {
-    for (let i = 0; i < 40; i++) wsA.send(frame)
-    await sleep(200)
-    if ((await onlineNodes(PORT_D)) === 1) break
-  }
+  for (let i = 0; i < 80; i++) wsA.send(frame)
 
-  // The server must shed B rather than grow its send queue without bound.
-  const dropped = await waitForCond(async () => (await onlineNodes(PORT_D)) === 1, 15000)
-  assert(dropped, '不读取数据的慢客户端必须被服务端断开')
+  // Processing barrier: a PING after the flood must elicit PONG only once the
+  // server has drained every prior frame from A's receive queue. Without this,
+  // on a slow runner the soft-mark (and grace arm) may not have been reached
+  // yet when we start waiting — and a next-send-only implementation can still
+  // pass if later processing coincides with the long wait window.
+  const barrierId = msgsA.length
+  wsA.send(JSON.stringify({ t: 'PING' }))
+  await waitFor(() => msgsA.slice(barrierId).some(m => m.t === 'PONG'), 5000)
+
+  // No further client frames during the grace window.
+  const graceStart = Date.now()
+
+  // The independent recheck timer (WS_SLOW_CONSUMER_GRACE_MS=500) must shed B
+  // without any additional traffic from A. Bound the wait relative to grace
+  // so we do not quietly accept a multi-second "eventually dropped" pass.
+  const dropped = await waitForCond(async () => (await onlineNodes(PORT_D)) === 1, 3000)
+  assert(dropped, '慢客户端必须在 grace 内被独立定时器断开（无需继续发送）')
+  const elapsed = Date.now() - graceStart
+  assert(elapsed < 2500, `shed must follow grace timer, not a long poll (elapsed ${elapsed}ms)`)
 
   // …and A must be untouched: shedding a slow reader is not allowed to take
   // the sender down with it.

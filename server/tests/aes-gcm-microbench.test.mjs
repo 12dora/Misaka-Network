@@ -1,11 +1,16 @@
 #!/usr/bin/env node
 /**
- * 1GB 文件内存压测
+ * Node AES-GCM micro-benchmark (NOT a product transfer correctness gate).
  *
- * 模拟 1GB 文件的 chunk → encrypt → decrypt → assemble 全流程，
- * 逐块 GC 友好的 sender 路径 vs 全部在内存中 assemble 的 Blob 路径。
+ * This script encrypts/decrypts synthetic chunks with Node's crypto module
+ * using a 64 KiB chunk size. Production transfer uses 252 KiB chunks and the
+ * browser WebCrypto engine in client/src/lib/ — this benchmark does NOT import
+ * any of that code. Keep it as a throughput/memory smoke for the CI monthly
+ * workflow, but never treat a pass here as proof of end-to-end transfer
+ * integrity. A real browser-side stress test against the production engine is
+ * follow-up work.
  *
- * Usage: cd server && node tests/stress-1gb.test.mjs
+ * Usage: cd server && npm run test:stress
  */
 
 import crypto from 'crypto'

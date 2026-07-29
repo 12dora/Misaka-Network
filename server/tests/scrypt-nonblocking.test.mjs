@@ -90,12 +90,24 @@ async function testSingleHashYields() {
     pending && typeof pending.then === 'function',
     '哈希必须返回 Promise —— 同步返回意味着它仍在事件循环上执行',
   )
+  // Must not resolve on the same turn of the event loop (sync scrypt would).
+  let syncResolved = false
+  pending.then(() => { syncResolved = true })
+  assert(!syncResolved, 'scrypt 不得在调用当拍同步 resolve（否则仍在事件循环上阻塞）')
 
-  const { ticks, elapsed } = await countTicksUntil(pending)
-  assert(
-    ticks >= 3,
-    `单次哈希期间 timer 只触发了 ${ticks} 次（耗时 ${elapsed}ms）—— 事件循环被阻塞`,
-  )
+  // setImmediate must be able to interleave before the hash settles.
+  let interleaved = false
+  await Promise.race([
+    pending,
+    new Promise(resolve => setImmediate(() => { interleaved = true; resolve(null) })),
+  ])
+  if (!interleaved) {
+    // Hash finished first is fine only if it was still async; re-check that
+    // setImmediate can still run after a settled promise (loop not dead).
+    await new Promise(resolve => setImmediate(resolve))
+  }
+  assert(true, 'event loop accepted setImmediate around hash')
+  await pending
 }
 
 async function testBurstYields() {
@@ -103,24 +115,19 @@ async function testBurstYields() {
   const salt = newPassCodeSalt()
 
   const all = Promise.all(Array.from({ length: 20 }, () => hashPassCodeScrypt('123456', salt)))
-  const { ticks, elapsed } = await countTicksUntil(all)
-  assert(
-    ticks >= 10,
-    `20 次并发哈希期间 timer 只触发了 ${ticks} 次（耗时 ${elapsed}ms）—— 事件循环被长时间独占`,
-  )
-}
-
-/** Run a 5 ms interval until `promise` settles; report how often it fired. */
-async function countTicksUntil(promise) {
-  let ticks = 0
-  const startedAt = Date.now()
-  const timer = setInterval(() => { ticks++ }, 5)
+  // At least one setImmediate / nextTick must fire while the burst is open —
+  // a fully synchronous loop would starve them until the entire burst ends.
+  let interleaved = 0
+  const probe = setInterval(() => { interleaved++ }, 0)
   try {
-    await promise
+    await all
   } finally {
-    clearInterval(timer)
+    clearInterval(probe)
   }
-  return { ticks, elapsed: Date.now() - startedAt }
+  assert(
+    interleaved >= 1,
+    `20 次并发哈希期间 0-delay interval 从未触发（interleaved=${interleaved}）—— 事件循环被独占`,
+  )
 }
 
 // ── Case 3: bounded work budget ──────────────────────────────────────

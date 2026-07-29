@@ -40,6 +40,7 @@ const REJECTED = [
   ['MAX_NODES',                     '1e3x',  '部分解析'],
   ['WS_AUTH_GRACE_MS',              'NaN',   'NaN grace 让 AUTH 超时不再触发'],
   ['TURN_AUTO_ENABLED',             'maybe', '布尔量只接受 true/false'],
+  ['TRUST_PROXY',                   'true',  '布尔 true 允许伪造 XFF；必须用 hop 数或 CIDR'],
 ]
 
 const procs = []

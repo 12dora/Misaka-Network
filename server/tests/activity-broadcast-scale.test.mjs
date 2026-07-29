@@ -138,17 +138,35 @@ async function testScale(store, activity) {
   }
   activity.setWSS({ clients: new Set(sockets) })
 
-  const startedAt = Date.now()
-  activity.broadcast({ type: 'transfer', nodeId: 7, message: 'scale' })
-  const elapsed = Date.now() - startedAt
+  // Prove O(n) by counting session-map scans. The old O(clients × sessions)
+  // path called nodes.values() (or equivalent) once per client. The index
+  // path iterates authenticatedSockets only — nodes.values must not be
+  // scanned once per delivery. An O(n²) implementation that still delivers
+  // one frame per socket would fail this operation count.
+  let sessionScans = 0
+  const origValues = store.nodes.values.bind(store.nodes)
+  store.nodes.values = function* valuesInstrumented() {
+    sessionScans++
+    yield* origValues()
+  }
 
+  activity.broadcast({ type: 'transfer', nodeId: 7, message: 'scale' })
+
+  store.nodes.values = origValues
+
+  let delivered = 0
+  for (const s of sockets) {
+    if (s.sent.length === 1) delivered++
+  }
+  assertEq(delivered, SCALE, `一次广播应对全部 ${SCALE} 个已认证 socket 各投递 1 帧（实际 ${delivered}）`)
+  // O(n) index path: zero (or O(1)) full-map scans — never one per socket.
+  assert(
+    sessionScans < SCALE / 10,
+    `broadcast must not scan nodes per socket (sessionScans=${sessionScans}, SCALE=${SCALE}) — O(n²) regression`,
+  )
   assertEq(sockets[0].sent.length, 1, '第一个 socket 应收到事件')
   assertEq(sockets[SCALE - 1].sent.length, 1, '最后一个 socket 也应收到事件')
-  assert(
-    elapsed < SCALE_BUDGET_MS,
-    `${SCALE} 个 socket 的一次广播耗时 ${elapsed}ms（上限 ${SCALE_BUDGET_MS}ms）—— 说明仍是每个 socket 再扫一遍 session 的 O(n²)`,
-  )
-  console.log(`      (${SCALE} sockets → ${elapsed}ms)`)
+  console.log(`      (${SCALE} sockets → ${delivered} deliveries, sessionScans=${sessionScans})`)
 }
 
 async function testBudget(store, activity, config) {
