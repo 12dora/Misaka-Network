@@ -54,6 +54,8 @@ describe('sendFileParallel: zero-byte file', () => {
     const empty = new File([], 'empty.txt', { type: 'text/plain' })
     const progress: Array<[number, number]> = []
 
+    // No peer protocol registered → v1. v1 tops out at `delivered` (never
+    // `saved`); only transfer-done promotes to saved under v2/v3.
     await expect(
       sendFileParallel(
         [dc], empty,
@@ -62,7 +64,7 @@ describe('sendFileParallel: zero-byte file', () => {
         undefined,
         { onProgress: (sent, total) => progress.push([sent, total]) },
       ),
-    ).resolves.toMatchObject({ state: 'saved', acked: false })
+    ).resolves.toMatchObject({ state: 'delivered', acked: false, legacyPeer: true })
 
     // Final tick must be 1/1, not 0/0 (which renders NaN%).
     expect(progress.at(-1)).toEqual([1, 1])
