@@ -70,12 +70,3 @@ export interface ActivityEvent {
   message: string
 }
 
-export type WSClientMessage =
-  | { t: 'AUTH'; token: string }
-  | { t: 'JOIN_CLUSTER' }                                       // auto-join own identity cluster
-  | { t: 'LEAVE_CHANNEL' }
-  | { t: 'SIGNAL_SDP'; targetSessionId: string; sdp: object }
-  | { t: 'SIGNAL_ICE'; targetSessionId: string; candidate: object }
-  | { t: 'SIGNAL_ICE_END'; targetSessionId: string; candidate?: object }
-  | { t: 'PING' }
-  | { t: 'BLOCK'; sessionId: string }

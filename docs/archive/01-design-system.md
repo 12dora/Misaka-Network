@@ -5,9 +5,9 @@
 **和风海报美学**：钴蓝大背景 + 御坂美琴整身立绘 + 中日混排字标 + 白色卡片。**不**走赛博暗黑终端方向（无辉光、无扫描线、无 glitch、无机能字体）。
 
 参考样图：
-- [sample/home-page-sample.jpg](sample/home-page-sample.jpg) — 首页构图
-- [sample/misaka.webp](sample/misaka.webp) — 立绘
-- [sample/misaka-text.webp](sample/misaka-text.webp) — 字标
+- [home-page-sample.jpg](../sample/home-page-sample.jpg) — 首页构图
+- [misaka.webp](../../client/public/assets/misaka.webp) — 立绘（生产资产）
+- [misaka-text.webp](../sample/misaka-text.webp) — 字标
 
 ## 配色
 

@@ -1,3 +1,5 @@
+> **已由 [AUDIT_REPAIR_COMPLETION_2026-07-27.md](../AUDIT_REPAIR_COMPLETION_2026-07-27.md) 取代。** 本文件仅为历史交接快照；其中 “Wave 3/4 未开始” 与 “已知 flake” 等状态均以 completion 文档为准，请勿据此重做或忽略真实失败。
+
 # 审计修复交接状态（CODE_AUDIT_2026-07-27）
 
 > 本文件记录 `docs/CODE_AUDIT_2026-07-27.md` 中 107 个问题的修复进度、编排规则与未完成事项。

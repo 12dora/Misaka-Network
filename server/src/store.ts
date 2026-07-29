@@ -311,16 +311,6 @@ export function _seedTokenTombstoneForTest(token: string, until: number): void {
   expiredTokenTombstones.set(token, until)
 }
 
-export function findSessionsByNodeAndHash(nodeId: number, passCodeHash: string): NodeSession[] {
-  const now = Date.now()
-  const out: NodeSession[] = []
-  for (const s of nodes.values()) {
-    if (isSessionExpired(s, now)) continue
-    if (s.nodeId === nodeId && s.passCodeHash === passCodeHash) out.push(s)
-  }
-  return out
-}
-
 // ── Passcode hashing ────────────────────────────────────────────────
 //
 // Two hashes are kept per session, with very different jobs:
@@ -399,11 +389,6 @@ function releaseScryptSlot(): void {
   const next = scryptWaiters.shift()
   if (next) next()
   else scryptInFlight--
-}
-
-/** Test/diagnostic hook — current semaphore occupancy. */
-export function scryptQueueDepth(): { inFlight: number; queued: number } {
-  return { inFlight: scryptInFlight, queued: scryptWaiters.length }
 }
 
 /** Test hook — number of scrypt hashes started (occupied wrong-passcode path). */
@@ -543,14 +528,6 @@ export function countNodesByIp(ip: string): number {
   let count = 0
   for (const n of nodes.values()) {
     if (n.ip === ip) count++
-  }
-  return count
-}
-
-export function countReportsForTarget(nodeId: number, since: number): number {
-  let count = 0
-  for (const r of reports) {
-    if (r.targetNodeId === nodeId && r.reportedAt > since) count++
   }
   return count
 }

@@ -34,16 +34,18 @@ docker run -d --name misaka-signaling -p 19080:9080 misaka-signaling
 
 ## 环境变量
 
-所有配置集中在 [`src/config.ts`](src/config.ts)。以下为可通过环境变量覆盖的运行时参数：
+完整清单与注释见 **[`.env.example`](.env.example)**（与 `deploy/.env.example` 中 TURN 段同步）。读取入口是 `src/config.ts`；清理间隔、WS 边界、scrypt 队列、TURN 配额等大量参数都是 **env 驱动**，不是只能改源码的编译时常量。
+
+常用项：
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `PORT` | `9080` | 监听端口 |
-| `MAX_NODES` | 不限制 | 全局节点上限，`0` 表示不限制 |
+| `MAX_NODES` | `5000` | 全局节点上限；**仅 `MAX_NODES=0` 表示不限制** |
 | `RATE_LIMIT_PER_MIN` | `60` | API 每分钟限流次数（按 IP） |
 | `SESSION_TTL_MS` | `1800000` | 登录 token 有效期（毫秒），默认 30 分钟 |
 
-其余参数（节点锁定时长、清理间隔、举报阈值等）为编译时常量，直接在 `src/config.ts` 中修改。
+Cloudflare TURN 运维：`TURN_CF_API_TOKEN` 用于签发/撤销（启动校验必填）；可选 `TURN_CF_ANALYTICS_API_TOKEN` 仅给 GraphQL Analytics 读权限，缺省回退到签发 token。
 
 ## 自托管生产部署
 

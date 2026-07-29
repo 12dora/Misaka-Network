@@ -6,7 +6,7 @@ import {
   nodes, channels, qrTokens, reports, stats, getOnlineCount, getLongestUptimeMs, countNodesByIp,
   getCpuUsagePercent, findSessionByToken, attemptLocks, attemptKey,
   nodeFreezes, hashPassCodeIdentity, newPassCodeRecord, verifyAndMaybeUpgrade,
-  deriveCustomIdentifier, redactCustomIdentifier, ScryptBusyError,
+  ScryptBusyError,
   deriveTurnPrincipal, mintReRegisterProof, indexReRegisterProof,
   resolveReRegisterProof, rotateReRegisterProof,
 } from './store.js'
@@ -50,11 +50,6 @@ if (TEST_INSTANCE_NONCE) {
     next()
   })
 }
-
-// Re-export so legacy import sites keep working without touching the new
-// derivation location (which lives in store.js to avoid a circular import
-// between turn.ts and http.ts).
-export { deriveCustomIdentifier, redactCustomIdentifier }
 
 // Canonical client-IP extractor used by every HTTP handler. Express'
 // `req.ip` already honours `app.set('trust proxy', 1)`, so X-Forwarded-For's

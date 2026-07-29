@@ -116,7 +116,7 @@ TURN 自动下发落地：服务端按 sessionId 申请 Cloudflare 短时效凭�
 - TURN 与自托管链路仍缺真实公网验证（含域名证书签发、80/443 入站、防火墙、coturn relay 可达性）
 - ICE 三场景（host/srflx/relay）尚未实测；已支持复制诊断文本留痕（节点/信道/ICE路径/采集时间/状态）
 - Service Worker 当前仅做 app shell + 静态资源离线缓存；`/api` 与 `/ws` 不缓存（实时信令与会话语义保持在线优先）
-- PWA 图标当前使用 `favicon.svg` 作为 manifest icon（`purpose: any maskable`）；后续如需商店级上架可再补 192/512 位图资源
+- PWA 图标使用 `assets/misaka-logo.webp` 作为 favicon / manifest icon（`purpose: any maskable`）；后续如需商店级上架可再补 192/512 位图资源
 - File System Access API 仅在 Chromium 系浏览器可用，Safari/Firefox 使用 OPFS 磁盘缓存替代（相同效果）
 - OPFS 写入可能因磁盘配额不足失败 → 自动降级 IndexedDB + Blob 内存组装
 - Lighthouse 已完成 desktop 实测；移动端与弱网分数仍建议后续补测（当前项仅以 desktop 达标闭环）
