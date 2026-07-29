@@ -66,18 +66,33 @@ async function testFreezeTrips() {
   const owner = await postFrom('/register', { nodeId: NODE_ID, passCode: CORRECT }, ownerIp)
   if (!owner.token) throw new Error('owner 注册失败: ' + JSON.stringify(owner))
 
-  // Now rotate through 10 distinct attacker IPs, 1 wrong attempt each.
-  // Threshold is 8 → freeze should trigger by attempt 8.
-  let freezeSeen = false
-  for (let i = 0; i < 10; i++) {
+  // Exact boundary: threshold is 8. Freeze is engaged when the 8th failure is
+  // recorded, but the response for that request is still NODE_OCCUPIED (freeze
+  // is checked at the start of the next request). So:
+  //   attempts 1..8 → not NODE_FROZEN
+  //   attempt 9     → NODE_FROZEN
+  //   attempt 10    → still NODE_FROZEN
+  // A "eventually frozen" assertion would still pass if the threshold were
+  // silently lowered to 1.
+  const THRESHOLD = 8
+  for (let i = 0; i < THRESHOLD; i++) {
     const ip = `198.51.100.${100 + i}`
     const r = await postFrom('/register', { nodeId: NODE_ID, passCode: '000000' }, ip)
     if (r.error === 'NODE_LOCKED' && r.reason === 'NODE_FROZEN') {
-      freezeSeen = true
-      break
+      throw new Error(`attempt ${i + 1}/${THRESHOLD} must not return NODE_FROZEN yet, got ${JSON.stringify(r)}`)
+    }
+    if (r.error !== 'NODE_OCCUPIED' && !(r.error === 'NODE_LOCKED' && r.reason === 'WRONG_PASSCODE')) {
+      throw new Error(`attempt ${i + 1} expected NODE_OCCUPIED, got ${JSON.stringify(r)}`)
     }
   }
-  if (!freezeSeen) throw new Error('IP 轮换 8+ 次后应触发 NODE_FROZEN，但未出现')
+  const trip = await postFrom('/register', { nodeId: NODE_ID, passCode: '000000' }, '198.51.100.200')
+  if (trip.error !== 'NODE_LOCKED' || trip.reason !== 'NODE_FROZEN') {
+    throw new Error(`attempt ${THRESHOLD + 1} must be NODE_FROZEN, got ${JSON.stringify(trip)}`)
+  }
+  const again = await postFrom('/register', { nodeId: NODE_ID, passCode: '000000' }, '198.51.100.201')
+  if (again.error !== 'NODE_LOCKED' || again.reason !== 'NODE_FROZEN') {
+    throw new Error(`attempt ${THRESHOLD + 2} must still be NODE_FROZEN, got ${JSON.stringify(again)}`)
+  }
 }
 
 async function testFreezeBlocksOwnerNewRegister() {

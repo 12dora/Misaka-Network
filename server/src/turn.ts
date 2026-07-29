@@ -29,6 +29,7 @@ import {
 } from './config.js'
 import {
   getTurnState, markDirty, rollMonthIfNeeded, isTurnStateReady, markTurnStateRecovered,
+  flushSecurityState,
   type ActiveCredential,
 } from './persist.js'
 import { deriveCustomIdentifier, redactCustomIdentifier } from './store.js'
@@ -115,7 +116,16 @@ function dropCachedCredential(customIdentifier: string) {
  * Issue short-lived TURN credentials for a session. All gates run here so
  * that a malicious client cannot bypass enforcement by hooking its own code.
  */
-export async function issueCredentials(sessionId: string, ip: string): Promise<IssueResult> {
+/**
+ * @param turnPrincipal Restart-stable deny key (HMAC over identity). When
+ *   omitted (legacy call sites / tests) we fall back to a session-bound
+ *   principal so deny still works within one process lifetime.
+ */
+export async function issueCredentials(
+  sessionId: string,
+  ip: string,
+  turnPrincipal?: string,
+): Promise<IssueResult> {
   if (!TURN_AUTO_ENABLED) return { ok: false, reason: 'DISABLED' }
   if (!turnConfigured()) return { ok: false, reason: 'NOT_CONFIGURED' }
   // SECURITY-009: an unreadable snapshot means we do not know this month's
@@ -138,12 +148,18 @@ export async function issueCredentials(sessionId: string, ip: string): Promise<I
   }
 
   // customIdentifier is a one-way derivation of (sessionId, SERVER_SECRET);
-  // CF logs never see the sessionId directly.
+  // CF logs never see the sessionId directly. Deny uses the restart-stable
+  // principal so a re-register after restart cannot dodge a ban.
   const customIdentifier = deriveCustomIdentifier(sessionId)
+  const principal = turnPrincipal && turnPrincipal.length > 0
+    ? turnPrincipal
+    : `sess:${customIdentifier}`
 
   // SECURITY-010: durable denial. Checked before the cache so a session that
   // was revoked for abuse cannot keep replaying its cached grant.
   if (isDenied(`ip:${ip}`, now)) return { ok: false, reason: 'IP_BANNED' }
+  if (isDenied(`principal:${principal}`, now)) return { ok: false, reason: 'SESSION_BANNED' }
+  // Honour legacy cid: keys from older snapshots until they expire.
   if (isDenied(`cid:${customIdentifier}`, now)) return { ok: false, reason: 'SESSION_BANNED' }
 
   const running = inFlightIssues.get(customIdentifier)
@@ -158,7 +174,7 @@ export async function issueCredentials(sessionId: string, ip: string): Promise<I
     dropCachedCredential(customIdentifier)
   }
 
-  const task = issueFreshCredentials(sessionId, ip, customIdentifier)
+  const task = issueFreshCredentials(sessionId, ip, customIdentifier, principal)
   inFlightIssues.set(customIdentifier, task)
   try {
     return await task
@@ -167,7 +183,12 @@ export async function issueCredentials(sessionId: string, ip: string): Promise<I
   }
 }
 
-async function issueFreshCredentials(sessionId: string, ip: string, customIdentifier: string): Promise<IssueResult> {
+async function issueFreshCredentials(
+  sessionId: string,
+  ip: string,
+  customIdentifier: string,
+  turnPrincipal: string,
+): Promise<IssueResult> {
   const state = getTurnState()
   const now = Date.now()
 
@@ -202,6 +223,7 @@ async function issueFreshCredentials(sessionId: string, ip: string, customIdenti
     sessionId,
     customIdentifier,
     ip,
+    turnPrincipal,
     issuedAt: now,
     expiresAt,
     pessimisticBytes,
@@ -326,24 +348,39 @@ function isDenied(key: string, now: number): boolean {
 }
 
 /**
- * Persist a denial for the abusive session and, once an IP has produced enough
- * abusive sessions, for the IP itself. Session denial is immediate; the IP
- * level needs a strike count because carrier-grade NAT collapses many unrelated
- * users onto one address. `TURN_BAN_DURATION_SEC=0` disables denial entirely.
+ * Persist a denial for the abusive principal and, once an IP has produced enough
+ * abusive sessions, for the IP itself. Principal denial is immediate and
+ * restart-stable; the IP level needs a strike count because carrier-grade NAT
+ * collapses many unrelated users onto one address.
+ * `TURN_BAN_DURATION_SEC=0` disables denial entirely.
  */
-function applyDeny(customIdentifier: string, ip: string, reason: string) {
+function applyDeny(principal: string, ip: string, reason: string, customIdentifier?: string) {
   if (TURN_BAN_DURATION_SEC <= 0) return
   const state = getTurnState()
   const now = Date.now()
   const until = now + TURN_BAN_DURATION_SEC * 1000
-  state.denyList[`cid:${customIdentifier}`] = { until, at: now, reason, ip }
+  state.denyList[`principal:${principal}`] = { until, at: now, reason, ip }
+  // Keep a cid: entry too when we have one, so in-process re-issues of the same
+  // session still hit immediately without consulting the principal map.
+  if (customIdentifier) {
+    state.denyList[`cid:${customIdentifier}`] = { until, at: now, reason, ip }
+  }
 
   const strikes = Object.entries(state.denyList)
-    .filter(([key, entry]) => key.startsWith('cid:') && entry.ip === ip && entry.until > now)
+    .filter(([key, entry]) =>
+      (key.startsWith('principal:') || key.startsWith('cid:'))
+      && entry.ip === ip
+      && entry.until > now)
+    // Count unique principal/cid keys only once per key.
     .length
-  if (strikes >= TURN_IP_BAN_STRIKES) {
-    state.denyList[`ip:${ip}`] = { until, at: now, reason: `${reason}_STRIKES_${strikes}`, ip }
-    console.warn(`[turn] deny ip ${ip} for ${TURN_BAN_DURATION_SEC}s after ${strikes} abusive session(s)`)
+  // principal + cid for the same event would double-count; prefer principal keys.
+  const principalStrikes = Object.entries(state.denyList)
+    .filter(([key, entry]) => key.startsWith('principal:') && entry.ip === ip && entry.until > now)
+    .length
+  const effectiveStrikes = principalStrikes > 0 ? principalStrikes : strikes
+  if (effectiveStrikes >= TURN_IP_BAN_STRIKES) {
+    state.denyList[`ip:${ip}`] = { until, at: now, reason: `${reason}_STRIKES_${effectiveStrikes}`, ip }
+    console.warn(`[turn] deny ip ${ip} for ${TURN_BAN_DURATION_SEC}s after ${effectiveStrikes} abusive session(s)`)
   }
   markDirty()
 }
@@ -434,6 +471,15 @@ export function classifyTurnStatusAuth(authHeader: string | undefined): TurnStat
 }
 
 // ── Pollers ──────────────────────────────────────────────────────────
+//
+// Single-flight + generation counters: with TURN_GLOBAL_POLL_SEC=1 and an
+// 8s CF timeout, an old slow poll must never overwrite a newer result (and
+// especially must never CLEAR a kill switch that a fresher sweep engaged).
+
+let abusePollInFlight = false
+let globalPollInFlight = false
+let globalPollGeneration = 0
+let abusePollGeneration = 0
 
 export function startTurnPollers() {
   if (!turnConfigured()) {
@@ -443,13 +489,13 @@ export function startTurnPollers() {
 
   console.log(`[turn] starting pollers (abuse=${TURN_ABUSE_POLL_SEC}s, global=${TURN_GLOBAL_POLL_SEC}s)`)
   const abusePoller = setInterval(() => {
-    pollPerIdentifierUsage().catch(err => console.error('[turn] abuse poll error:', err.message))
+    void runAbusePoll()
   }, TURN_ABUSE_POLL_SEC * 1000)
   abusePoller.unref?.()
   pollers.push(abusePoller)
 
   const globalPoller = setInterval(() => {
-    pollGlobalUsage().catch(err => console.error('[turn] global poll error:', err.message))
+    void runGlobalPoll()
   }, TURN_GLOBAL_POLL_SEC * 1000)
   globalPoller.unref?.()
   pollers.push(globalPoller)
@@ -457,9 +503,35 @@ export function startTurnPollers() {
   // Run an initial global sync soon after startup to calibrate persisted counter.
   initialGlobalPoller = setTimeout(() => {
     initialGlobalPoller = null
-    pollGlobalUsage().catch(err => console.error('[turn] initial global poll error:', err.message))
+    void runGlobalPoll()
   }, 2000)
   initialGlobalPoller.unref?.()
+}
+
+async function runAbusePoll() {
+  if (abusePollInFlight) return
+  abusePollInFlight = true
+  const gen = ++abusePollGeneration
+  try {
+    await pollPerIdentifierUsage(gen)
+  } catch (err) {
+    console.error('[turn] abuse poll error:', (err as Error).message)
+  } finally {
+    abusePollInFlight = false
+  }
+}
+
+async function runGlobalPoll() {
+  if (globalPollInFlight) return
+  globalPollInFlight = true
+  const gen = ++globalPollGeneration
+  try {
+    await pollGlobalUsage(gen)
+  } catch (err) {
+    console.error('[turn] global poll error:', (err as Error).message)
+  } finally {
+    globalPollInFlight = false
+  }
 }
 
 export function stopTurnPollers() {
@@ -672,23 +744,29 @@ function pruneIssuanceHistory(now: number) {
 }
 
 // Rolling per-IP ledger of CF-CONFIRMED actual relayed bytes, folded from
-// credentials as they expire. In-memory only (a restart resets it, which only
-// briefly loosens this SECONDARY per-IP cap; the persisted global monthly kill
-// switch is the primary money defence). We fold `cfActualBytes` — NOT the
-// pessimistic estimate — so a P2P session that relayed ~0 bytes contributes 0
-// and can never false-positive a legitimate user who reconnects frequently.
-interface IpByteLedgerEntry { ip: string; bytes: number; at: number }
-let ipByteLedger: IpByteLedgerEntry[] = []
+// credentials as they expire. Now versioned into TurnState so a restart cannot
+// wipe the 10 GiB/hour/IP cap. We fold `cfActualBytes` — NOT the pessimistic
+// estimate — so a P2P session that relayed ~0 bytes contributes 0 and can never
+// false-positive a legitimate user who reconnects frequently.
 
-// Test-only: reset / inspect the in-memory ledger between scenarios.
-export function _resetIpByteLedger() { ipByteLedger = [] }
+// Test-only: reset / inspect the ledger between scenarios.
+export function _resetIpByteLedger() {
+  const state = getTurnState()
+  state.ipByteLedger = []
+  markDirty()
+}
 export function _ipLedgerBytesForTest(ip: string): number {
-  return ipByteLedger.filter(e => e.ip === ip).reduce((s, e) => s + e.bytes, 0)
+  const state = getTurnState()
+  return (state.ipByteLedger ?? []).filter(e => e.ip === ip).reduce((s, e) => s + e.bytes, 0)
 }
 
 function pruneIpByteLedger(now: number) {
+  const state = getTurnState()
+  if (!state.ipByteLedger) state.ipByteLedger = []
   const cutoff = now - 60 * 60 * 1000
-  ipByteLedger = ipByteLedger.filter(e => e.at >= cutoff)
+  const before = state.ipByteLedger.length
+  state.ipByteLedger = state.ipByteLedger.filter(e => e.at >= cutoff)
+  if (state.ipByteLedger.length !== before) markDirty()
 }
 
 /**
@@ -701,9 +779,11 @@ function pruneIpByteLedger(now: number) {
  */
 function settleCredentialUsage(cred: ActiveCredential, observedBytes?: number) {
   if (cred.usageSettled) return
+  const state = getTurnState()
+  if (!state.ipByteLedger) state.ipByteLedger = []
   const bytes = Math.max(observedBytes ?? 0, cred.cfActualBytes ?? 0)
   if (bytes > 0) {
-    ipByteLedger.push({ ip: cred.ip, bytes, at: Date.now() })
+    state.ipByteLedger.push({ ip: cred.ip, bytes, at: Date.now() })
     cred.cfActualBytes = bytes
   }
   cred.usageSettled = true
@@ -735,7 +815,7 @@ function sumHourlyBytesForIp(ip: string, now: number): number {
   for (const c of Object.values(state.activeCredentials)) {
     if (c.ip === ip && c.issuedAt >= cutoff) total += c.pessimisticBytes
   }
-  for (const e of ipByteLedger) {
+  for (const e of state.ipByteLedger ?? []) {
     if (e.ip === ip && e.at >= cutoff) total += e.bytes
   }
   return total
@@ -765,12 +845,29 @@ async function revokeAllActive() {
   const state = getTurnState()
   const ids = Object.keys(state.activeCredentials)
   console.warn(`[turn] revoking ${ids.length} active credentials (kill switch)`)
+  // Persist settlement + revokePending for every credential BEFORE the first
+  // external CF call so a crash mid-sweep never loses accounting or the retry
+  // queue while the provider side effect may already have happened.
+  for (const cid of ids) {
+    const active = state.activeCredentials[cid]
+    if (!active) continue
+    settleCredentialUsage(active)
+    active.revokePending = true
+    active.revokeAttempts = (active.revokeAttempts ?? 0) + 1
+    active.lastRevokeAttemptAt = Date.now()
+  }
+  markDirty()
+  try {
+    await flushSecurityState()
+  } catch (err) {
+    console.error('[turn] kill-switch pre-revoke flush failed — deferring external revokes:', (err as Error).message)
+    return
+  }
   for (const cid of ids) {
     const active = state.activeCredentials[cid]
     if (!active) continue
     const ok = await revokeCustomIdentifier(cid)
     if (ok) {
-      settleCredentialUsage(active)
       delete state.activeCredentials[cid]
       dropCachedCredential(cid)
     } else {
@@ -780,6 +877,11 @@ async function revokeAllActive() {
     }
   }
   markDirty()
+  try {
+    await flushSecurityState()
+  } catch (err) {
+    console.error('[turn] kill-switch post-revoke flush failed:', (err as Error).message)
+  }
 }
 
 // ── CF GraphQL Analytics ─────────────────────────────────────────────
@@ -907,9 +1009,11 @@ function setAnalyticsTruncated(truncated: boolean) {
 }
 
 /** Per-customIdentifier byte usage over the last hour. */
-async function pollPerIdentifierUsage() {
+async function pollPerIdentifierUsage(generation = abusePollGeneration) {
   const state = getTurnState()
   if (Object.keys(state.activeCredentials).length === 0) return
+  // Capture generation at start; if a newer sweep began (shouldn't with
+  // single-flight, but defend in depth) refuse to write stale results.
 
   const now = new Date()
   const since = new Date(now.getTime() - 60 * 60 * 1000)   // 1 h window
@@ -918,9 +1022,14 @@ async function pollPerIdentifierUsage() {
   try {
     paged = await fetchIdentifierPages('Time', since.toISOString(), now.toISOString())
   } catch (err) {
+    if (generation !== abusePollGeneration) return
     state.monthlyUsage.lastCfSyncErrorCode = errorCodeOf(err)
     markDirty()
     console.error('[turn] analytics query failed:', errorCodeOf(err), (err as Error).message)
+    return
+  }
+  if (generation !== abusePollGeneration) {
+    console.warn(`[turn] discarding stale abuse poll generation ${generation} (current ${abusePollGeneration})`)
     return
   }
   if (paged.truncated) {
@@ -977,22 +1086,40 @@ async function pollPerIdentifierUsage() {
 async function handleAbusiveCredential(cid: string, active: ActiveCredential, actualBytes: number) {
   console.warn(`[turn] abuse: ${redactCustomIdentifier(cid)} used ${actualBytes} bytes (cap ${TURN_MAX_BYTES_PER_SESSION}), settling + denying + revoking`)
   settleCredentialUsage(active, actualBytes)
-  applyDeny(cid, active.ip, 'SESSION_BYTES_EXCEEDED')
+  const principal = active.turnPrincipal || `sess:${cid}`
+  applyDeny(principal, active.ip, 'SESSION_BYTES_EXCEEDED', cid)
+  // Always leave a retryable local record before any external action.
+  active.revokePending = true
+  active.revokeAttempts = (active.revokeAttempts ?? 0) + 1
+  active.lastRevokeAttemptAt = Date.now()
+  markDirty()
+  // Strict security boundary: settle + deny + revokePending MUST hit disk
+  // before the external provider revoke. Failure at any step leaves the
+  // retryable local record; we must NOT call CF if flush fails.
+  try {
+    await flushSecurityState()
+  } catch (err) {
+    console.error('[turn] security flush before revoke failed — holding external revoke:', (err as Error).message)
+    return
+  }
 
   const ok = await revokeCustomIdentifier(cid)
   if (ok) {
     delete getTurnState().activeCredentials[cid]
     dropCachedCredential(cid)
+    markDirty()
   } else {
-    // P1-6: do NOT drop the entry on revoke failure. We need to retry until
-    // either CF accepts the revoke or the credential's TTL elapses, otherwise
-    // we lose visibility into an outstanding credential that still counts
-    // against our quota.
+    // P1-6: keep revokePending for the retry loop.
     active.revokePending = true
     active.revokeAttempts = (active.revokeAttempts ?? 0) + 1
     active.lastRevokeAttemptAt = Date.now()
+    markDirty()
+    try {
+      await flushSecurityState()
+    } catch (err) {
+      console.error('[turn] security flush after revoke failure failed:', (err as Error).message)
+    }
   }
-  markDirty()
 }
 
 /**
@@ -1031,7 +1158,7 @@ async function fetchMonthlyAggregate(since: string, until: string): Promise<numb
 }
 
 /** Account-wide monthly bytes — feeds the 1 TB kill switch. */
-async function pollGlobalUsage() {
+async function pollGlobalUsage(generation = globalPollGeneration) {
   rollMonthIfNeeded()
   const state = getTurnState()
   const now = new Date()
@@ -1051,11 +1178,21 @@ async function pollGlobalUsage() {
       total = paged.rows.reduce((s, r) => s + bytesOf(r), 0)
       truncated = paged.truncated
     } catch (pagedErr) {
+      // Stale generation: do not write error codes from an outdated sweep.
+      if (generation !== globalPollGeneration) return
       state.monthlyUsage.lastCfSyncErrorCode = errorCodeOf(pagedErr)
       markDirty()
       console.error('[turn] global analytics query failed:', errorCodeOf(pagedErr), (pagedErr as Error).message)
       return
     }
+  }
+
+  // Refuse to apply results from a superseded sweep. Without this, a slow
+  // poll A (started before poll B) can overwrite B's higher usage and even
+  // clear a kill switch B engaged.
+  if (generation !== globalPollGeneration) {
+    console.warn(`[turn] discarding stale global poll generation ${generation} (current ${globalPollGeneration})`)
+    return
   }
 
   // Reconcile the pessimistic estimate DOWN to only currently-active
@@ -1112,6 +1249,29 @@ async function pollGlobalUsage() {
 }
 
 export async function syncTurnUsageNow() {
-  await pollGlobalUsage()
+  // Bump generation so any in-flight poll is discarded, then run a fresh one.
+  globalPollGeneration++
+  const gen = globalPollGeneration
+  await pollGlobalUsage(gen)
   return getOperatorTurnStatus()
+}
+
+/** Test hooks — out-of-order / stale-generation poll coverage. */
+export function _globalPollGenerationForTest(): number {
+  return globalPollGeneration
+}
+export function _setGlobalPollGenerationForTest(n: number): void {
+  globalPollGeneration = n
+}
+export async function _pollGlobalUsageForTest(generation: number): Promise<void> {
+  await pollGlobalUsage(generation)
+}
+export function _abusePollGenerationForTest(): number {
+  return abusePollGeneration
+}
+export function _setAbusePollGenerationForTest(n: number): void {
+  abusePollGeneration = n
+}
+export async function _pollPerIdentifierUsageForTest(generation: number): Promise<void> {
+  await pollPerIdentifierUsage(generation)
 }

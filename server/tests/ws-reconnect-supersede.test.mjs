@@ -88,13 +88,22 @@ async function testReconnectDoesNotEvictLiveSession() {
   const wsA2 = await openWS()
   const msgsA2 = []
   wsA2.on('message', raw => { try { msgsA2.push(JSON.parse(raw.toString())) } catch { /* ignore */ } })
-  const ws1ClosePromise = waitForClose(wsA1, 3000).catch(() => null)
+  // Must NOT swallow a missing close — that let the server keep two valid
+  // sockets and this test still pass.
+  const ws1ClosePromise = waitForClose(wsA1, 3000)
   wsA2.send(JSON.stringify({ t: 'AUTH', token: regA.token }))
   const welcome2 = await waitFor(() => msgsA2.find(m => m.t === 'WELCOME'), 1500)
   if (welcome2.sessionId !== regA.sessionId) throw new Error('ws2 WELCOME should reuse the same sessionId')
 
-  // ws1 should be closed by the server (superseded).
-  await ws1ClosePromise
+  // ws1 should be closed by the server (superseded) with code 1000 / SUPERSEDED.
+  const closed = await ws1ClosePromise
+  if (closed.code !== 1000) throw new Error(`superseded close code expected 1000, got ${closed.code}`)
+  if (!String(closed.reason || '').includes('SUPERSEDED')) {
+    throw new Error(`superseded close reason expected SUPERSEDED, got ${closed.reason}`)
+  }
+  if (wsA1.readyState !== WebSocket.CLOSED) {
+    throw new Error(`wsA1.readyState expected CLOSED (${WebSocket.CLOSED}), got ${wsA1.readyState}`)
+  }
 
   // Record how many PEER_LEFT(A) B had seen up to now, then wait for the window
   // in which the buggy stale-close would have fired one.

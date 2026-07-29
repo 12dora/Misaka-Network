@@ -95,9 +95,11 @@ async function main() {
   assert((state.activeCredentials[cid]?.revokeAttempts ?? 0) >= 1, 'revokeAttempts 已累加')
 
   console.log('[2] deny 状态被持久化并生效')
-  assert(!!state.denyList[`cid:${cid}`], 'session 级 deny 已写入 state')
+  // Restart-stable principal key (plus legacy cid: for same-process re-issue).
+  const principalKeys = Object.keys(state.denyList).filter(k => k.startsWith('principal:') || k.startsWith('cid:'))
+  assert(principalKeys.length >= 1, 'session/principal 级 deny 已写入 state')
   assert(!!state.denyList['ip:5.5.5.5'], 'IP 级 deny 已写入 state')
-  assert(state.denyList[`cid:${cid}`].until > Date.now(), 'deny 有未来的到期时间')
+  assert(state.denyList[principalKeys[0]].until > Date.now(), 'deny 有未来的到期时间')
 
   const resign = await turn.issueCredentials('sess-abuse', '5.5.5.5')
   assert(!resign.ok && (resign.reason === 'SESSION_BANNED' || resign.reason === 'IP_BANNED'),

@@ -1,12 +1,16 @@
 name: Deploy to GitHub Pages
 
+# Deploy ONLY after the Test workflow succeeds on main. No direct `push: main`
+# path — a failing commit must never ship, and a passing commit must not
+# double-deploy via both push and workflow_run.
 on:
-  push:
+  workflow_run:
+    workflows: ["Test"]
+    types: [completed]
     branches: [main]
 
-# Grant the GITHUB_TOKEN write access to pages and contents
+# pages + id-token only — this workflow never writes to the repository.
 permissions:
-  contents: write
   pages: write
   id-token: write
 
@@ -17,11 +21,33 @@ concurrency:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    # Only deploy a successful Test run on main for a concrete head_sha.
+    if: |
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_sha != ''
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - name: Guard — refuse deploy without exact tested head_sha
+        run: |
+          set -euo pipefail
+          sha="${{ github.event.workflow_run.head_sha }}"
+          if [ -z "$sha" ]; then
+            echo "::error::workflow_run head_sha is empty"
+            exit 1
+          fi
+          if [ "${{ github.event.workflow_run.conclusion }}" != "success" ]; then
+            echo "::error::Test workflow did not succeed"
+            exit 1
+          fi
+          echo "Deploying head_sha=$sha from successful Test run"
+
       - uses: actions/checkout@v4
+        with:
+          # Check out the exact tested commit — not whatever main points at now.
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - uses: actions/setup-node@v4
         with:
@@ -65,9 +91,6 @@ jobs:
           VITE_BASE: ${{ steps.base.outputs.vite_base }}
         run: |
           set -e
-          # The 404 redirect target must equal the base the bundle was built
-          # with, otherwise a deep link bounces somewhere the router does not
-          # serve.
           grep -q "var base = '${VITE_BASE}'" client/dist/404.html
           grep -q "${VITE_BASE}assets/" client/dist/index.html
           echo "base consistency OK for VITE_BASE=$VITE_BASE"
