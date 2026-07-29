@@ -24,6 +24,8 @@ import {
   rangesToBitmap,
   setToRanges,
   preferRangesOverIndexes,
+  validateAndNormalizeRanges,
+  MAX_RANGE_COUNT,
 } from '../../src/lib/chunk-bitmap'
 
 describe('chunk-bitmap basics', () => {
@@ -134,6 +136,12 @@ describe('RLE ranges', () => {
   it('rangesToBitmap silently clamps oversize ranges', () => {
     const buf = rangesToBitmap([[5, 100]], 10)
     expect(bitmapToIndexes(buf, 10)).toEqual([5, 6, 7, 8, 9])
+  })
+
+  it('validateAndNormalizeRanges rejects hostile u32 expansion and over-count floods', () => {
+    expect(validateAndNormalizeRanges([[0, 4294967295]], 8)).toEqual([[0, 8]])
+    expect(validateAndNormalizeRanges(new Array(MAX_RANGE_COUNT + 1).fill([0, 1]), 16)).toEqual([])
+    expect(validateAndNormalizeRanges([[-1, 4], [1.5, 2], ['x', 1]], 10)).toEqual([])
   })
 
   it('setToRanges agrees with bitmapToRanges', () => {

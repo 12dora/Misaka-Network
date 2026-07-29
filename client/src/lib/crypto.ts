@@ -4,7 +4,10 @@
 // hot-path calls dispatch to the pool — keeping ~tens of milliseconds per
 // MB of CPU off the main thread and parallelizing across cores.
 
-import { registerPeerKey, unregisterPeerKey, encryptInWorker, decryptInWorker } from './cryptoPool'
+import {
+  registerPeerKey, unregisterPeerKey, encryptInWorker, decryptInWorker,
+  decryptFrameInWorker,
+} from './cryptoPool'
 
 type PeerCryptoState = {
   myKeyPair: CryptoKeyPair | null
@@ -116,12 +119,32 @@ export function makeChunkIv(
 ): Uint8Array<ArrayBuffer> | Promise<Uint8Array<ArrayBuffer>> {
   if (transferId === undefined) {
     // Legacy fast path — unchanged from pre-P1-9.
-    const iv = new Uint8Array(12)
-    iv.set(prefix.subarray(0, 8), 0)
-    new DataView(iv.buffer).setUint32(8, index >>> 0, false)
-    return iv as Uint8Array<ArrayBuffer>
+    return assembleChunkIv(prefix.subarray(0, 8), index)
   }
   return makeChunkIvAsync(prefix, index, transferId)
+}
+
+/** Derive the 8-byte domain-separated IV prefix once per transfer. The wire
+ *  IV for chunk `i` is then this prefix || BE32(i) — identical bytes to the
+ *  previous per-chunk SHA-256 path, without recomputing the digest ~66k times
+ *  for a 16 GB file. */
+export async function deriveTransferIvPrefix(
+  randomPrefix: Uint8Array,
+  transferId: string,
+): Promise<Uint8Array<ArrayBuffer>> {
+  const transferIdBytes = new TextEncoder().encode(transferId)
+  const input = new Uint8Array(8 + transferIdBytes.length)
+  input.set(randomPrefix.subarray(0, 8), 0)
+  input.set(transferIdBytes, 8)
+  const digest = await crypto.subtle.digest('SHA-256', input)
+  return new Uint8Array(digest, 0, 8) as Uint8Array<ArrayBuffer>
+}
+
+function assembleChunkIv(domainPrefix: Uint8Array, index: number): Uint8Array<ArrayBuffer> {
+  const iv = new Uint8Array(12)
+  iv.set(domainPrefix.subarray(0, 8), 0)
+  new DataView(iv.buffer).setUint32(8, index >>> 0, false)
+  return iv as Uint8Array<ArrayBuffer>
 }
 
 async function makeChunkIvAsync(
@@ -129,37 +152,51 @@ async function makeChunkIvAsync(
   index: number,
   transferId: string,
 ): Promise<Uint8Array<ArrayBuffer>> {
-  // Hash(prefix || transferId) → take first 8 bytes as the
-  // domain-separated prefix. SHA-256 is overkill cryptographically (we
-  // only need a 64-bit codomain), but it's hardware-accelerated in every
-  // browser and the cost (~5 µs) is amortised across the chunk's full
-  // encrypt + send, which is a few orders of magnitude slower.
-  const transferIdBytes = new TextEncoder().encode(transferId)
-  const input = new Uint8Array(8 + transferIdBytes.length)
-  input.set(prefix.subarray(0, 8), 0)
-  input.set(transferIdBytes, 8)
-  const digest = await crypto.subtle.digest('SHA-256', input)
-  const iv = new Uint8Array(12)
-  iv.set(new Uint8Array(digest, 0, 8), 0)
-  new DataView(iv.buffer).setUint32(8, index >>> 0, false)
-  return iv as Uint8Array<ArrayBuffer>
+  const domain = await deriveTransferIvPrefix(prefix, transferId)
+  return assembleChunkIv(domain, index)
 }
 
 export function randomIvPrefix(): Uint8Array {
   return crypto.getRandomValues(new Uint8Array(8))
 }
 
+/**
+ * PROTOCOL_VERSION ≥ 3 AES-GCM AAD. Deterministic, length-prefixed transferId
+ * so field boundaries are unambiguous. Bound into every encrypt/decrypt when
+ * the negotiated version is ≥ 3; v1/v2 peers keep empty AAD behaviour.
+ */
+export function chunkAad(
+  protocolVersion: number,
+  transferId: string,
+  shortId: number,
+  index: number,
+  plaintextLength: number,
+): Uint8Array<ArrayBuffer> {
+  const idBytes = new TextEncoder().encode(transferId)
+  const out = new Uint8Array(4 + 4 + idBytes.length + 4 + 4 + 4)
+  const view = new DataView(out.buffer)
+  let o = 0
+  view.setUint32(o, protocolVersion >>> 0, false); o += 4
+  view.setUint32(o, idBytes.length >>> 0, false); o += 4
+  out.set(idBytes, o); o += idBytes.length
+  view.setUint32(o, shortId >>> 0, false); o += 4
+  view.setUint32(o, index >>> 0, false); o += 4
+  view.setUint32(o, plaintextLength >>> 0, false)
+  return out as Uint8Array<ArrayBuffer>
+}
+
 export async function encryptChunk(
   data: ArrayBuffer,
   peerSessionId: string,
   iv?: Uint8Array<ArrayBuffer>,
+  additionalData?: Uint8Array,
 ): Promise<{ iv: Uint8Array<ArrayBuffer>; encrypted: ArrayBuffer }> {
   if (!peerStates.get(peerSessionId)?.aesKey) throw new Error('AES key not derived')
   const actualIv = iv ?? (crypto.getRandomValues(new Uint8Array(12)) as Uint8Array<ArrayBuffer>)
   // `data` is transferred into the worker (zero-copy); the caller's reference
   // becomes detached. sendFileParallel does not reuse `raw` after encrypt, so
   // this is safe in the current hot path.
-  const encrypted = await encryptInWorker(peerSessionId, actualIv, data)
+  const encrypted = await encryptInWorker(peerSessionId, actualIv, data, additionalData)
   return { iv: actualIv, encrypted }
 }
 
@@ -167,9 +204,26 @@ export async function decryptChunk(
   iv: Uint8Array<ArrayBuffer>,
   encrypted: ArrayBuffer,
   peerSessionId: string,
+  additionalData?: Uint8Array,
 ): Promise<ArrayBuffer> {
   if (!peerStates.get(peerSessionId)?.aesKey) throw new Error('AES key not derived')
-  return decryptInWorker(peerSessionId, iv, encrypted)
+  return decryptInWorker(peerSessionId, iv, encrypted, additionalData)
+}
+
+/** Decrypt ciphertext in-place from a full chunk frame (no main-thread copy). */
+export async function decryptChunkFrame(
+  peerSessionId: string,
+  frame: ArrayBuffer,
+  ivOffset: number,
+  ivLength: number,
+  cipherOffset: number,
+  cipherLength: number,
+  additionalData?: Uint8Array,
+): Promise<ArrayBuffer> {
+  if (!peerStates.get(peerSessionId)?.aesKey) throw new Error('AES key not derived')
+  return decryptFrameInWorker(
+    peerSessionId, frame, ivOffset, ivLength, cipherOffset, cipherLength, additionalData,
+  )
 }
 
 export function resetCrypto(peerSessionId?: string) {

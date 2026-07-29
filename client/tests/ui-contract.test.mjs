@@ -1,10 +1,27 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 
 const root = new URL('..', import.meta.url).pathname
 const read = path => readFileSync(join(root, path), 'utf8')
+
+// Wave 4a: transfer implementation lives under src/lib/transfer/*; the
+// facade at transfer.ts only re-exports. Contract patterns must match the
+// implementation, not the barrel alone.
+function readTransferTree(dir = 'src/lib/transfer') {
+  const parts = [read('src/lib/transfer.ts')]
+  const walk = (d) => {
+    for (const name of readdirSync(join(root, d))) {
+      const rel = `${d}/${name}`
+      const abs = join(root, rel)
+      if (statSync(abs).isDirectory()) walk(rel)
+      else if (name.endsWith('.ts')) parts.push(read(rel))
+    }
+  }
+  try { walk(dir) } catch { /* pre-split layout */ }
+  return parts.join('\n')
+}
 
 const css = read('src/index.css')
 const app = read('src/App.tsx')
@@ -16,12 +33,28 @@ const footer = read('src/components/ui/AppFooter.tsx')
 const privacy = read('src/pages/Privacy.tsx')
 const terms = read('src/pages/Terms.tsx')
 const network = read('src/pages/Network.tsx')
-const networkStore = read('src/store/network.ts')
+// Wave 4b: network implementation lives under src/store/network/*; the
+// facade at network.ts only re-exports. Contract patterns must match the
+// implementation, not the barrel alone.
+function readNetworkStoreTree() {
+  const parts = [read('src/store/network.ts')]
+  const walk = (d) => {
+    for (const name of readdirSync(join(root, d))) {
+      const rel = `${d}/${name}`
+      const abs = join(root, rel)
+      if (statSync(abs).isDirectory()) walk(rel)
+      else if (name.endsWith('.ts')) parts.push(read(rel))
+    }
+  }
+  try { walk('src/store/network') } catch { /* pre-split layout */ }
+  return parts.join('\n')
+}
+const networkStore = readNetworkStoreTree()
 const authStore = read('src/store/auth.ts')
 const signaling = read('src/lib/signaling.ts')
 const api = read('src/lib/api.ts')
 const crypto = read('src/lib/crypto.ts')
-const transfer = read('src/lib/transfer.ts')
+const transfer = readTransferTree()
 const serviceWorker = read('public/sw.js')
 
 assert.match(css, /@keyframes page-enter/)
@@ -104,17 +137,21 @@ assert.match(networkStore, /waitForPrimaryChannel\(peerSessionId\)/)
 assert.match(networkStore, /peerConnections\.has\(peerSessionId\)\) && !dataChannels\.has\(peerSessionId\)/)
 assert.match(networkStore, /notifyPrimaryChannel\(fromSessionId\)/)
 assert.match(networkStore, /getMyPublicKey\(peerSessionId\)/)
-assert.match(networkStore, /setPeerPublicKey\(peerSessionId, msg\.pub\)/)
+assert.match(networkStore, /setPeerPublicKey\(peerSessionId,\s*(?:String\()?msg\.pub/)
 assert.match(networkStore, /hasAESKey\(peerSessionId\)/)
 assert.match(networkStore, /const isTransferLane = dc\.label\.startsWith\('misaka-transfer-'\)/)
 assert.match(networkStore, /if \(!isTransferLane\)/)
 assert.match(networkStore, /const publishEncryptedReady = \(\) =>/)
 assert.match(networkStore, /if \(!stillCurrent\(\) \|\| !hasAESKey\(peerSessionId\)\) return false/)
 assert.match(networkStore, /if \(hasAESKey\(peerSessionId\)\) flushOutgoing\(peerSessionId, dc\)/)
-assert.match(networkStore, /flushOutgoing\(peerSessionId, dc\)\s+sendResumeRequests\(peerSessionId, dc\)/)
-// receiveChunk now takes (transferId, index, iv, ciphertext) — chunk frame is
-// a single binary message; the transferId comes from the shortId map.
-assert.match(networkStore, /receiveChunk\(\s*transferId, frame\.index, frame\.iv, frame\.ciphertext, peerSessionId,/)
+assert.match(networkStore, /flushOutgoing\(peerSessionId, dc\)\s+flushPendingDurableAcks\(peerSessionId\)\s+sendResumeRequests\(peerSessionId, dc\)/)
+// receiveChunk: production uses rawFrame + offsets (zero-copy). Must NOT
+// evaluate frame.ciphertext (lazy getter runs ArrayBuffer.slice on main thread).
+assert.match(networkStore, /EMPTY_CIPHERTEXT/)
+assert.match(networkStore, /receiveChunk\(\s*transferId, frame\.index, frame\.iv, EMPTY_CIPHERTEXT, peerSessionId,/)
+assert.match(networkStore, /rawFrame:\s*frame\.rawFrame/)
+assert.match(networkStore, /cipherOffset:\s*frame\.cipherOffset/)
+assert.doesNotMatch(networkStore, /receiveChunk\(\s*transferId, frame\.index, frame\.iv, frame\.ciphertext, peerSessionId,/)
 assert.match(networkStore, /decodeChunkFrame\(e\.data\)/)
 assert.match(networkStore, /shortIdToTransferId/)
 // Per-chunk JSON header and ack are removed — the binary frame carries both
@@ -133,13 +170,13 @@ assert.match(crypto, /resetCrypto\(peerSessionId\?: string\)/)
 
 // Per-chunk IV is built from an 8-byte per-transfer prefix + 4-byte index
 // (NIST SP 800-38D §8.2.1) instead of a per-chunk getRandomValues call.
-// P1-9: the prefix is additionally domain-separated with `transferId`
-// (SHA-256 of prefix||transferId) so two transfers that draw the same
-// random prefix still produce distinct IVs. The hot-path call is now
-// awaited (digest is async) and threads `transferId` through.
-assert.match(transfer, /makeChunkIv\(ivPrefix, i, transferId\)/)
-assert.match(transfer, /encryptChunk\(raw, peerSessionId, ivForChunk\)/)
-assert.match(transfer, /decryptChunk\(iv, encrypted, peerSessionId\)/)
+// P1-9: the prefix is domain-separated with `transferId` ONCE per transfer
+// (`deriveTransferIvPrefix`), then each chunk uses makeChunkIv(domain, i).
+// v3 binds AAD; production decrypt prefers decryptChunkFrame (zero-copy).
+assert.match(transfer, /deriveTransferIvPrefix\(ivPrefix, transferId\)/)
+assert.match(transfer, /makeChunkIv\(domainIvPrefix, i\)/)
+assert.match(transfer, /encryptChunk\(raw, peerSessionId, ivForChunk/)
+assert.match(transfer, /decryptChunkFrame\(|decryptChunk\(iv, encrypted, peerSessionId/)
 assert.match(transfer, /const ivPrefix = randomIvPrefix\(\)/)
 
 // Bumped to v5: shell-only install (no aggressive asset prefetch — that

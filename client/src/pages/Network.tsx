@@ -12,6 +12,7 @@ import {
   useNetworkStore, isLikelyUnreachable,
   deriveNetworkStatus, networkStatusLabel, peerDisplayStatus,
   getTransferDeliveryState,
+  ORPHANED_DOWNLOADS_CHAT_KEY,
 } from '@/store/network'
 import { useAuthStore } from '@/store/auth'
 import { appUrl } from '@/lib/appBase'
@@ -424,6 +425,11 @@ function TransferChannel({ selectedPeer, onlinePeerCount, onStageFiles, onSendFi
   const fileInputRef = useRef<HTMLInputElement>(null)
   const folderInputRef = useRef<HTMLInputElement>(null)
   const emptyFanoutInputRef = useRef<HTMLInputElement>(null)
+  // Started downloads rehomed after blockPeer — must remain reachable with
+  // DownloadArtifactActions even when no peer chat is selected.
+  const orphanedDownloads = useNetworkStore(
+    s => s.chatMessages[ORPHANED_DOWNLOADS_CHAT_KEY] ?? [],
+  )
 
   async function handleReconnectClick() {
     if (!selectedPeer || reconnecting) return
@@ -497,6 +503,39 @@ function TransferChannel({ selectedPeer, onlinePeerCount, onStageFiles, onSendFi
           if (files.length > 0) onEmptyDropAttempt()
         }}
       >
+        {orphanedDownloads.length > 0 && (
+          <div
+            className="w-full max-w-md mb-4 px-4 py-3 rounded-lg text-left"
+            style={{ background: 'var(--surface-tint)', border: '1px solid var(--accent-cyan)' }}
+            data-testid="orphaned-downloads-panel"
+          >
+            <p className="font-kanji text-xs font-bold mb-2" style={{ color: 'var(--text-on-white)' }}>
+              已屏蔽节点的未完成下载
+            </p>
+            <p className="font-kanji text-[10px] mb-2" style={{ color: 'var(--text-muted)' }}>
+              下载完成后请确认释放临时副本
+            </p>
+            <div className="flex flex-col gap-2">
+              {orphanedDownloads.map(m => (
+                m.downloadUrl ? (
+                  <div key={m.id} className="flex items-center gap-2">
+                    <div className="flex-1 min-w-0">
+                      <div className="truncate text-xs font-semibold" title={m.fileName}>{m.fileName}</div>
+                      {m.fileSize !== undefined && (
+                        <div className="text-[10px]" style={{ color: 'var(--text-muted)' }}>{formatBytes(m.fileSize)}</div>
+                      )}
+                    </div>
+                    <DownloadArtifactActions
+                      id={m.id}
+                      url={m.downloadUrl}
+                      fileName={m.fileName ?? 'download'}
+                    />
+                  </div>
+                ) : null
+              ))}
+            </div>
+          </div>
+        )}
         <MisakaKanjiBlock char="同" size="xl" className="mb-4" />
         <p className="font-kanji font-bold text-lg text-[var(--text-on-white)] mb-1">请先在「节点」页选择目标节点</p>
         <p className="font-kanji text-sm text-[var(--text-on-white-2)] mb-3">选择后即可打开信道并发送文件或消息</p>

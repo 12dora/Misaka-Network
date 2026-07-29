@@ -115,8 +115,19 @@ vi.mock('@/lib/crypto', () => ({
   hasAESKey: vi.fn(() => true),
   encryptChunk: vi.fn(async (data: ArrayBuffer) => ({ iv: new Uint8Array(12), encrypted: data })),
   decryptChunk: vi.fn(async (_iv: Uint8Array, encrypted: ArrayBuffer) => encrypted),
-  makeChunkIv: vi.fn(async () => new Uint8Array(12)),
+  decryptChunkFrame: vi.fn(async (
+    _peer: string, frame: ArrayBuffer, _ivOff: number, _ivLen: number,
+    cipherOffset: number, cipherLength: number,
+  ) => frame.slice(cipherOffset, cipherOffset + cipherLength)),
+  makeChunkIv: vi.fn((prefix: Uint8Array, index: number) => {
+    const iv = new Uint8Array(12)
+    iv.set(prefix.subarray(0, 8), 0)
+    new DataView(iv.buffer).setUint32(8, index >>> 0, false)
+    return iv
+  }),
   randomIvPrefix: vi.fn(() => new Uint8Array(8)),
+  deriveTransferIvPrefix: vi.fn(async (prefix: Uint8Array) => prefix.subarray(0, 8)),
+  chunkAad: vi.fn(() => new Uint8Array(0)),
 }))
 
 const records = new Map<string, any>()
@@ -254,7 +265,11 @@ async function buildRig(): Promise<Rig> {
     for (const msg of pending) {
       switch (msg.type) {
         case 'transfer-ready':
-          sender.markReceiverReady(String(msg.transferId), owner); break
+          sender.markReceiverReady(
+            String(msg.transferId),
+            Number(msg.shortId),
+            owner,
+          ); break
         case 'transfer-pause':
           sender.applyPeerPause(String(msg.transferId), owner); break
         case 'transfer-resume':
@@ -264,7 +279,11 @@ async function buildRig(): Promise<Rig> {
         case 'transfer-cancel':
           sender.applyPeerCancel(String(msg.transferId), owner); break
         case 'transfer-done':
-          sender.markTransferAcked(String(msg.transferId), owner); break
+          sender.markTransferAcked(
+            String(msg.transferId),
+            Number(msg.bytes),
+            owner,
+          ); break
         default: break
       }
     }

@@ -59,7 +59,7 @@ vi.mock('../../src/lib/crypto', async () => {
 })
 
 import {
-  sendFileParallel, hasLiveSendTask, markTransferAcked, markReceiverReady,
+  sendFileParallel, hasLiveSendTask, markTransferAcked, markReceiverReady, getSendTaskInfo,
   setPeerProtocolVersion, clearPeerProtocolVersion,
   handleMetaMessage, receiveChunk, prepareReceiveBackend, finalizeReceive,
   getReceiveSession, cleanupOPFS, getOPFSHandle,
@@ -170,21 +170,24 @@ describe('BUG-016: queued → delivered → saved', () => {
     // BUG-011: with a v2 peer nothing ships until `transfer-ready`.
     await new Promise(r => setTimeout(r, 0))
     expect(frames.length).toBe(0)
-    markReceiverReady(id, OWNER)
+    const info = getSendTaskInfo(id)!
+    markReceiverReady(id, info.shortId, OWNER)
 
     // Let the engine queue everything and park on the ACK wait.
     await new Promise(r => setTimeout(r, 20))
     expect(frames.length).toBe(2)
     expect(states).toEqual(['queued', 'delivered'])
 
-    markTransferAcked(id, OWNER)
+    markTransferAcked(id, file.size, OWNER)
     const outcome = await sending
     expect(outcome).toEqual({ state: 'saved', acked: true, legacyPeer: false })
     expect(states).toEqual(['queued', 'delivered', 'saved'])
   })
 
   it('stops at `delivered` (never `saved`) when the ACK never arrives', async () => {
-    vi.useFakeTimers()
+    // Fake only timer APIs so crypto.subtle / microtasks still flush; pure
+    // fake timers used to leave the engine parked before the ready barrier.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
     try {
       const id = 'ack-timeout'
       setPeerProtocolVersion(PEER, 2)
@@ -192,10 +195,14 @@ describe('BUG-016: queued → delivered → saved', () => {
       const lane = makeLane(frames)
       const file = new File([new Uint8Array(CHUNK_SIZE)], 'b.bin')
       const sending = sendFileParallel([lane], file, id, 1, PEER, undefined, undefined, undefined, 0)
-      await vi.advanceTimersByTimeAsync(1)
-      markReceiverReady(id, OWNER)
-      await vi.advanceTimersByTimeAsync(50)
-      // Burn the whole ACK budget without a receiver ACK.
+      // Allow deriveTransferIvPrefix + saveTransfer microtasks to settle.
+      await vi.advanceTimersByTimeAsync(0)
+      for (let i = 0; i < 10; i++) await Promise.resolve()
+      const info = getSendTaskInfo(id)
+      expect(info).toBeTruthy()
+      markReceiverReady(id, info!.shortId, OWNER)
+      // Let lanes finish (microtasks) then burn the ACK budget.
+      for (let i = 0; i < 30; i++) await Promise.resolve()
       await vi.advanceTimersByTimeAsync(61_000)
       const outcome = await sending
       expect(outcome).toEqual({ state: 'delivered', acked: false, legacyPeer: false })
@@ -223,13 +230,14 @@ describe('BUG-016: queued → delivered → saved', () => {
     const file = new File([new Uint8Array(CHUNK_SIZE)], 'd.bin')
     const sending = sendFileParallel([lane], file, id, 1, PEER, undefined, undefined, undefined, 0)
     await new Promise(r => setTimeout(r, 0))
-    markReceiverReady(id, OWNER)
+    const info = getSendTaskInfo(id)!
+    markReceiverReady(id, info.shortId, OWNER)
     await new Promise(r => setTimeout(r, 20))
 
     // SECURITY-015: a sibling device in the same identity cluster must not be
     // able to confirm someone else's transfer.
-    expect(markTransferAcked(id, { peerSessionId: 'intruder', epoch: 0 })).toBe(false)
-    expect(markTransferAcked(id, OWNER)).toBe(true)
+    expect(markTransferAcked(id, file.size, { peerSessionId: 'intruder', epoch: 0 })).toBe(false)
+    expect(markTransferAcked(id, file.size, OWNER)).toBe(true)
     await sending
   })
 })

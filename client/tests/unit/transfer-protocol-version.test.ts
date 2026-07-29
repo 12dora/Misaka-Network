@@ -44,7 +44,7 @@ import {
   PROTOCOL_VERSION, makeHelloMessage,
   setPeerProtocolVersion, getPeerProtocolVersion,
   negotiatedProtocolVersion, clearPeerProtocolVersion,
-  sendFileParallel, markReceiverReady, markTransferAcked,
+  sendFileParallel, markReceiverReady, markTransferAcked, getSendTaskInfo,
   CHUNK_FRAME_TAG, encodeChunkFrame, decodeChunkFrame,
   CHUNK_SIZE,
 } from '../../src/lib/transfer'
@@ -78,8 +78,8 @@ beforeEach(() => {
 
 describe('protocol version negotiation', () => {
   it('announces the current version in `hello`', () => {
-    expect(PROTOCOL_VERSION).toBe(2)
-    expect(JSON.parse(makeHelloMessage())).toEqual({ type: 'hello', v: 2 })
+    expect(PROTOCOL_VERSION).toBe(3)
+    expect(JSON.parse(makeHelloMessage())).toEqual({ type: 'hello', v: 3 })
   })
 
   it('treats an unknown / malformed / absent version as v1', () => {
@@ -127,11 +127,12 @@ describe('version-gated delivery semantics', () => {
     await new Promise(r => setTimeout(r, 5))
     expect(frames.length).toBe(0)      // parked on the readiness barrier
 
-    markReceiverReady('gate', OWNER)
+    const info = getSendTaskInfo('gate')!
+    markReceiverReady('gate', info.shortId, OWNER)
     await new Promise(r => setTimeout(r, 20))
     expect(frames.length).toBe(2)
 
-    markTransferAcked('gate', OWNER)
+    markTransferAcked('gate', file.size, OWNER)
     await expect(sending).resolves.toMatchObject({ state: 'saved' })
   })
 
