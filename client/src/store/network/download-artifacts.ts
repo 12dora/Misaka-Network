@@ -4,7 +4,13 @@
  * Cleanup owner: download-artifacts module. Entries are retired by chat
  * prune, peer block, and session-scope epoch teardown via retire/release APIs.
  * Started downloads are NOT auto-revoked (browser has no completion signal).
+ *
+ * Module state:
+ *   artifactLifecycleByUrl → releaseDownloadArtifact / retireDownloadArtifact
+ *   ORPHANED_DOWNLOADS_CHAT_KEY chat rows → releaseDownloadArtifact (prunes
+ *     released URL) / blockPeer (rehomes) / endNetworkEpoch (store clear)
  */
+import { storeGet, storeSet } from './store-access'
 
 interface DownloadArtifactLifecycle {
   cleanup?: () => Promise<void>
@@ -33,11 +39,27 @@ export function isDownloadArtifactStarted(url: string): boolean {
   return artifactLifecycleByUrl.get(url)?.started === true
 }
 
+/** Drop orphan-panel chat rows that pointed at a released URL. */
+function pruneOrphanChatForUrl(url: string): void {
+  try {
+    const state = storeGet()
+    const orphaned = state.chatMessages[ORPHANED_DOWNLOADS_CHAT_KEY]
+    if (!orphaned?.length) return
+    const next = orphaned.filter(m => m.downloadUrl !== url)
+    if (next.length === orphaned.length) return
+    const chatMessages = { ...state.chatMessages }
+    if (next.length === 0) delete chatMessages[ORPHANED_DOWNLOADS_CHAT_KEY]
+    else chatMessages[ORPHANED_DOWNLOADS_CHAT_KEY] = next
+    storeSet({ chatMessages })
+  } catch { /* store not bound in pure unit tests */ }
+}
+
 /** Explicit acknowledgement that the browser has finished saving the file. */
 export async function releaseDownloadArtifact(url: string): Promise<void> {
   try { URL.revokeObjectURL(url) } catch { /* ignore */ }
   const lifecycle = artifactLifecycleByUrl.get(url)
   artifactLifecycleByUrl.delete(url)
+  pruneOrphanChatForUrl(url)
   await lifecycle?.cleanup?.()
 }
 
@@ -56,4 +78,4 @@ export function retireDownloadUrls(urls: string[]): void {
   for (const url of urls) retireDownloadArtifact(url)
 }
 
-/** Open ownership (do not fix here): started artifacts rehomed under ORPHANED_DOWNLOADS_CHAT_KEY. */
+/** Started downloads rehomed under ORPHANED_DOWNLOADS_CHAT_KEY by blockPeer; UI releases via releaseDownloadArtifact. */

@@ -88,19 +88,21 @@ export async function migrateIcePath(peerSessionId: string) {
     let offer: RTCSessionDescriptionInit
     try {
       offer = await pc.createOffer({ iceRestart: true })
+      if (!deps.isPeerConnectionAttemptCurrent(attempt)) return
+      if (!deps.isLocalOfferCurrent(peerSessionId, offerToken)) return
+      // Keep makingOffer true through setLocalDescription so a remote offer
+      // arriving mid-install still observes the collision window.
+      await pc.setLocalDescription(offer)
+      if (!deps.isPeerConnectionAttemptCurrent(attempt)) return
+      if (!deps.isLocalOfferCurrent(peerSessionId, offerToken)) return
+      deps.sendLocalOffer(peerSessionId, pc, pc.localDescription!.toJSON())
     } finally {
-      // Only the current offer token may clear makingOffer — an older
-      // deferred offer finishing must not clear a newer in-flight one.
+      // Only the current offer token may clear makingOffer — after local
+      // description is installed or this token is no longer current.
       if (offerToken !== undefined && deps.isLocalOfferCurrent(peerSessionId, offerToken)) {
         deps.negState(peerSessionId).makingOffer = false
       }
     }
-    if (!deps.isPeerConnectionAttemptCurrent(attempt)) return
-    if (!deps.isLocalOfferCurrent(peerSessionId, offerToken)) return
-    await pc.setLocalDescription(offer)
-    if (!deps.isPeerConnectionAttemptCurrent(attempt)) return
-    if (!deps.isLocalOfferCurrent(peerSessionId, offerToken)) return
-    deps.sendLocalOffer(peerSessionId, pc, pc.localDescription!.toJSON())
   } catch (err) {
     if (offerToken !== undefined && deps.isLocalOfferCurrent(peerSessionId, offerToken)) {
       deps.negState(peerSessionId).makingOffer = false

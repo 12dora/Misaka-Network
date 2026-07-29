@@ -74,14 +74,24 @@ interface NegotiationState {
 }
 /** Cleanup owner: peer-runtime.cleanupPeerConnection (deletes negotiationState entry) */
 export const negotiationState = new Map<string, NegotiationState>()
+/**
+ * Monotonic local-offer generation per peer session. Survives
+ * clearPeerNegotiationState so a superseded deferred offer cannot reuse
+ * token 1 on a replacement connection and clear its makingOffer.
+ * Cleanup owner: clearAllNegotiationState (epoch teardown only).
+ */
+export const peerOfferGeneration = new Map<string, number>()
 export function negState(peerSessionId: string): NegotiationState {
   let s = negotiationState.get(peerSessionId)
   if (!s) {
+    // Seed offerSeq from the peer-level generation so a replacement entry
+    // never restarts at 0 while an old deferred offer still holds token 1.
+    const gen = peerOfferGeneration.get(peerSessionId) ?? 0
     s = {
       makingOffer: false,
       isSettingRemoteAnswerPending: false,
       ignoreOffer: false,
-      offerSeq: 0,
+      offerSeq: gen,
     }
     negotiationState.set(peerSessionId, s)
   }
@@ -92,20 +102,28 @@ export function negState(peerSessionId: string): NegotiationState {
 export function beginLocalOffer(peerSessionId: string): number {
   const neg = negState(peerSessionId)
   neg.makingOffer = true
-  neg.offerSeq += 1
-  return neg.offerSeq
+  const next = (peerOfferGeneration.get(peerSessionId) ?? 0) + 1
+  peerOfferGeneration.set(peerSessionId, next)
+  neg.offerSeq = next
+  return next
 }
 
 /** Invalidate any in-flight local offer (polite glare accepted remote). */
 export function invalidatePendingLocalOffer(peerSessionId: string): void {
   const neg = negState(peerSessionId)
-  neg.offerSeq += 1
+  const next = (peerOfferGeneration.get(peerSessionId) ?? 0) + 1
+  peerOfferGeneration.set(peerSessionId, next)
+  neg.offerSeq = next
   neg.makingOffer = false
 }
 
-/** True iff the createOffer that produced `token` is still the current one. */
+/**
+ * True iff the createOffer that produced `token` is still the current one.
+ * Uses the peer-level generation (not only the current negotiationState
+ * entry) so cleanup/replacement cannot make an old token appear current.
+ */
 export function isLocalOfferCurrent(peerSessionId: string, token: number): boolean {
-  return negState(peerSessionId).offerSeq === token
+  return (peerOfferGeneration.get(peerSessionId) ?? 0) === token
 }
 
 export const peerTaskQueues = new Map<string, Promise<void>>()
@@ -1178,6 +1196,7 @@ export function clearAllNegotiationState(): void {
   peerTaskQueues.clear()
   peerSignalingIncarnations.clear()
   peerLocalOfferTokens.clear()
+  peerOfferGeneration.clear()
   pendingRemoteIce.clear()
   pendingRemoteNegotiationTokens.clear()
   pendingRemoteTokenReservations.clear()

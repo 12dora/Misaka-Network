@@ -4,9 +4,12 @@
  * Module-global state cleanup owners:
  *   sendTasks              → forgetTransfer / resetTransferModuleState (registry)
  *   neutralizedSends       → awaitSendEngineSettlement / forgetTransfer / reset
- *   irrevocableSendGates   → OPEN: survives forgetTransfer + reset; cleared only by
- *                            awaitSendEngineSettlement when engine actually settles
- *                            (no detach). Documented open ownership item.
+ *   irrevocableSendGates   → attempt-keyed Set; clear ONLY via releaseSendAttempt
+ *                            when that attempt settles/aborts (incl. after detach).
+ *                            forgetTransfer/reset must NOT unblock a still-running
+ *                            older engine; a new attempt id is never gated by an old one.
+ *   activeSendAttempts     → transferId → attemptId while engine is bookkept or detached
+ *   detachedSendEngines    → attemptId → promise until engine finally settles
  *   receiverReadyWaiters   → clearReceiverReady / markReceiverRejected / reset
  *   receiverReadyFlags     → clearReceiverReady / reset
  *   laneDrainTimeoutMs     → test helper only (process lifetime)
@@ -99,6 +102,8 @@ interface SendTask {
   transferId: string
   peerSessionId: string
   epoch: number
+  /** Opaque engine attempt — irrevocable gate and wire checks bind to this. */
+  attemptId: number
   shortId: number
   fileSize: number
   totalChunks: number
@@ -123,6 +128,21 @@ interface SendTask {
 
 // Cleanup owner: registry.forgetTransfer / resetTransferModuleState
 export const sendTasks = new Map<string, SendTask>()
+
+/** Monotonic engine attempt ids (never reused). */
+let nextSendAttemptId = 1
+
+/**
+ * transferId → current attempt while bookkept or detached-but-running.
+ * Cleanup owner: releaseSendAttempt (engine settle) only.
+ */
+const activeSendAttempts = new Map<string, number>()
+
+/**
+ * Detached engines still running after task bookkeeping was dropped.
+ * Cleanup owner: releaseSendAttempt when the engine promise settles.
+ */
+const detachedSendEngines = new Map<number, Promise<unknown>>()
 
 export function getSendTaskInfo(transferId: string):
   {
@@ -249,39 +269,106 @@ export class LaneDrainTimeoutError extends Error {
  * when it finally resumes. We keep the cancel signal + task alive (so the
  * engine can observe cancellation) and only block the wire.
  *
- * `irrevocableSendGates` survives `forgetTransfer` / `resetTransferModuleState`
- * so epoch teardown cannot clear the wire gate while an engine is still live.
- * Soft `neutralizedSends` is for ordinary cancel paths and is cleared on
- * settlement; the irrevocable gate is the epoch-safe backstop.
+ * Gates are attempt-keyed: a detached/cancelled attempt stays blocked forever
+ * for THAT attempt only. A later transfer reusing the same transferId gets a
+ * new attemptId and is not poisoned. Soft `neutralizedSends` is transfer-id
+ * scoped for ordinary cancel and is cleared on settlement.
  */
 // Cleanup owner: awaitSendEngineSettlement / forgetTransfer / reset
 export const neutralizedSends = new Set<string>()
-// OPEN OWNERSHIP: survives forgetTransfer + resetTransferModuleState so epoch
-// teardown cannot clear the wire gate while an engine is still live.
-// Cleared only by awaitSendEngineSettlement when !didDetach.
-// Cleanup owner: UNCLEAR / incomplete — open item for next task.
-export const irrevocableSendGates = new Set<string>()
+/**
+ * Opaque engine attempt ids that must never touch the wire again.
+ * Cleanup owner: releaseSendAttempt only (engine settle / abort).
+ * @internal exported for tests that inspect gate survival under ID reuse.
+ */
+export const irrevocableSendGates = new Set<number>()
+
+/** Release gate + attempt maps when this engine attempt truly ends. */
+function releaseSendAttempt(transferId: string, attemptId: number): void {
+  irrevocableSendGates.delete(attemptId)
+  detachedSendEngines.delete(attemptId)
+  if (activeSendAttempts.get(transferId) === attemptId) {
+    activeSendAttempts.delete(transferId)
+  }
+  // Soft neutralize is transfer-scoped; clear only if no other attempt holds it.
+  if (activeSendAttempts.get(transferId) === undefined) {
+    neutralizedSends.delete(transferId)
+  }
+}
 
 export function neutralizeSendTask(transferId: string): void {
   cancelTransfer(transferId)
   neutralizedSends.add(transferId)
-  irrevocableSendGates.add(transferId)
+  const attemptId = activeSendAttempts.get(transferId)
+    ?? sendTasks.get(transferId)?.attemptId
+  if (attemptId !== undefined) irrevocableSendGates.add(attemptId)
   abortBufferWaits(transferId)
 }
 
 export function isSendNeutralized(transferId: string): boolean {
-  return neutralizedSends.has(transferId) || irrevocableSendGates.has(transferId)
+  if (neutralizedSends.has(transferId)) return true
+  const attemptId = activeSendAttempts.get(transferId)
+    ?? sendTasks.get(transferId)?.attemptId
+  return attemptId !== undefined && irrevocableSendGates.has(attemptId)
+}
+
+/** True when this exact engine attempt is hard-gated (post-detach safe). */
+export function isSendAttemptGated(attemptId: number): boolean {
+  return irrevocableSendGates.has(attemptId)
 }
 
 /**
  * Drop live-task bookkeeping without clearing the irrevocable wire gate.
  * Used when a never-resolving slice/worker would otherwise pin settlement
- * forever after the gate is already installed.
+ * forever after the gate is already installed. The underlying engine remains
+ * accounted for in detachedSendEngines until it settles.
  */
 function detachLiveSendTask(transferId: string): void {
+  const task = sendTasks.get(transferId)
+  if (task) {
+    // Account for the still-running engine so we know work is outstanding
+    // (File/worker cannot always be aborted; gate + post-await checks block wire).
+    // Swallow rejection here so a detached cancel cannot surface as an
+    // unhandled rejection after bookkeeping is gone — callers already
+    // observed settlement via awaitSendEngineSettlement.
+    // Avoid double-finally if already detached.
+    if (!detachedSendEngines.has(task.attemptId)) {
+      const tracked = task.promise.then(
+        v => v,
+        () => undefined,
+      )
+      detachedSendEngines.set(task.attemptId, tracked)
+      void tracked.finally(() => {
+        releaseSendAttempt(transferId, task.attemptId)
+      })
+    }
+  }
   sendTasks.delete(transferId)
-  // Keep transferSignals.cancelled + irrevocable gate if present so a late
-  // resume still cannot transmit. Source File is held by the store layer.
+  // Keep transferSignals.cancelled + irrevocable gate so a late resume cannot
+  // transmit. Source File is held by the store layer until send settles.
+}
+
+/**
+ * Epoch / module teardown: hard-gate and account every live, parked, or
+ * unlisted engine before soft cancel signals and task maps are wiped.
+ *
+ * Cleanup owner: registry.resetTransferModuleState (sole caller).
+ * Source of truth is sendTasks + activeSendAttempts + detachedSendEngines —
+ * never the UI transfer card list (a cancel may have removed the card while
+ * the engine is still parked).
+ */
+export function accountAllLiveSendEnginesForTeardown(): void {
+  for (const transferId of [...sendTasks.keys()]) {
+    neutralizeSendTask(transferId)
+    detachLiveSendTask(transferId)
+  }
+  // Attempts already detached or still mapped after detach keep their gates.
+  for (const attemptId of activeSendAttempts.values()) {
+    irrevocableSendGates.add(attemptId)
+  }
+  for (const attemptId of detachedSendEngines.keys()) {
+    irrevocableSendGates.add(attemptId)
+  }
 }
 
 /**
@@ -290,7 +377,7 @@ function detachLiveSendTask(transferId: string): void {
  * neutralised so a wedged encrypt/backpressure wait cannot transmit cancelled
  * data when it eventually resumes. After `detachAfterMs`, task bookkeeping is
  * detached so settlement can complete even if `File.arrayBuffer()` / a worker
- * never resolves — the irrevocable gate still blocks the wire.
+ * never resolves — the attempt-keyed irrevocable gate still blocks the wire.
  */
 export async function awaitSendEngineSettlement(
   transferId: string,
@@ -302,6 +389,8 @@ export async function awaitSendEngineSettlement(
   const started = Date.now()
   let didNeutralize = false
   let didDetach = false
+  const attemptAtStart = activeSendAttempts.get(transferId)
+    ?? sendTasks.get(transferId)?.attemptId
   while (hasLiveSendTask(transferId)) {
     const elapsed = Date.now() - started
     if (!didNeutralize && elapsed >= neutralizeAfterMs) {
@@ -310,7 +399,7 @@ export async function awaitSendEngineSettlement(
     }
     if (!didDetach && elapsed >= detachAfterMs) {
       // Gate is installed; drop task so callers are not wedged forever on a
-      // never-resolving engine boundary.
+      // never-resolving engine boundary. Gate clears when the attempt settles.
       if (!didNeutralize) neutralizeSendTask(transferId)
       detachLiveSendTask(transferId)
       didDetach = true
@@ -319,10 +408,14 @@ export async function awaitSendEngineSettlement(
     await new Promise<void>(r => setTimeout(r, pollMs))
   }
   neutralizedSends.delete(transferId)
-  // Clear the irrevocable gate only when the engine actually settled (task
-  // gone or settled). After detach the engine may still be live in the
-  // background — keep the gate so a late resume cannot transmit.
-  if (!didDetach) irrevocableSendGates.delete(transferId)
+  // Clear the irrevocable gate only when THIS attempt actually settled without
+  // detach. After detach the engine may still be live — keep its attempt gate.
+  if (!didDetach && attemptAtStart !== undefined) {
+    const stillActive = activeSendAttempts.get(transferId)
+    if (stillActive === undefined || stillActive === attemptAtStart) {
+      releaseSendAttempt(transferId, attemptAtStart)
+    }
+  }
 }
 
 export async function sendFileParallel(
@@ -378,6 +471,8 @@ export async function sendFileParallel(
       }
       repairBitmap = bm
     }
+    // Same attempt identity for late repair — never a second engine generation.
+    activeSendAttempts.set(transferId, live.attemptId)
     const promise = runSendEngine(
       live, dcs, file, transferId, peerNodeId, peerSessionId,
       existingRecord, callbacks, repairBitmap, wireFileName,
@@ -387,15 +482,21 @@ export async function sendFileParallel(
     promise.then(
       () => { live.settled = true },
       () => { live.settled = true },
-    )
+    ).finally(() => {
+      if (!detachedSendEngines.has(live.attemptId)) {
+        releaseSendAttempt(transferId, live.attemptId)
+      }
+    })
     return promise
   }
 
   const totalChunks = expectedChunkCount(file.size)
+  const attemptId = nextSendAttemptId++
   const task: SendTask = {
     transferId,
     peerSessionId,
     epoch,
+    attemptId,
     shortId: 0,
     fileSize: file.size,
     totalChunks,
@@ -408,6 +509,7 @@ export async function sendFileParallel(
   // Registered SYNCHRONOUSLY (runSendEngine runs up to its first await inside
   // this same tick), so a second entry point can never slip past the guard.
   sendTasks.set(transferId, task)
+  activeSendAttempts.set(transferId, attemptId)
   registerTransferOwner(transferId, {
     peerSessionId, epoch, direction: 'send',
     fileName: wireFileName, fileSize: file.size,
@@ -422,10 +524,16 @@ export async function sendFileParallel(
   // Keep the task registered after settle so a late `transfer-done` or
   // repair can still hit the same owner/fileSize/shortId. Cleanup is via
   // forgetTransfer / epoch reset / successful saved release.
-  promise.then(
+  // Attempt gate/maps release when the engine truly ends (including detach).
+  void promise.then(
     () => { task.settled = true },
     () => { task.settled = true },
-  )
+  ).finally(() => {
+    // If already detached, detachLiveSendTask owns release via its own finally.
+    if (!detachedSendEngines.has(attemptId)) {
+      releaseSendAttempt(transferId, attemptId)
+    }
+  })
   return promise
 }
 
@@ -490,6 +598,13 @@ async function runSendEngine(
     updatedAt: Date.now(),
   }
   await saveTransfer(record)
+
+  // Re-check engine/attempt gate after initial derivation + row-save awaits —
+  // cancel/detach may have landed while we were parked.
+  if (isSendAttemptGated(task.attemptId) || isSendNeutralized(transferId)
+      || transferSignals.get(transferId)?.cancelled) {
+    throw new TransferCancelledError()
+  }
 
   // skipBitmap: chunks the receiver already has (from a prior session) OR
   // the sender already shipped (from its own persisted record). Either way
@@ -590,6 +705,7 @@ async function runSendEngine(
 
   // Meta is always (re)sent so the receiver can register the new shortId for
   // this connection — cheap and avoids a separate "remap" message on resume.
+  // Wire handoff: re-check attempt gate immediately before EVERY dc.send.
   const meta = JSON.stringify({
     type: 'meta',
     transferId,
@@ -601,7 +717,13 @@ async function runSendEngine(
     mime: file.type || 'application/octet-stream',
     v: PROTOCOL_VERSION,
   } satisfies MetaMessage)
-  for (const lane of activeLanes) lane.send(meta)
+  for (const lane of activeLanes) {
+    if (isSendAttemptGated(task.attemptId) || isSendNeutralized(transferId)
+        || transferSignals.get(transferId)?.cancelled) {
+      throw new TransferCancelledError()
+    }
+    lane.send(meta)
+  }
 
   // BUG-011: with a v2+ receiver, no payload may move until the receiver has
   // COMMITTED a writable storage backend and ACKed `transfer-ready`. Under
@@ -626,7 +748,7 @@ async function runSendEngine(
     const ready = await waitForReceiverReady(transferId, shortId)
     if (!ready) {
       const signal = transferSignals.get(transferId)
-      if (signal?.cancelled) {
+      if (signal?.cancelled || isSendAttemptGated(task.attemptId) || isSendNeutralized(transferId)) {
         throw new TransferCancelledError()
       }
       throw new Error('接收端未就绪（存储准备超时）')
@@ -637,7 +759,12 @@ async function runSendEngine(
   // doesn't render NaN%. v1 tops out at `delivered`; v2/v3 wait for
   // `transfer-done(bytes: 0)` before claiming `saved` — the hard contract
   // says only transfer-done promotes to saved.
+  // Re-check gate after ready wait / before claiming any delivery state.
   if (file.size === 0) {
+    if (isSendAttemptGated(task.attemptId) || isSendNeutralized(transferId)
+        || transferSignals.get(transferId)?.cancelled) {
+      throw new TransferCancelledError()
+    }
     callbacks?.onProgress?.(1, 1)
     callbacks?.onDeliveryState?.('queued')
     callbacks?.onDeliveryState?.('delivered')
@@ -646,7 +773,9 @@ async function runSendEngine(
       return { state: 'delivered', acked: false, legacyPeer: true }
     }
     const settled = await waitForReceiverAck(task, RECEIVER_ACK_TIMEOUT_MS)
-    if (settled === 'cancelled') throw new TransferCancelledError()
+    if (settled === 'cancelled' || isSendAttemptGated(task.attemptId) || isSendNeutralized(transferId)) {
+      throw new TransferCancelledError()
+    }
     if (settled === 'ack') {
       callbacks?.onDeliveryState?.('saved')
       await updateTransfer(transferId, { status: 'completed' })
@@ -721,7 +850,7 @@ async function runSendEngine(
 
   /** Re-read cancel/neutralise after every await that can outlive a cancel. */
   function isAbortRequested(): boolean {
-    if (cancelled || isSendNeutralized(transferId)) return true
+    if (cancelled || isSendNeutralized(transferId) || isSendAttemptGated(task.attemptId)) return true
     return !!transferSignals.get(transferId)?.cancelled
   }
 
@@ -802,8 +931,8 @@ async function runSendEngine(
           return
         }
         if (dc.readyState !== 'open') throw new Error('lane closed')
-        // Hard wire gate: neutralised sends never leave the device.
-        if (isSendNeutralized(transferId)) {
+        // Hard wire gate: neutralised / attempt-gated sends never leave the device.
+        if (isSendNeutralized(transferId) || isSendAttemptGated(task.attemptId)) {
           cancelled = true
           return
         }

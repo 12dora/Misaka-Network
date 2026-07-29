@@ -168,9 +168,9 @@ function defaultEpochTransferTeardown(transfers: Transfer[]) {
   // Durable ACK queue is epoch-scoped: a transfer-done for the previous
   // identity must never be flushed on the next session.
   pendingDurableAcks.clear()
-  // The transfer module also holds per-peer negotiated protocol versions,
-  // in-flight backend preparations and owner records for transfers that never
-  // made it into `state.transfers`. All of it is epoch-scoped.
+  // Hard-gates every live/parked/unlisted send engine (not only store cards),
+  // then wipes epoch-scoped module maps. Irrevocable attempt gates survive
+  // until those engines settle — cancel-then-epoch must not resurrect wire.
   resetTransferModuleState()
   // QUALITY-001: an epoch boundary is the natural moment to retire terminal
   // DB rows — nothing in the next epoch can resume them.

@@ -2,8 +2,9 @@
  * transfer/registry.ts — single terminal teardown orchestrator.
  * Centrally releases owner, ready waiter, task, session and backend maps.
  *
- * Does NOT clear: irrevocableSendGates, pendingCompletedResults, localStorage
- * terminal-cleanup intents (open ownership items — intentional survival).
+ * Does NOT clear: attempt-keyed irrevocable send gates for still-running
+ * engines, or localStorage terminal-cleanup intents (scoped; re-armed by
+ * resumeTerminalCleanupIntents after epoch/token change).
  */
 import { clearPeerProtocolVersion } from './protocol'
 import { transferOwners, clearTransferOwner } from './ownership'
@@ -11,16 +12,21 @@ import { transferSignals, clearTransferSignal } from './flow-control'
 import {
   sendTasks, neutralizedSends,
   receiverReadyFlags, receiverReadyWaiters, clearReceiverReady,
+  accountAllLiveSendEnginesForTeardown,
 } from './send-engine'
 import {
   receiveSessions, backendPreparations,
   terminalCleanupJobs, clearTerminalCleanupJob,
+  resumeTerminalCleanupIntents,
 } from './receive-engine'
 
 /**
  * Drop every piece of module state a transfer owns. Called from the store's
  * epoch teardown once per transfer, and by `resetTransferModuleState()` for a
  * whole-epoch wipe. Idempotent.
+ *
+ * Does NOT clear attempt-keyed irrevocable gates for a still-running engine —
+ * those clear only when that attempt settles (send-engine ownership).
  */
 export function forgetTransfer(transferId: string) {
   transferSignals.delete(transferId)
@@ -28,8 +34,6 @@ export function forgetTransfer(transferId: string) {
   receiveSessions.delete(transferId)
   sendTasks.delete(transferId)
   neutralizedSends.delete(transferId)
-  // Do NOT clear irrevocableSendGates here — epoch teardown calls forget while
-  // an engine may still be mid-slice; the gate must outlive registry reset.
   clearReceiverReady(transferId)
   for (const key of [...backendPreparations.keys()]) {
     // preparationKey() joins with a NUL, which cannot occur in a session id.
@@ -46,11 +50,18 @@ export function forgetTransfer(transferId: string) {
  * negotiated protocol versions, which were announced by peers of the old
  * session.
  *
- * Irrevocable send gates and durable terminal-cleanup intents intentionally
- * survive so a parked engine / pending completed write cannot resume on the
- * wire or lose cleanup after registry wipe.
+ * Attempt-keyed send gates for still-running detached engines stay until those
+ * attempts settle. Durable terminal-cleanup intents survive and are re-armed.
+ *
+ * Order matters: hard-gate and detach every live/parked/unlisted engine FIRST
+ * so wiping soft cancel signals cannot resurrect wire transmission for a
+ * card-removed engine that was never in `state.transfers`.
  */
 export function resetTransferModuleState() {
+  // 1. Hard-gate + account every live engine (including parked unlisted).
+  //    Irrevocable gates and detachedSendEngines survive the wipe below.
+  accountAllLiveSendEnginesForTeardown()
+
   for (const job of terminalCleanupJobs.values()) {
     if (job.timer) clearTimeout(job.timer)
   }
@@ -58,15 +69,17 @@ export function resetTransferModuleState() {
   transferSignals.clear()
   transferOwners.clear()
   receiveSessions.clear()
+  // sendTasks already emptied by detach; clear for safety.
   sendTasks.clear()
   neutralizedSends.clear()
-  // irrevocableSendGates intentionally retained
-  // pendingCompletedResults retained so undelivered completed files survive
   receiverReadyFlags.clear()
   for (const settle of receiverReadyWaiters.values()) settle(false)
   receiverReadyWaiters.clear()
   backendPreparations.clear()
   clearPeerProtocolVersion()
+  // Same-tab epoch/token change cancelled in-memory timers above; re-arm from
+  // durable scoped intents so cleanup work is not lost until the next full init.
+  try { resumeTerminalCleanupIntents() } catch { /* ignore */ }
 }
 
 // Re-export clearTransferSignal for facade completeness

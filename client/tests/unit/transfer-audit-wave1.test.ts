@@ -123,9 +123,12 @@ import {
   WAIT_FOR_BUFFER_TIMEOUT_MS,
   finalizeReceive,
   takePendingCompletedResult,
+  resumeTerminalCleanupIntents,
   resetTransferModuleState,
+  mintReceiveAttemptToken,
   type MetaMessage,
 } from '../../src/lib/transfer'
+import { terminalCleanupJobs } from '../../src/lib/transfer/receive-engine'
 import * as cryptoMod from '../../src/lib/crypto'
 import { chunkAad, deriveTransferIvPrefix, makeChunkIv } from '../../src/lib/crypto'
 import { rangesToBitmap, bitmapPopcount, newBitmap, bitmapSet } from '../../src/lib/chunk-bitmap'
@@ -715,10 +718,12 @@ describe('01 P1: drain timeout is a delivery failure, not delivered', () => {
 
   it('slow but progressing drain succeeds past a hard 30s wall clock', async () => {
     // NO-PROGRESS budget of 2s; buffer decreases slowly for >30s simulated time.
+    // Start ABOVE HIGH_WATER_MARK so waitForBuffer actually parks and exercises
+    // the progress-renewed deadline (exactly 8 MiB returns immediately).
     setLaneDrainTimeoutMsForTests(2_000)
     vi.useFakeTimers({ shouldAdvanceTime: true })
     try {
-      let amount = 8 * 1024 * 1024
+      let amount = 8 * 1024 * 1024 + 1
       const listeners: Record<string, Array<() => void>> = {}
       const dc = {
         readyState: 'open' as RTCDataChannelState,
@@ -767,25 +772,18 @@ describe('01 P0: completed status-write failure must not destroy the artefact', 
     expect(result.bytes).toBe(0)
     // Session retained for cleanup retry — not aborted into destroy path.
     expect(getReceiveSession('done-persist')).toBeTruthy()
-    expect(takePendingCompletedResult('done-persist')?.file).toBeInstanceOf(File)
+    // Sole delivery is the return value — no in-memory File stash / re-delivery API.
+    expect(takePendingCompletedResult('done-persist')).toBeUndefined()
     // CleanupOPFS / deleteChunks must not have run while status is not durable.
     expect(db.deleteChunks).not.toHaveBeenCalled()
     forgetTransfer('done-persist')
   })
 
-  it('irrevocable neutralize survives forgetTransfer + module reset', async () => {
-    neutralizeSendTask('gate-survive')
-    expect(isSendNeutralized('gate-survive')).toBe(true)
-    forgetTransfer('gate-survive')
-    expect(isSendNeutralized('gate-survive')).toBe(true)
-    resetTransferModuleState()
-    expect(isSendNeutralized('gate-survive')).toBe(true)
-  })
-
-  it('awaitSendEngineSettlement detaches a never-resolving engine after gate', async () => {
+  it('attempt-keyed irrevocable gate blocks only the gated attempt, not ID reuse', async () => {
     setPeerProtocolVersion(PEER, 2)
     const frames: ArrayBuffer[] = []
-    const lane = makeLane(frames)
+    const control: string[] = []
+    const lane = makeLane(frames, control)
     let release!: () => void
     const forever = new Promise<void>(r => { release = r })
     const encSpy = vi.spyOn(cryptoMod, 'encryptChunk').mockImplementation(async () => {
@@ -793,28 +791,501 @@ describe('01 P0: completed status-write failure must not destroy the artefact', 
       return { iv: new Uint8Array(12), encrypted: new ArrayBuffer(0) }
     })
     try {
-      const file = new File([new Uint8Array(CHUNK_SIZE)], 'wedge.bin')
-      const sending = sendFileParallel([lane], file, 'wedge-detach', 1, PEER, undefined, undefined, undefined, 0)
+      const file = new File([new Uint8Array(CHUNK_SIZE)], 'gate.bin')
+      const sending = sendFileParallel([lane], file, 'gate-survive', 1, PEER, undefined, undefined, undefined, 0)
+      const sendingDone = sending.catch(() => 'cancelled')
       await new Promise(r => setTimeout(r, 10))
-      const info = getSendTaskInfo('wedge-detach')!
-      markReceiverReady('wedge-detach', info.shortId, OWNER)
+      const info = getSendTaskInfo('gate-survive')!
+      markReceiverReady('gate-survive', info.shortId, OWNER)
       await new Promise(r => setTimeout(r, 10))
-      // Short neutralize + detach budgets so the test finishes.
-      const settleP = awaitSendEngineSettlement('wedge-detach', {
-        neutralizeAfterMs: 20,
-        detachAfterMs: 40,
-        pollMs: 5,
+      neutralizeSendTask('gate-survive')
+      expect(isSendNeutralized('gate-survive')).toBe(true)
+      // Detach + forget must not clear the attempt gate while engine is live.
+      await awaitSendEngineSettlement('gate-survive', {
+        neutralizeAfterMs: 5, detachAfterMs: 10, pollMs: 5,
       })
-      await settleP
-      // Settlement returned even though encrypt is still parked.
-      expect(hasLiveSendTask('wedge-detach')).toBe(false)
-      expect(isSendNeutralized('wedge-detach')).toBe(true)
+      expect(hasLiveSendTask('gate-survive')).toBe(false)
+      forgetTransfer('gate-survive')
+      resetTransferModuleState()
       release()
-      await sending.catch(() => {})
-      forgetTransfer('wedge-detach')
+      await sendingDone
+      // After old engine settles, a fresh send with same id may proceed.
+      const control2: string[] = []
+      const frames2: ArrayBuffer[] = []
+      const lane2 = makeLane(frames2, control2)
+      const file2 = new File([new Uint8Array(0)], 'reuse.bin')
+      const reuse = sendFileParallel([lane2], file2, 'gate-survive', 1, PEER, undefined, undefined, undefined, 0)
+      await new Promise(r => setTimeout(r, 20))
+      // Zero-byte will send meta if not gated — expect meta or a live task.
+      expect(control2.some(s => s.includes('"type":"meta"')) || getSendTaskInfo('gate-survive')).toBeTruthy()
+      await reuse.catch(() => {})
+      forgetTransfer('gate-survive')
     } finally {
       encSpy.mockRestore()
     }
+  })
+
+  it('awaitSendEngineSettlement detaches and blocks ALL wire sends after detach', async () => {
+    setPeerProtocolVersion(PEER, 2)
+    const frames: ArrayBuffer[] = []
+    const control: string[] = []
+    const lane = makeLane(frames, control)
+    let release!: () => void
+    const forever = new Promise<void>(r => { release = r })
+    // Park at IV derivation so meta has not been sent yet when we detach.
+    const deriveSpy = vi.spyOn(cryptoMod, 'deriveTransferIvPrefix').mockImplementation(async () => {
+      await forever
+      return new Uint8Array(8)
+    })
+    try {
+      const file = new File([new Uint8Array(CHUNK_SIZE)], 'wedge.bin')
+      const sending = sendFileParallel([lane], file, 'wedge-detach', 1, PEER, undefined, undefined, undefined, 0)
+      const sendingDone = sending.catch(() => 'cancelled')
+      await new Promise(r => setTimeout(r, 10))
+      // Neutralise + detach while still parked before meta.
+      const settleP = awaitSendEngineSettlement('wedge-detach', {
+        neutralizeAfterMs: 5,
+        detachAfterMs: 15,
+        pollMs: 5,
+      })
+      await settleP
+      expect(hasLiveSendTask('wedge-detach')).toBe(false)
+      const sendsBefore = control.length + frames.length
+      release()
+      await sendingDone
+      await new Promise(r => setTimeout(r, 30))
+      // No string (meta) OR binary (chunk) send after detach.
+      expect(control.length + frames.length).toBe(sendsBefore)
+      expect(control.filter(s => s.includes('"type":"meta"')).length).toBe(0)
+      expect(frames.length).toBe(0)
+      forgetTransfer('wedge-detach')
+    } finally {
+      deriveSpy.mockRestore()
+    }
+  })
+})
+
+describe('01 P0: scoped durable cleanup intents', () => {
+  class MemStorage implements Storage {
+    private m = new Map<string, string>()
+    get length() { return this.m.size }
+    clear() { this.m.clear() }
+    getItem(k: string) { return this.m.has(k) ? this.m.get(k)! : null }
+    key(i: number) { return [...this.m.keys()][i] ?? null }
+    removeItem(k: string) { this.m.delete(k) }
+    setItem(k: string, v: string) { this.m.set(k, v) }
+  }
+
+  let prevStorage: Storage | undefined
+
+  beforeEach(() => {
+    prevStorage = globalThis.localStorage
+    const mem = new MemStorage()
+    Object.defineProperty(globalThis, 'localStorage', {
+      value: mem, configurable: true, writable: true,
+    })
+  })
+
+  afterEach(() => {
+    if (prevStorage !== undefined) {
+      Object.defineProperty(globalThis, 'localStorage', {
+        value: prevStorage, configurable: true, writable: true,
+      })
+    }
+  })
+
+  it('rejects corrupt JSON and does not permanently disable cleanup', async () => {
+    localStorage.setItem('misaka.terminalCleanupIntents', '{not-json')
+    // Must not throw; corrupt value wiped.
+    resumeTerminalCleanupIntents()
+    expect(localStorage.getItem('misaka.terminalCleanupIntents')).toBe('{}')
+  })
+
+  it('does not apply an old identity completed intent to a live new-identity receive', async () => {
+    const transferId = 'intent-replay'
+    // Plant a scoped completed intent from an OLD identity.
+    localStorage.setItem('misaka.terminalCleanupIntents', JSON.stringify({
+      [transferId]: {
+        kind: 'completed',
+        at: Date.now(),
+        peerSessionId: 'old-identity',
+        epoch: 1,
+        fileName: 'old.bin',
+        fileSize: 0,
+        totalChunks: 0,
+        attemptToken: 1,
+      },
+    }))
+    // Live receive under NEW identity, same transferId.
+    const meta = makeMeta({
+      transferId, shortId: 9, fileSize: 0, totalChunks: 0, v: 2, fileName: 'new.bin',
+    })
+    await handleMetaMessage(meta, 1, { peerSessionId: 'new-identity', epoch: 99 })
+    const session = getReceiveSession(transferId)!
+    session.backend = 'idb'
+    session.storageMode = 'indexeddb'
+    session.receivedCount = 0
+    session.peerSessionId = 'new-identity'
+    session.epoch = 99
+    // Production tokens are unique per attempt — leave the real token.
+
+    vi.mocked(db.updateTransfer).mockClear()
+    vi.mocked(db.deleteChunks).mockClear()
+    resumeTerminalCleanupIntents()
+    // Allow scheduled job to fire.
+    await new Promise(r => setTimeout(r, 80))
+
+    // Must NOT have marked the live transfer completed or deleted its chunks.
+    const completedCalls = vi.mocked(db.updateTransfer).mock.calls
+      .filter(c => c[0] === transferId && (c[1] as { status?: string })?.status === 'completed')
+    expect(completedCalls.length).toBe(0)
+    expect(db.deleteChunks).not.toHaveBeenCalledWith(transferId)
+    // Live session still present.
+    expect(getReceiveSession(transferId)).toBeTruthy()
+    // Stale intent removed.
+    const raw = localStorage.getItem('misaka.terminalCleanupIntents')
+    const all = raw ? JSON.parse(raw) as Record<string, unknown> : {}
+    expect(all[transferId]).toBeUndefined()
+    forgetTransfer(transferId)
+  })
+
+  it('rejects same-scope later attempt (unique tokens) — does not destroy live receive', async () => {
+    const transferId = 'intent-same-scope'
+    const meta1 = makeMeta({
+      transferId, shortId: 1, fileSize: 0, totalChunks: 0, v: 2, fileName: 'a.bin',
+    })
+    await handleMetaMessage(meta1, 1, OWNER)
+    const first = getReceiveSession(transferId)!
+    const firstToken = first.attemptToken
+    expect(typeof firstToken).toBe('string')
+    expect(firstToken.length).toBeGreaterThan(8)
+    // Plant intent for the first attempt.
+    localStorage.setItem('misaka.terminalCleanupIntents', JSON.stringify({
+      [transferId]: {
+        kind: 'completed',
+        at: Date.now(),
+        peerSessionId: OWNER.peerSessionId,
+        epoch: OWNER.epoch,
+        fileName: 'a.bin',
+        fileSize: 0,
+        totalChunks: 0,
+        attemptToken: firstToken,
+      },
+    }))
+    // Simulate terminal of first attempt leaving no live session, then a
+    // second same-scope receive reuses the id with a new unique token.
+    forgetTransfer(transferId)
+    const meta2 = makeMeta({
+      transferId, shortId: 2, fileSize: 0, totalChunks: 0, v: 2, fileName: 'a.bin',
+    })
+    await handleMetaMessage(meta2, 1, OWNER)
+    const second = getReceiveSession(transferId)!
+    expect(second.attemptToken).not.toBe(firstToken)
+
+    vi.mocked(db.updateTransfer).mockClear()
+    vi.mocked(db.deleteChunks).mockClear()
+    resumeTerminalCleanupIntents()
+    await new Promise(r => setTimeout(r, 80))
+
+    const completedCalls = vi.mocked(db.updateTransfer).mock.calls
+      .filter(c => c[0] === transferId && (c[1] as { status?: string })?.status === 'completed')
+    expect(completedCalls.length).toBe(0)
+    expect(db.deleteChunks).not.toHaveBeenCalledWith(transferId)
+    expect(getReceiveSession(transferId)).toBeTruthy()
+    forgetTransfer(transferId)
+  })
+
+  it('reload: stale intent with old attemptToken must not terminalize a new receive', async () => {
+    // Mimic page/module reload: durable intent survives, module-local state
+    // does not. UUID tokens ensure the first post-reload receive never
+    // collides with a persisted token from before the reload (the old
+    // counter always restarted at 1 and matched).
+    const transferId = 'intent-reload-collide'
+    const staleToken = mintReceiveAttemptToken()
+    // Wipe in-memory state first (as a fresh module load does), then plant
+    // the durable intent that localStorage would still hold across reload.
+    // Planting before reset would let reset's resume clear it against a
+    // missing row before the later receive exists.
+    resetTransferModuleState()
+    localStorage.setItem('misaka.terminalCleanupIntents', JSON.stringify({
+      [transferId]: {
+        kind: 'completed',
+        at: Date.now(),
+        peerSessionId: OWNER.peerSessionId,
+        epoch: OWNER.epoch,
+        fileName: 'reload.bin',
+        fileSize: 0,
+        totalChunks: 0,
+        attemptToken: staleToken,
+      },
+    }))
+    // Distinct later receive reusing the same transferId after reload.
+    // getTransfer stays null so this is a fresh attempt, not a resume.
+    const meta = makeMeta({
+      transferId, shortId: 3, fileSize: 0, totalChunks: 0, v: 2, fileName: 'reload.bin',
+    })
+    await handleMetaMessage(meta, 1, OWNER)
+    const live = getReceiveSession(transferId)!
+    expect(live.attemptToken).not.toBe(staleToken)
+    expect(typeof live.attemptToken).toBe('string')
+
+    vi.mocked(db.updateTransfer).mockClear()
+    vi.mocked(db.deleteChunks).mockClear()
+    resumeTerminalCleanupIntents()
+    await new Promise(r => setTimeout(r, 80))
+
+    const completedCalls = vi.mocked(db.updateTransfer).mock.calls
+      .filter(c => c[0] === transferId && (c[1] as { status?: string })?.status === 'completed')
+    expect(completedCalls.length).toBe(0)
+    expect(db.deleteChunks).not.toHaveBeenCalledWith(transferId)
+    expect(getReceiveSession(transferId)).toBeTruthy()
+    expect(getReceiveSession(transferId)!.attemptToken).toBe(live.attemptToken)
+    forgetTransfer(transferId)
+  })
+
+  it('fails closed when durable row cannot be read (defers, does not delete chunks)', async () => {
+    const transferId = 'intent-read-fail'
+    localStorage.setItem('misaka.terminalCleanupIntents', JSON.stringify({
+      [transferId]: {
+        kind: 'failed',
+        at: Date.now(),
+        peerSessionId: OWNER.peerSessionId,
+        epoch: OWNER.epoch,
+        fileName: 'x.bin',
+        fileSize: 1,
+        totalChunks: 1,
+        attemptToken: mintReceiveAttemptToken(),
+      },
+    }))
+    vi.mocked(db.getTransfer).mockRejectedValue(new Error('idb offline'))
+    vi.mocked(db.deleteChunks).mockClear()
+    vi.mocked(db.updateTransfer).mockClear()
+    resumeTerminalCleanupIntents()
+    await new Promise(r => setTimeout(r, 80))
+    // Must not have destroyed an unvalidated target.
+    expect(db.deleteChunks).not.toHaveBeenCalledWith(transferId)
+    // Intent stays durable and a job remains armed (not silently orphaned).
+    const raw = localStorage.getItem('misaka.terminalCleanupIntents')
+    const all = raw ? JSON.parse(raw) as Record<string, unknown> : {}
+    expect(all[transferId]).toBeTruthy()
+    expect(terminalCleanupJobs.has(transferId)).toBe(true)
+    const job = terminalCleanupJobs.get(transferId)!
+    expect(job.timer).toBeTruthy()
+    // Cleanup job timer so it does not leak into later tests.
+    forgetTransfer(transferId)
+    vi.mocked(db.getTransfer).mockResolvedValue(undefined)
+  })
+
+  it('legacy row without attemptToken is cleaned when other scope fields match', async () => {
+    const transferId = 'intent-legacy-row'
+    const token = mintReceiveAttemptToken()
+    localStorage.setItem('misaka.terminalCleanupIntents', JSON.stringify({
+      [transferId]: {
+        kind: 'failed',
+        at: Date.now(),
+        peerSessionId: OWNER.peerSessionId,
+        epoch: OWNER.epoch,
+        fileName: 'legacy.bin',
+        fileSize: 1,
+        totalChunks: 1,
+        attemptToken: token,
+      },
+    }))
+    // Old-build durable row: scope matches, no attemptToken field.
+    vi.mocked(db.getTransfer).mockResolvedValue({
+      transferId,
+      direction: 'recv',
+      peerNodeId: 1,
+      peerSessionId: OWNER.peerSessionId,
+      epoch: OWNER.epoch,
+      fileName: 'legacy.bin',
+      fileSize: 1,
+      fileHash: '',
+      totalChunks: 1,
+      receivedChunks: [],
+      status: 'active',
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    vi.mocked(db.updateTransfer).mockClear()
+    vi.mocked(db.deleteChunks).mockClear()
+    resumeTerminalCleanupIntents()
+    await new Promise(r => setTimeout(r, 80))
+
+    expect(db.updateTransfer).toHaveBeenCalledWith(transferId, { status: 'failed' })
+    expect(db.deleteChunks).toHaveBeenCalledWith(transferId)
+    const raw = localStorage.getItem('misaka.terminalCleanupIntents')
+    const all = raw ? JSON.parse(raw) as Record<string, unknown> : {}
+    expect(all[transferId]).toBeUndefined()
+    vi.mocked(db.getTransfer).mockResolvedValue(undefined)
+  })
+
+  it('pre-token intent is kept (not abandoned) when a live later attempt blocks apply', async () => {
+    const transferId = 'intent-pre-token'
+    // Old-build intent shape: no attemptToken field.
+    localStorage.setItem('misaka.terminalCleanupIntents', JSON.stringify({
+      [transferId]: {
+        kind: 'completed',
+        at: Date.now(),
+        peerSessionId: OWNER.peerSessionId,
+        epoch: OWNER.epoch,
+        fileName: 'pre.bin',
+        fileSize: 0,
+        totalChunks: 0,
+      },
+    }))
+    const meta = makeMeta({
+      transferId, shortId: 4, fileSize: 0, totalChunks: 0, v: 2, fileName: 'pre.bin',
+    })
+    await handleMetaMessage(meta, 1, OWNER)
+    vi.mocked(db.updateTransfer).mockClear()
+    vi.mocked(db.deleteChunks).mockClear()
+    resumeTerminalCleanupIntents()
+    await new Promise(r => setTimeout(r, 80))
+
+    // Must not terminalize the live receive.
+    const completedCalls = vi.mocked(db.updateTransfer).mock.calls
+      .filter(c => c[0] === transferId && (c[1] as { status?: string })?.status === 'completed')
+    expect(completedCalls.length).toBe(0)
+    expect(db.deleteChunks).not.toHaveBeenCalledWith(transferId)
+    expect(getReceiveSession(transferId)).toBeTruthy()
+    // Intent must remain armed — not dropped because it lacked a token.
+    const raw = localStorage.getItem('misaka.terminalCleanupIntents')
+    const all = raw ? JSON.parse(raw) as Record<string, unknown> : {}
+    expect(all[transferId]).toBeTruthy()
+    expect(terminalCleanupJobs.has(transferId)).toBe(true)
+    forgetTransfer(transferId)
+  })
+
+  it('legacy untokened intent + legacy untokened row + no live session → cleanup runs', async () => {
+    // Post-reload upgrade path: old-build intent and old-build durable row both
+    // lack attemptToken, but owner/epoch/metadata agree and nothing is live.
+    // Soft-match must apply so the ghost active row and its chunks are cleaned.
+    const transferId = 'intent-legacy-both'
+    const LEGACY_OWNER = { peerSessionId: PEER, epoch: 7 }
+    localStorage.setItem('misaka.terminalCleanupIntents', JSON.stringify({
+      [transferId]: {
+        kind: 'completed',
+        at: Date.now(),
+        peerSessionId: LEGACY_OWNER.peerSessionId,
+        epoch: LEGACY_OWNER.epoch,
+        fileName: 'legacy-both.bin',
+        fileSize: 1024,
+        totalChunks: 1,
+        // no attemptToken — pre-token build shape
+      },
+    }))
+    // Stable mock (not Once): revalidation after status write still sees the row.
+    vi.mocked(db.getTransfer).mockImplementation(async (id: string) => {
+      if (id !== transferId) return undefined
+      return {
+        transferId,
+        direction: 'recv' as const,
+        peerNodeId: 1,
+        peerSessionId: LEGACY_OWNER.peerSessionId,
+        epoch: LEGACY_OWNER.epoch,
+        fileName: 'legacy-both.bin',
+        fileSize: 1024,
+        fileHash: '',
+        totalChunks: 1,
+        receivedChunks: [],
+        status: 'active' as const,
+        createdAt: 1,
+        updatedAt: 1,
+        // no attemptToken
+      }
+    })
+    vi.mocked(db.updateTransfer).mockClear()
+    vi.mocked(db.deleteChunks).mockClear()
+    expect(getReceiveSession(transferId)).toBeUndefined()
+
+    resumeTerminalCleanupIntents()
+    await new Promise(r => setTimeout(r, 120))
+
+    expect(db.updateTransfer).toHaveBeenCalledWith(transferId, { status: 'completed' })
+    expect(db.deleteChunks).toHaveBeenCalledWith(transferId)
+    const raw = localStorage.getItem('misaka.terminalCleanupIntents')
+    const all = raw ? JSON.parse(raw) as Record<string, unknown> : {}
+    expect(all[transferId]).toBeUndefined()
+    vi.mocked(db.getTransfer).mockResolvedValue(undefined)
+  })
+
+  it('legacy untokened intent + live session → cleanup does not run; intent retained', async () => {
+    // Distinct product assertion from the pre-token keep case: same-scope live
+    // receive with a UUID attempt token must not be terminalized by a pre-token
+    // intent even when owner/epoch/metadata would soft-match a durable row.
+    const transferId = 'intent-legacy-live'
+    const LEGACY_OWNER = { peerSessionId: PEER, epoch: 7 }
+    localStorage.setItem('misaka.terminalCleanupIntents', JSON.stringify({
+      [transferId]: {
+        kind: 'completed',
+        at: Date.now(),
+        peerSessionId: LEGACY_OWNER.peerSessionId,
+        epoch: LEGACY_OWNER.epoch,
+        fileName: 'live-block.bin',
+        fileSize: 0,
+        totalChunks: 0,
+      },
+    }))
+    const meta = makeMeta({
+      transferId, shortId: 8, fileSize: 0, totalChunks: 0, v: 2, fileName: 'live-block.bin',
+    })
+    await handleMetaMessage(meta, 1, LEGACY_OWNER)
+    expect(getReceiveSession(transferId)).toBeTruthy()
+    expect(typeof getReceiveSession(transferId)!.attemptToken).toBe('string')
+
+    vi.mocked(db.getTransfer).mockResolvedValue({
+      transferId,
+      direction: 'recv',
+      peerNodeId: 1,
+      peerSessionId: LEGACY_OWNER.peerSessionId,
+      epoch: LEGACY_OWNER.epoch,
+      fileName: 'live-block.bin',
+      fileSize: 0,
+      fileHash: '',
+      totalChunks: 0,
+      receivedChunks: [],
+      status: 'active',
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    vi.mocked(db.updateTransfer).mockClear()
+    vi.mocked(db.deleteChunks).mockClear()
+    resumeTerminalCleanupIntents()
+    await new Promise(r => setTimeout(r, 120))
+
+    const completedCalls = vi.mocked(db.updateTransfer).mock.calls
+      .filter(c => c[0] === transferId && (c[1] as { status?: string })?.status === 'completed')
+    expect(completedCalls.length).toBe(0)
+    expect(db.deleteChunks).not.toHaveBeenCalledWith(transferId)
+    expect(getReceiveSession(transferId)).toBeTruthy()
+    const raw = localStorage.getItem('misaka.terminalCleanupIntents')
+    const all = raw ? JSON.parse(raw) as Record<string, unknown> : {}
+    expect(all[transferId]).toBeTruthy()
+    expect(terminalCleanupJobs.has(transferId)).toBe(true)
+    forgetTransfer(transferId)
+    vi.mocked(db.getTransfer).mockResolvedValue(undefined)
+  })
+
+  it('caps intent map size', () => {
+    const bulk: Record<string, unknown> = {}
+    for (let i = 0; i < 80; i++) {
+      bulk[`id-${i}`] = {
+        kind: 'failed',
+        at: Date.now() - i,
+        peerSessionId: 'p',
+        epoch: 0,
+        fileName: 'f',
+        fileSize: 1,
+        totalChunks: 1,
+        attemptToken: `tok-${i}`,
+      }
+    }
+    localStorage.setItem('misaka.terminalCleanupIntents', JSON.stringify(bulk))
+    resumeTerminalCleanupIntents()
+    const raw = localStorage.getItem('misaka.terminalCleanupIntents')
+    const all = raw ? JSON.parse(raw) as Record<string, unknown> : {}
+    expect(Object.keys(all).length).toBeLessThanOrEqual(64)
   })
 })
 
@@ -825,7 +1296,45 @@ afterEach(() => {
     'ghost-row', 'union', 'late-repair', 'late-repair-2', 'cancel-sig',
     'cancel-enc', 'cancel-neut', 'aad-reroute', 'known',
     'drain-timeout', 'done-persist', 'gate-survive', 'wedge-detach',
+    'intent-replay', 'intent-same-scope', 'intent-read-fail',
+    'intent-reload-collide', 'intent-legacy-row', 'intent-pre-token',
+    'intent-legacy-both', 'intent-legacy-live',
+    'cancel-epoch-wire',
   ]) {
     try { forgetTransfer(id) } catch { /* ignore */ }
   }
+})
+
+describe('01 P0: cancel + epoch reset hard-gates unlisted parked engines', () => {
+  it('does not transmit meta after cancel removes the card and epoch resets module state', async () => {
+    setPeerProtocolVersion(PEER, 2)
+    const frames: ArrayBuffer[] = []
+    const control: string[] = []
+    const lane = makeLane(frames, control)
+    let release!: () => void
+    const forever = new Promise<void>(r => { release = r })
+    const deriveSpy = vi.spyOn(cryptoMod, 'deriveTransferIvPrefix').mockImplementation(async () => {
+      await forever
+      return new Uint8Array(8)
+    })
+    try {
+      const file = new File([new Uint8Array(CHUNK_SIZE)], 'epoch.bin')
+      const sending = sendFileParallel([lane], file, 'cancel-epoch-wire', 1, PEER, undefined, undefined, undefined, 0)
+      const sendingDone = sending.catch(() => 'cancelled')
+      await new Promise(r => setTimeout(r, 10))
+      // Soft-cancel only (card gone) — do not await settlement.
+      cancelTransfer('cancel-epoch-wire')
+      neutralizeSendTask('cancel-epoch-wire')
+      // Epoch teardown wipes soft cancel/task maps; hard gate must remain.
+      resetTransferModuleState()
+      const sendsBefore = control.length + frames.length
+      release()
+      await sendingDone
+      await new Promise(r => setTimeout(r, 30))
+      expect(control.length + frames.length).toBe(sendsBefore)
+      expect(control.filter(s => s.includes('"type":"meta"')).length).toBe(0)
+    } finally {
+      deriveSpy.mockRestore()
+    }
+  })
 })

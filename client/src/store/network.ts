@@ -69,5 +69,6 @@ export {
 export {
   ORPHANED_DOWNLOADS_CHAT_KEY,
   markDownloadArtifactStarted,
+  isDownloadArtifactStarted,
   releaseDownloadArtifact,
 } from './network/download-artifacts'

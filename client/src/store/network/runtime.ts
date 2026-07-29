@@ -49,9 +49,11 @@ import {
 } from './connectivity-controller'
 import {
   iceRestartRetryTimers, iceRestarting, iceRestartAttempts,
+  iceRestartPreconditionStarted,
   initialEncryptedSessionRebuilds,
   attemptIceRestart, handleIceStateChange, scheduleInitialIceRecovery,
   clearInitialIceRecovery, clearDisconnectedTimer,
+  clearPeerIceRecovery, clearAllIceRecovery,
 } from './ice-recovery'
 import { setupDataChannel } from './data-channel-router'
 import {
@@ -241,12 +243,15 @@ bindDeps({
   ecdhResolvers,
   initialEncryptedSessionRebuilds,
   clearInitialIceRecovery,
+  clearPeerIceRecovery,
+  clearAllIceRecovery,
   handleIceStateChange,
   scheduleInitialIceRecovery,
   clearDisconnectedTimer,
   iceRestartRetryTimers,
   iceRestarting,
   iceRestartAttempts,
+  iceRestartPreconditionStarted,
   setupDataChannel,
   notifyPrimaryChannel,
   whenSignalingReady,
@@ -271,5 +276,9 @@ bindDeps({
   failPendingMessages,
   shortIdToTransferId,
   pendingIceMigration,
+  // Per-peer cleanup owners — cleanupPeerConnection deletes these on
+  // departure/block/reconnect. Must be bound here; optional-chain no-ops hide leaks.
+  seenInboundChatIds,
+  pendingDurableAcks,
   get currentToken() { return currentToken },
 } as any)

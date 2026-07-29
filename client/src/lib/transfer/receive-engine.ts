@@ -5,10 +5,14 @@
  *   receiveSessions          → finalizeReceive / abortInboundTransfer / forgetTransfer / reset
  *   backendPreparations      → prepareReceiveBackend finally / forgetTransfer / reset
  *   terminalCleanupJobs      → clearTerminalCleanupJob / forceResidual / reset (timers cancelled)
- *   pendingCompletedResults  → OPEN: takePendingCompletedResult / clearPendingCompleted;
- *                              intentionally survives resetTransferModuleState
- *   terminalCleanup intents  → OPEN: localStorage key misaka.terminalCleanupIntents;
- *                              survives forgetTransfer (by design); cleared on successful cleanup
+ *   terminalCleanup intents  → localStorage key misaka.terminalCleanupIntents;
+ *                              owner: persist/clear/resumeTerminalCleanupIntents in THIS module.
+ *                              Survives forgetTransfer (by design). Bound to owner/epoch/metadata;
+ *                              validated before any row/chunk mutation. Cleared on successful cleanup.
+ *
+ * Delivery model: the File returned by finalizeReceive is the sole delivery.
+ * An in-memory File cannot survive tab close; durable intents only retry
+ * status/chunk cleanup — they never re-deliver a File.
  *
  * Fixed receive order: decrypt → durable write → set bitmap → persist bitmap → progress.
  * finalizeReceive = single successful terminal API across FSA/OPFS/IDB.
@@ -39,8 +43,9 @@ import {
   type MetaMessage, type RepairRequest, type ResumeRequest,
 } from './protocol'
 import {
-  assertTransferOwner, registerTransferOwner, clearTransferOwner,
+  registerTransferOwner, clearTransferOwner,
   transferOwners, TransferOwnershipError,
+  matchesDurableReceiveOwner,
   type TransferOwner,
 } from './ownership'
 import {
@@ -127,12 +132,46 @@ type ReceiveSession = {
   droppedCount: number
   /** BUG-018: set by `finalizeReceive` so a second completion is a no-op. */
   finalized: boolean
-  /** Generation token for stale preparation detection. */
-  attemptToken: number
+  /**
+   * Globally unique attempt identity (UUID / random hex). Never a module-local
+   * counter — those restart at 1 after reload and collide with durable intents.
+   */
+  attemptToken: string
 }
 
 // Cleanup owner: finalizeReceive / abortInboundTransfer / forgetTransfer / reset
 export const receiveSessions = new Map<string, ReceiveSession>()
+
+/**
+ * Mint a receive attempt token that cannot collide across page/module reloads.
+ * `crypto.randomUUID()` when available; otherwise 128 bits of getRandomValues hex.
+ */
+export function mintReceiveAttemptToken(): string {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID()
+    }
+  } catch { /* fall through */ }
+  const bytes = new Uint8Array(16)
+  crypto.getRandomValues(bytes)
+  let hex = ''
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i]!.toString(16).padStart(2, '0')
+  }
+  return hex
+}
+
+/** Normalize durable/intent attempt tokens for exact comparison. */
+function normalizeAttemptToken(token: unknown): string | undefined {
+  if (typeof token === 'string') {
+    const t = token.trim()
+    return t.length > 0 ? t : undefined
+  }
+  if (typeof token === 'number' && Number.isSafeInteger(token) && token > 0) {
+    return String(token)
+  }
+  return undefined
+}
 
 // BUG-011: pre-commit buffer is bounded by BOTH frame count and total bytes.
 // 32 × ~252 KB ≈ 8 MB — enough for a legacy (v1) sender that starts blasting
@@ -288,7 +327,10 @@ export async function handleMetaMessage(
     droppedWhilePaused: newBitmap(msg.totalChunks),
     droppedCount: 0,
     finalized: false,
-    attemptToken: 1,
+    // Globally unique per attempt — UUID/hex, never a reload-resetting counter.
+    // Cleanup intents and durable rows bind to this so same-scope id reuse
+    // cannot destroy a later transfer after a page reload.
+    attemptToken: mintReceiveAttemptToken(),
   }
   receiveSessions.set(msg.transferId, session)
   registerTransferOwner(msg.transferId, {
@@ -318,6 +360,12 @@ export async function handleMetaMessage(
         const saved = await getSavedChunkIndexes(msg.transferId)
         for (const idx of saved) bitmapSet(session.received, idx)
         session.receivedCount = bitmapPopcount(session.received)
+        // Carry the durable attempt identity when resuming the same row so
+        // intents still bind after reload. Fresh geometry keeps the mint above.
+        const priorToken = normalizeAttemptToken(prior.attemptToken)
+        if (priorToken !== undefined) {
+          session.attemptToken = priorToken
+        }
       }
     }
   } catch { /* fresh transfer */ }
@@ -328,6 +376,7 @@ export async function handleMetaMessage(
     peerNodeId,
     peerSessionId: owner.peerSessionId,
     epoch: owner.epoch,
+    attemptToken: session.attemptToken,
     fileName: msg.fileName,
     fileSize: msg.fileSize,
     fileHash: msg.fileHash,
@@ -383,7 +432,7 @@ export function prepareReceiveBackend(
   const inFlight = backendPreparations.get(key)
   if (inFlight) return inFlight
 
-  const attemptToken = session?.attemptToken ?? 0
+  const attemptToken = session?.attemptToken ?? ''
 
   const task = (async (): Promise<PrepareBackendResult> => {
     const selected = await selectWritableBackend(meta)
@@ -822,16 +871,16 @@ export async function finalizeReceive(transferId: string): Promise<FinalizeResul
 
   // ── terminal status + cleanup ──
   // A successful assembly must NEVER be undone by a status-write failure.
-  // Deliver the file to the caller regardless; retry only the durable row /
+  // The File returned here is the sole delivery path (no in-memory re-delivery
+  // stash — Files cannot survive tab close). Retry only the durable row /
   // chunk cleanup without destroying the completed OPFS/IDB artefact.
+  const intentScope = intentScopeFromSession(session)
   try {
     await updateTransfer(transferId, { status: 'completed' })
   } catch (err) {
     // Keep session + handles + finalized so a retry can re-read the artefact.
     // Persist cleanup INTENT durably so a tab close cannot erase the only job.
-    stashPendingCompleted(transferId, { file: named, bytes: named.size, backend, cleanup })
-    persistTerminalCleanupIntent(transferId, 'completed')
-    scheduleTerminalCleanup(transferId, 'completed', 'finalize-persist-failed')
+    scheduleTerminalCleanup(transferId, 'completed', 'finalize-persist-failed', 0, intentScope)
     // Return the assembled file — do not throw into abortInboundTransfer.
     return { file: named, bytes: named.size, backend, cleanup }
   }
@@ -845,14 +894,23 @@ export async function finalizeReceive(transferId: string): Promise<FinalizeResul
     await deleteChunks(transferId)
   } catch (err) {
     console.warn('[transfer] deleteChunks after finalize failed', transferId, err)
-    persistTerminalCleanupIntent(transferId, 'completed')
-    scheduleTerminalCleanup(transferId, 'completed', 'delete-chunks-failed')
+    // Schedule retry and RETURN without clearing the intent we just persisted.
+    // Session can still be retired from the live map; the durable intent +
+    // scoped metadata drive the retry.
+    scheduleTerminalCleanup(transferId, 'completed', 'delete-chunks-failed', 0, intentScope)
+    receiveSessions.delete(transferId)
+    if (!sendTasks.has(transferId) && !hasLiveSendTask(transferId)) {
+      transferSignals.delete(transferId)
+      clearTransferOwner(transferId)
+    }
+    clearReceiverReady(transferId)
+    return { file: named, bytes: named.size, backend, cleanup }
   }
+
   receiveSessions.delete(transferId)
   transferSignals.delete(transferId)
   clearTransferOwner(transferId)
   clearReceiverReady(transferId)
-  clearPendingCompleted(transferId)
   clearTerminalCleanupIntent(transferId)
   // Terminal rows have no consumer (QUALITY-001) — prune opportunistically so
   // the policy runs without a separate scheduler.
@@ -875,92 +933,402 @@ export async function finalizeReceive(transferId: string): Promise<FinalizeResul
 // COMPLETED path is special: assembly already succeeded and the user must
 // receive the artefact. Cleanup may only retry the durable row + chunk store
 // — never destroy OPFS/FSA/IDB assembled bytes.
+//
+// Intents are SCOPED to the exact attempt (owner session, epoch, metadata).
+// An old identity's completed intent must never terminalize a live receive
+// that reuses the same caller-controlled transferId.
 
 const TERMINAL_CLEANUP_MAX_ATTEMPTS = 8
 const TERMINAL_CLEANUP_BASE_DELAY_MS = 50
+/** Slow re-arm when fail-closed row reads stay unreadable after ordinary retries. */
+const TERMINAL_CLEANUP_DEFER_BACKOFF_MS = 5_000
+/**
+ * Bound for pre-token (`keep`) re-arms against a live later attempt. After this
+ * many keep cycles the intent is dropped with a warning so it cannot live
+ * forever when a live receive never yields. Age TTL is the primary long-lived
+ * bound; this is a shorter session-local safety net (~5 min at 5s backoff).
+ */
+const TERMINAL_CLEANUP_KEEP_MAX = 64
 const TERMINAL_CLEANUP_INTENT_KEY = 'misaka.terminalCleanupIntents'
+const TERMINAL_CLEANUP_INTENT_MAX = 64
+const TERMINAL_CLEANUP_INTENT_TTL_MS = 7 * 24 * 60 * 60 * 1000
 
 type TerminalCleanupKind = 'failed' | 'completed'
+
+/** Attempt-scoped durable intent — never keyed by transferId alone. */
+interface TerminalCleanupIntent {
+  kind: TerminalCleanupKind
+  at: number
+  peerSessionId: string
+  epoch: number
+  fileName: string
+  fileSize: number
+  totalChunks: number
+  /**
+   * Globally unique attempt identity. Optional only for pre-token intents from
+   * older builds — those match a durable row solely when owner/epoch/metadata
+   * agree and no live receive with a different proven token is present.
+   */
+  attemptToken?: string | number
+}
 
 interface TerminalCleanupJob {
   transferId: string
   kind: TerminalCleanupKind
   reason: string
   attempts: number
+  scope: TerminalCleanupIntent
   timer?: ReturnType<typeof setTimeout>
-}
-
-interface PendingCompletedResult {
-  file: File
-  bytes: number
-  backend: 'fsa' | 'opfs' | 'idb'
-  cleanup?: () => Promise<void>
 }
 
 // Cleanup owner: clearTerminalCleanupJob / forceResidual / reset (timers)
 export const terminalCleanupJobs = new Map<string, TerminalCleanupJob>()
-// OPEN OWNERSHIP: intentionally survives resetTransferModuleState so undelivered
-// completed Files remain queryable via takePendingCompletedResult.
-// Cleanup owner: takePendingCompletedResult / clearPendingCompleted / forceResidual(failed).
-export const pendingCompletedResults = new Map<string, PendingCompletedResult>()
 
-function stashPendingCompleted(transferId: string, result: PendingCompletedResult): void {
-  pendingCompletedResults.set(transferId, result)
+function intentScopeFromSession(session: ReceiveSession): TerminalCleanupIntent {
+  return {
+    kind: 'completed', // kind filled by caller when persisting
+    at: Date.now(),
+    peerSessionId: session.peerSessionId,
+    epoch: session.epoch,
+    fileName: session.fileName,
+    fileSize: session.fileSize,
+    totalChunks: session.totalChunks,
+    attemptToken: session.attemptToken,
+  }
 }
 
-export function clearPendingCompleted(transferId: string): void {
-  pendingCompletedResults.delete(transferId)
+function isValidIntentShape(entry: unknown): entry is TerminalCleanupIntent {
+  if (!entry || typeof entry !== 'object') return false
+  const e = entry as Record<string, unknown>
+  if (e.kind !== 'completed' && e.kind !== 'failed') return false
+  if (typeof e.at !== 'number' || !Number.isFinite(e.at)) return false
+  if (typeof e.peerSessionId !== 'string' || e.peerSessionId.length === 0) return false
+  if (typeof e.epoch !== 'number' || !Number.isSafeInteger(e.epoch)) return false
+  if (typeof e.fileName !== 'string') return false
+  if (typeof e.fileSize !== 'number' || !Number.isSafeInteger(e.fileSize) || e.fileSize < 0) return false
+  if (typeof e.totalChunks !== 'number' || !Number.isSafeInteger(e.totalChunks) || e.totalChunks < 0) return false
+  // attemptToken optional for pre-token builds. When present: non-empty string
+  // (UUID/hex) or a positive safe integer from intermediate counter builds.
+  if (e.attemptToken !== undefined && e.attemptToken !== null) {
+    if (normalizeAttemptToken(e.attemptToken) === undefined) return false
+  }
+  return true
 }
 
-/** @internal — re-deliver after a completed-status retry (store may re-query). */
-export function takePendingCompletedResult(transferId: string): PendingCompletedResult | undefined {
-  const r = pendingCompletedResults.get(transferId)
-  if (r) pendingCompletedResults.delete(transferId)
-  return r
+/**
+ * Exact attempt match when both sides have tokens. A missing token on the
+ * durable row (or a pre-token intent) is a soft match only when every other
+ * scoping field already agrees — never against a live receive that has a
+ * different proven token (see resolveIntentTarget live path).
+ */
+function attemptTokensCompatible(
+  intentToken: unknown,
+  targetToken: unknown,
+): boolean {
+  const intent = normalizeAttemptToken(intentToken)
+  const target = normalizeAttemptToken(targetToken)
+  if (intent === undefined || target === undefined) return true
+  return intent === target
 }
 
-function persistTerminalCleanupIntent(transferId: string, kind: TerminalCleanupKind): void {
+/** Load intents; recover from corrupt JSON by wiping the key. Cap + expire. */
+function loadCleanupIntents(): Record<string, TerminalCleanupIntent> {
   try {
     const raw = localStorage.getItem(TERMINAL_CLEANUP_INTENT_KEY)
-    const all: Record<string, { kind: TerminalCleanupKind; at: number }> =
-      raw ? JSON.parse(raw) as Record<string, { kind: TerminalCleanupKind; at: number }> : {}
-    all[transferId] = { kind, at: Date.now() }
+    if (!raw) return {}
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      localStorage.removeItem(TERMINAL_CLEANUP_INTENT_KEY)
+      return {}
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      localStorage.removeItem(TERMINAL_CLEANUP_INTENT_KEY)
+      return {}
+    }
+    const out: Record<string, TerminalCleanupIntent> = {}
+    const now = Date.now()
+    for (const [id, entry] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof id !== 'string' || id.length === 0 || id.length > 128) continue
+      if (!isValidIntentShape(entry)) continue
+      if (now - entry.at > TERMINAL_CLEANUP_INTENT_TTL_MS) continue
+      out[id] = entry
+    }
+    // Cap: keep newest by `at`.
+    const ids = Object.keys(out)
+    if (ids.length > TERMINAL_CLEANUP_INTENT_MAX) {
+      ids.sort((a, b) => out[a].at - out[b].at)
+      for (const drop of ids.slice(0, ids.length - TERMINAL_CLEANUP_INTENT_MAX)) {
+        delete out[drop]
+      }
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function saveCleanupIntents(all: Record<string, TerminalCleanupIntent>): void {
+  try {
     localStorage.setItem(TERMINAL_CLEANUP_INTENT_KEY, JSON.stringify(all))
-  } catch { /* private mode / SSR */ }
+  } catch { /* private mode / SSR / quota */ }
+}
+
+function persistTerminalCleanupIntent(
+  transferId: string,
+  kind: TerminalCleanupKind,
+  scope: Omit<TerminalCleanupIntent, 'kind' | 'at'> & { kind?: TerminalCleanupKind; at?: number },
+): void {
+  const all = loadCleanupIntents()
+  // Preserve the original arm time across keep/defer re-arms so the 7-day TTL
+  // still expires intents that can never match (e.g. pre-token vs live forever).
+  const prior = all[transferId]
+  const at =
+    typeof scope.at === 'number' && Number.isFinite(scope.at)
+      ? scope.at
+      : (prior && typeof prior.at === 'number' && Number.isFinite(prior.at)
+        ? prior.at
+        : Date.now())
+  const entry: TerminalCleanupIntent = {
+    kind,
+    at,
+    peerSessionId: scope.peerSessionId,
+    epoch: scope.epoch,
+    fileName: scope.fileName,
+    fileSize: scope.fileSize,
+    totalChunks: scope.totalChunks,
+  }
+  const token = normalizeAttemptToken(scope.attemptToken)
+  if (token !== undefined) entry.attemptToken = token
+  all[transferId] = entry
+  // Cap after insert.
+  const ids = Object.keys(all)
+  if (ids.length > TERMINAL_CLEANUP_INTENT_MAX) {
+    ids.sort((a, b) => all[a].at - all[b].at)
+    for (const drop of ids.slice(0, ids.length - TERMINAL_CLEANUP_INTENT_MAX)) {
+      delete all[drop]
+    }
+  }
+  saveCleanupIntents(all)
+}
+
+/** True when the intent has aged past the durable TTL (must not live forever). */
+function isIntentAgedOut(intent: TerminalCleanupIntent): boolean {
+  return Date.now() - intent.at > TERMINAL_CLEANUP_INTENT_TTL_MS
 }
 
 function clearTerminalCleanupIntent(transferId: string): void {
   try {
-    const raw = localStorage.getItem(TERMINAL_CLEANUP_INTENT_KEY)
-    if (!raw) return
-    const all = JSON.parse(raw) as Record<string, unknown>
+    const all = loadCleanupIntents()
     if (!(transferId in all)) return
     delete all[transferId]
-    localStorage.setItem(TERMINAL_CLEANUP_INTENT_KEY, JSON.stringify(all))
+    saveCleanupIntents(all)
   } catch { /* ignore */ }
 }
 
 /**
+ * Live receive vs intent: require exact attempt tokens when the intent has one.
+ * Soft-matching a missing intent token against a live UUID would terminalize a
+ * distinct later attempt that reused transferId after reload — never do that.
+ */
+function liveMatchesIntent(
+  live: ReceiveSession,
+  intent: TerminalCleanupIntent,
+): boolean {
+  if (
+    live.peerSessionId !== intent.peerSessionId
+    || live.epoch !== intent.epoch
+    || live.fileName !== intent.fileName
+    || live.fileSize !== intent.fileSize
+    || live.totalChunks !== intent.totalChunks
+  ) {
+    return false
+  }
+  const intentToken = normalizeAttemptToken(intent.attemptToken)
+  if (intentToken === undefined) {
+    // Pre-token intent cannot prove identity against a live attempt.
+    return false
+  }
+  return live.attemptToken === intentToken
+}
+
+/**
+ * Pre-token (legacy) intent blocked by a live receive: stay armed only while
+ * the intent is still within age/retry bounds. Aged-out intents are rejected
+ * so they cannot remain permanently inert.
+ */
+function keepOrDropLegacyAgainstLive(intent: TerminalCleanupIntent): 'keep' | 'reject' {
+  if (normalizeAttemptToken(intent.attemptToken) !== undefined) return 'reject'
+  if (isIntentAgedOut(intent)) return 'reject'
+  return 'keep'
+}
+
+/**
+ * Validate that a durable intent still targets the same attempt before any
+ * destructive cleanup. Rejects (and clears) stale/mismatched entries.
+ * Returns `defer` when the durable row cannot be read — fail closed (retry
+ * later) rather than applying against an unvalidated target.
+ * Returns `keep` only when a live receive exists and a pre-token intent cannot
+ * prove match — never when there is nothing live to protect.
+ *
+ * Legacy soft-match (no live session): if owner, epoch and metadata all agree,
+ * missing attemptToken on either side still applies so pre-upgrade intents
+ * clean residual rows instead of living forever.
+ *
+ * A live receive with different owner/epoch/metadata/attempt MUST NOT be touched.
+ */
+async function resolveIntentTarget(
+  transferId: string,
+  intent: TerminalCleanupIntent,
+): Promise<'apply' | 'reject' | 'defer' | 'keep'> {
+  const live = receiveSessions.get(transferId)
+  if (live) {
+    if (!liveMatchesIntent(live, intent)) {
+      // Live attempt present — never terminalize it on an untokened legacy intent.
+      return keepOrDropLegacyAgainstLive(intent)
+    }
+    // Same attempt still in memory — apply (e.g. retry after status-write fail).
+    return 'apply'
+  }
+
+  // No live session: nothing in-memory to protect. Soft-match the durable row
+  // (or residual-apply when the row is already gone but chunks may remain).
+  try {
+    const row = await getTransfer(transferId)
+    // TOCTOU: a newer live receive may have been created during the row read.
+    // Prefer the live check — never apply a stale intent onto a new attempt.
+    const liveAfter = receiveSessions.get(transferId)
+    if (liveAfter) {
+      if (!liveMatchesIntent(liveAfter, intent)) {
+        return keepOrDropLegacyAgainstLive(intent)
+      }
+      return 'apply'
+    }
+    if (!row) {
+      // No durable row and no live session: residual chunk/status cleanup is
+      // still safe and necessary (row may have been written then vanished
+      // between validation and revalidation, or chunks may outlive the row).
+      // Clearing the intent without applying would abandon orphan chunks.
+      return 'apply'
+    }
+    if (
+      (row.peerSessionId != null && row.peerSessionId !== intent.peerSessionId)
+      || (row.epoch != null && row.epoch !== intent.epoch)
+      || row.fileName !== intent.fileName
+      || row.fileSize !== intent.fileSize
+      || row.totalChunks !== intent.totalChunks
+    ) {
+      return 'reject'
+    }
+    // Exact tokens when both sides have them. Missing token on either side is
+    // a legacy soft match once owner/epoch/metadata already agree — so old-build
+    // intents/rows without attemptToken still get cleaned instead of abandoned.
+    if (!attemptTokensCompatible(intent.attemptToken, row.attemptToken)) {
+      return 'reject'
+    }
+    return 'apply'
+  } catch {
+    // DB unavailable — retain intent and retry; never apply unvalidated.
+    // Still protect a live mismatched attempt that appeared while we failed.
+    const liveAfter = receiveSessions.get(transferId)
+    if (liveAfter) {
+      if (!liveMatchesIntent(liveAfter, intent)) {
+        return keepOrDropLegacyAgainstLive(intent)
+      }
+      return 'apply'
+    }
+    return 'defer'
+  }
+}
+
+/** Re-check intent target after every await before mutating or deleting. */
+async function revalidateIntentTarget(
+  transferId: string,
+  intent: TerminalCleanupIntent,
+): Promise<'apply' | 'reject' | 'defer' | 'keep'> {
+  return resolveIntentTarget(transferId, intent)
+}
+
+/**
+ * Drop an intent that can never make progress (aged out or keep-bound) so it
+ * cannot remain permanently inert. Logs a warning for operator visibility.
+ */
+function dropUnresolvableCleanupIntent(
+  transferId: string,
+  kind: TerminalCleanupKind,
+  reason: string,
+  detail: string,
+): void {
+  console.warn(
+    '[transfer] drop unresolvable terminal cleanup intent',
+    transferId, kind, reason, detail,
+  )
+  clearTerminalCleanupJob(transferId)
+  clearTerminalCleanupIntent(transferId)
+}
+
+/**
+ * Arm a slow backoff timer for a durable intent that must stay owned without
+ * mutating unvalidated targets. Used after fail-closed defer exhaustion and
+ * for pre-token intents held against a live later attempt.
+ *
+ * Re-arms preserve the original `scope.at` so the 7-day TTL still applies.
+ * Keep cycles are bounded by TERMINAL_CLEANUP_KEEP_MAX.
+ */
+function armDeferredCleanupRetry(
+  transferId: string,
+  kind: TerminalCleanupKind,
+  reason: string,
+  scope: TerminalCleanupIntent,
+  attempts: number,
+): void {
+  if (isIntentAgedOut(scope)) {
+    dropUnresolvableCleanupIntent(transferId, kind, reason, 'aged-out')
+    return
+  }
+  // Keep-path reasons carry ":keep" — bound those so a live later attempt
+  // cannot pin a pre-token intent forever within a long-lived tab.
+  const isKeep = reason.includes(':keep')
+  if (isKeep && attempts >= TERMINAL_CLEANUP_KEEP_MAX) {
+    dropUnresolvableCleanupIntent(transferId, kind, reason, `keep-max=${TERMINAL_CLEANUP_KEEP_MAX}`)
+    return
+  }
+  cancelTerminalCleanupTimer(transferId)
+  persistTerminalCleanupIntent(transferId, kind, scope)
+  const job: TerminalCleanupJob = {
+    transferId,
+    kind,
+    reason,
+    attempts,
+    scope,
+  }
+  job.timer = setTimeout(() => {
+    const live = terminalCleanupJobs.get(transferId)
+    if (live) live.timer = undefined
+    void runTerminalCleanup(transferId, kind, reason, attempts, scope)
+  }, TERMINAL_CLEANUP_DEFER_BACKOFF_MS)
+  const t = job.timer as unknown as { unref?: () => void }
+  t.unref?.()
+  terminalCleanupJobs.set(transferId, job)
+}
+
+/**
  * Re-arm in-memory cleanup jobs from durable intents after a tab close/reload
- * mid-retry. Safe to call multiple times; does not destroy completed artefacts.
+ * or same-tab epoch/token change. Safe to call multiple times; does not destroy
+ * completed artefacts. Malformed/stale entries are removed.
+ *
+ * Cleanup owner for the localStorage map: this function + successful run clear.
  */
 export function resumeTerminalCleanupIntents(): void {
-  try {
-    const raw = localStorage.getItem(TERMINAL_CLEANUP_INTENT_KEY)
-    if (!raw) return
-    const all = JSON.parse(raw) as Record<string, { kind?: TerminalCleanupKind; at?: number }>
-    for (const [transferId, entry] of Object.entries(all)) {
-      if (!entry || (entry.kind !== 'completed' && entry.kind !== 'failed')) continue
-      // Drop intents older than 7 days to bound localStorage growth.
-      if (typeof entry.at === 'number' && Date.now() - entry.at > 7 * 24 * 60 * 60 * 1000) {
-        clearTerminalCleanupIntent(transferId)
-        continue
-      }
-      if (!terminalCleanupJobs.has(transferId)) {
-        scheduleTerminalCleanup(transferId, entry.kind, 'resume-after-reload', 0)
-      }
+  const all = loadCleanupIntents()
+  // Rewrite store after filter (drops corrupt/expired and caps).
+  saveCleanupIntents(all)
+  for (const [transferId, entry] of Object.entries(all)) {
+    if (!terminalCleanupJobs.has(transferId)) {
+      scheduleTerminalCleanup(transferId, entry.kind, 'resume-after-reload', 0, entry)
     }
-  } catch { /* ignore */ }
+  }
 }
 
 /** Cancel a scheduled retry timer without dropping intent (direct run owns it). */
@@ -983,25 +1351,69 @@ function scheduleTerminalCleanup(
   kind: TerminalCleanupKind,
   reason: string,
   attempts = 0,
+  scope?: TerminalCleanupIntent | Omit<TerminalCleanupIntent, 'kind' | 'at'>,
 ): void {
   cancelTerminalCleanupTimer(transferId)
-  persistTerminalCleanupIntent(transferId, kind)
+  // Prefer live session scope when not provided (abort path).
+  let resolved: TerminalCleanupIntent
+  // scope may be Omit<..., 'at'>; only full intents carry a durable arm time.
+  const scopeAt = (scope as { at?: number } | undefined)?.at
+  const preservedAt =
+    typeof scopeAt === 'number' && Number.isFinite(scopeAt) ? scopeAt : Date.now()
+  if (scope && isValidIntentShape({
+    ...scope,
+    kind,
+    at: preservedAt,
+  })) {
+    // Preserve original arm time when re-scheduling a durable intent so TTL
+    // does not reset on every resume/keep cycle.
+    resolved = {
+      kind,
+      at: preservedAt,
+      peerSessionId: scope.peerSessionId,
+      epoch: scope.epoch,
+      fileName: scope.fileName,
+      fileSize: scope.fileSize,
+      totalChunks: scope.totalChunks,
+    }
+    const token = normalizeAttemptToken(scope.attemptToken)
+    if (token !== undefined) resolved.attemptToken = token
+  } else {
+    const session = receiveSessions.get(transferId)
+    const owner = transferOwners.get(transferId)
+    if (!session && !owner) {
+      // No attempt identity — cannot safely schedule a durable intent.
+      console.warn('[transfer] refuse unscoped terminal cleanup', transferId, kind, reason)
+      return
+    }
+    resolved = {
+      kind,
+      at: Date.now(),
+      peerSessionId: session?.peerSessionId ?? owner!.peerSessionId,
+      epoch: session?.epoch ?? owner!.epoch,
+      fileName: session?.fileName ?? owner!.fileName,
+      fileSize: session?.fileSize ?? owner!.fileSize,
+      totalChunks: session?.totalChunks ?? owner!.totalChunks,
+    }
+    if (session?.attemptToken) resolved.attemptToken = session.attemptToken
+  }
+  persistTerminalCleanupIntent(transferId, kind, resolved)
   if (attempts >= TERMINAL_CLEANUP_MAX_ATTEMPTS) {
     console.warn(
       '[transfer] terminal cleanup exhausted retries; force residual drop',
       transferId, kind, reason,
     )
-    void forceResidualTerminalDrop(transferId, kind)
+    void forceResidualTerminalDrop(transferId, kind, resolved, reason)
     return
   }
   const delay = Math.min(5_000, TERMINAL_CLEANUP_BASE_DELAY_MS * (2 ** attempts))
-  const job: TerminalCleanupJob = { transferId, kind, reason, attempts }
+  const job: TerminalCleanupJob = { transferId, kind, reason, attempts, scope: resolved }
   job.timer = setTimeout(() => {
     // Clear timer handle only — do not delete the job entry before run finishes
     // so a concurrent direct abort can cancel this timer via cancelTerminalCleanupTimer.
     const live = terminalCleanupJobs.get(transferId)
     if (live) live.timer = undefined
-    void runTerminalCleanup(transferId, kind, reason, attempts)
+    void runTerminalCleanup(transferId, kind, reason, attempts, resolved)
   }, delay)
   // Unref so a pending cleanup cannot wedge the Node event loop in tests.
   const t = job.timer as unknown as { unref?: () => void }
@@ -1012,20 +1424,57 @@ function scheduleTerminalCleanup(
 async function forceResidualTerminalDrop(
   transferId: string,
   kind: TerminalCleanupKind,
+  scope: TerminalCleanupIntent,
+  reason = 'force-residual',
 ): Promise<void> {
   // Always cancel any pending timer first so it cannot re-enter after we finish.
   clearTerminalCleanupJob(transferId)
+  const decision = await resolveIntentTarget(transferId, scope)
+  if (decision === 'reject') {
+    clearTerminalCleanupIntent(transferId)
+    return
+  }
+  if (decision === 'defer' || decision === 'keep') {
+    // Fail-closed: never mutate unvalidated targets, but stay armed with a
+    // backoff timer so the intent is not silently orphaned until init/epoch.
+    armDeferredCleanupRetry(
+      transferId,
+      kind,
+      decision === 'keep' ? `${reason}:keep` : `${reason}:defer-backoff`,
+      scope,
+      TERMINAL_CLEANUP_MAX_ATTEMPTS,
+    )
+    return
+  }
+
   try {
     await updateTransfer(transferId, { status: kind === 'completed' ? 'completed' : 'failed' })
   } catch { /* last resort */ }
 
+  // Revalidate after every await before destructive mutation.
+  const afterStatus = await revalidateIntentTarget(transferId, scope)
+  if (afterStatus === 'defer' || afterStatus === 'keep') {
+    armDeferredCleanupRetry(transferId, kind, `${reason}:post-status`, scope, TERMINAL_CLEANUP_MAX_ATTEMPTS)
+    return
+  }
+  if (afterStatus === 'reject') {
+    clearTerminalCleanupIntent(transferId)
+    return
+  }
+  if (afterStatus !== 'apply') return
+
   if (kind === 'completed') {
     // NEVER destroy a completed artefact — only drop chunk recovery state.
     await deleteChunks(transferId).catch(() => {})
+    const afterChunks = await revalidateIntentTarget(transferId, scope)
+    if (afterChunks === 'defer' || afterChunks === 'keep') {
+      armDeferredCleanupRetry(transferId, kind, `${reason}:post-chunks`, scope, TERMINAL_CLEANUP_MAX_ATTEMPTS)
+      return
+    }
+    if (afterChunks !== 'apply') return
     // Drop handle maps (not OPFS entries) so we do not pin FSA/OPFS forever.
     writeHandles.delete(transferId)
     opfsHandles.delete(transferId)
-    // Keep pendingCompleted so a late re-deliver can still find the File.
     receiveSessions.delete(transferId)
     if (!sendTasks.has(transferId) && !hasLiveSendTask(transferId)) {
       transferSignals.delete(transferId)
@@ -1041,8 +1490,32 @@ async function forceResidualTerminalDrop(
   }
 
   await cancelStreamWrite(transferId).catch(() => {})
+  {
+    const d = await revalidateIntentTarget(transferId, scope)
+    if (d === 'defer' || d === 'keep') {
+      armDeferredCleanupRetry(transferId, kind, `${reason}:post-fsa`, scope, TERMINAL_CLEANUP_MAX_ATTEMPTS)
+      return
+    }
+    if (d !== 'apply') return
+  }
   await cleanupOPFS(transferId).catch(() => {})
+  {
+    const d = await revalidateIntentTarget(transferId, scope)
+    if (d === 'defer' || d === 'keep') {
+      armDeferredCleanupRetry(transferId, kind, `${reason}:post-opfs`, scope, TERMINAL_CLEANUP_MAX_ATTEMPTS)
+      return
+    }
+    if (d !== 'apply') return
+  }
   await deleteChunks(transferId).catch(() => {})
+  {
+    const d = await revalidateIntentTarget(transferId, scope)
+    if (d === 'defer' || d === 'keep') {
+      armDeferredCleanupRetry(transferId, kind, `${reason}:post-chunks`, scope, TERMINAL_CLEANUP_MAX_ATTEMPTS)
+      return
+    }
+    if (d !== 'apply') return
+  }
   receiveSessions.delete(transferId)
   if (!sendTasks.has(transferId) && !hasLiveSendTask(transferId)) {
     transferSignals.delete(transferId)
@@ -1054,7 +1527,6 @@ async function forceResidualTerminalDrop(
   for (const key of [...backendPreparations.keys()]) {
     if (key.endsWith(`\u0000${transferId}`)) backendPreparations.delete(key)
   }
-  clearPendingCompleted(transferId)
   clearTerminalCleanupIntent(transferId)
 }
 
@@ -1063,9 +1535,30 @@ async function runTerminalCleanup(
   kind: TerminalCleanupKind,
   reason: string,
   attempts: number,
+  scope: TerminalCleanupIntent,
 ): Promise<void> {
   // Direct abort while a timer is scheduled must not leave a stale fire.
   cancelTerminalCleanupTimer(transferId)
+
+  const decision = await resolveIntentTarget(transferId, scope)
+  if (decision === 'reject') {
+    clearTerminalCleanupJob(transferId)
+    clearTerminalCleanupIntent(transferId)
+    return
+  }
+  if (decision === 'keep') {
+    // Pre-token intent cannot touch a live later attempt — stay armed with
+    // age + keep-count bounds (see armDeferredCleanupRetry).
+    armDeferredCleanupRetry(transferId, kind, `${reason}:keep`, scope, attempts + 1)
+    return
+  }
+  if (decision === 'defer') {
+    // Fail closed: schedule retry without mutating unvalidated targets.
+    // After ordinary retries exhaust, scheduleTerminalCleanup re-arms via
+    // forceResidual → armDeferredCleanupRetry so the intent never goes dormant.
+    scheduleTerminalCleanup(transferId, kind, reason, attempts + 1, scope)
+    return
+  }
 
   // 1. Durable terminal row first.
   try {
@@ -1074,8 +1567,42 @@ async function runTerminalCleanup(
     })
   } catch (err) {
     console.warn('[transfer] terminal status persist failed; scheduling retry', transferId, err)
-    scheduleTerminalCleanup(transferId, kind, reason, attempts + 1)
+    scheduleTerminalCleanup(transferId, kind, reason, attempts + 1, scope)
     return
+  }
+
+  // TOCTOU: a newer same-id attempt may have been created during the await.
+  const afterStatus = await revalidateIntentTarget(transferId, scope)
+  if (afterStatus === 'reject') {
+    clearTerminalCleanupJob(transferId)
+    clearTerminalCleanupIntent(transferId)
+    return
+  }
+  if (afterStatus === 'keep') {
+    armDeferredCleanupRetry(transferId, kind, `${reason}:keep-post-status`, scope, attempts + 1)
+    return
+  }
+  if (afterStatus === 'defer') {
+    scheduleTerminalCleanup(transferId, kind, reason, attempts + 1, scope)
+    return
+  }
+
+  /** After an await: reject clears intent; defer/keep re-arm; apply continues. */
+  const stopUnlessApply = async (tag: string): Promise<boolean> => {
+    const d = await revalidateIntentTarget(transferId, scope)
+    if (d === 'apply') return false
+    if (d === 'reject') {
+      clearTerminalCleanupJob(transferId)
+      clearTerminalCleanupIntent(transferId)
+      return true
+    }
+    if (d === 'keep') {
+      armDeferredCleanupRetry(transferId, kind, `${reason}:${tag}:keep`, scope, attempts + 1)
+      return true
+    }
+    // defer
+    scheduleTerminalCleanup(transferId, kind, reason, attempts + 1, scope)
+    return true
   }
 
   if (kind === 'completed') {
@@ -1085,9 +1612,11 @@ async function runTerminalCleanup(
       await deleteChunks(transferId)
     } catch (err) {
       console.warn('[transfer] deleteChunks during completed cleanup; retry', transferId, err)
-      scheduleTerminalCleanup(transferId, kind, reason, attempts + 1)
+      scheduleTerminalCleanup(transferId, kind, reason, attempts + 1, scope)
       return
     }
+    // Target drifted after chunk delete — stop before wiping live session maps.
+    if (await stopUnlessApply('post-chunks')) return
     writeHandles.delete(transferId)
     opfsHandles.delete(transferId)
     receiveSessions.delete(transferId)
@@ -1101,8 +1630,6 @@ async function runTerminalCleanup(
     }
     clearTerminalCleanupJob(transferId)
     clearTerminalCleanupIntent(transferId)
-    // pendingCompleted is left for takePendingCompletedResult if the first
-    // deliver path missed; otherwise GC'd when taken or epoch ends.
     try {
       const p = pruneTerminalTransfers()
       if (p && typeof (p as Promise<unknown>).then === 'function') {
@@ -1114,25 +1641,33 @@ async function runTerminalCleanup(
 
   // 2. Failed path: backends (abort FSA / close OPFS) — only after the row is
   // durable so a failed persist never destroys the only recovery handles.
+  // Backend failures must RETRY, not silently drop handles/intents.
   try {
     await cancelStreamWrite(transferId)
   } catch (err) {
-    console.warn('[transfer] cancelStreamWrite during terminal cleanup', transferId, err)
+    console.warn('[transfer] cancelStreamWrite during terminal cleanup; retry', transferId, err)
+    scheduleTerminalCleanup(transferId, kind, reason, attempts + 1, scope)
+    return
   }
+  if (await stopUnlessApply('post-fsa')) return
   try {
     await cleanupOPFS(transferId)
   } catch (err) {
-    console.warn('[transfer] cleanupOPFS during terminal cleanup', transferId, err)
+    console.warn('[transfer] cleanupOPFS during terminal cleanup; retry', transferId, err)
+    scheduleTerminalCleanup(transferId, kind, reason, attempts + 1, scope)
+    return
   }
+  if (await stopUnlessApply('post-opfs')) return
 
   // 3. Chunk store.
   try {
     await deleteChunks(transferId)
   } catch (err) {
     console.warn('[transfer] deleteChunks during terminal cleanup; retry', transferId, err)
-    scheduleTerminalCleanup(transferId, kind, reason, attempts + 1)
+    scheduleTerminalCleanup(transferId, kind, reason, attempts + 1, scope)
     return
   }
+  if (await stopUnlessApply('post-chunks')) return
 
   // 4. Session + optional signal (preserve cancel for a live send engine).
   receiveSessions.delete(transferId)
@@ -1145,7 +1680,6 @@ async function runTerminalCleanup(
     if (key.endsWith(`\u0000${transferId}`)) backendPreparations.delete(key)
   }
   clearTerminalCleanupJob(transferId)
-  clearPendingCompleted(transferId)
   clearTerminalCleanupIntent(transferId)
   // Best-effort prune — some unit mocks omit this export; never throw.
   try {
@@ -1154,6 +1688,14 @@ async function runTerminalCleanup(
       void (p as Promise<unknown>).catch(() => {})
     }
   } catch { /* mock / missing export */ }
+}
+
+/**
+ * @deprecated First finalizeReceive return is the sole delivery. Kept so
+ * older audit imports resolve; always returns undefined.
+ */
+export function takePendingCompletedResult(_transferId: string): undefined {
+  return undefined
 }
 
 /**
@@ -1189,7 +1731,35 @@ export async function abortInboundTransfer(
 
   // Run the machine immediately (attempt 0). On persist failure it schedules
   // bounded retries instead of returning with indefinite retention.
-  await runTerminalCleanup(transferId, 'failed', reason, 0)
+  const scopeSession = session ?? receiveSessions.get(transferId)
+  const owner = transferOwners.get(transferId)
+  const scope: TerminalCleanupIntent = scopeSession
+    ? { ...intentScopeFromSession(scopeSession), kind: 'failed', at: Date.now() }
+    : {
+        kind: 'failed',
+        at: Date.now(),
+        peerSessionId: owner?.peerSessionId ?? '',
+        epoch: owner?.epoch ?? 0,
+        fileName: owner?.fileName ?? '',
+        fileSize: owner?.fileSize ?? 0,
+        totalChunks: owner?.totalChunks ?? 0,
+        // No live session → no proven attempt token (pre-token residual path).
+      }
+  if (!scope.peerSessionId && !scopeSession) {
+    // No attempt identity (caller cancelled an id with no live session/owner).
+    // Best-effort residual without durable intent: still mark failed + drop
+    // chunks so cancelReceive cannot leak orphan IDB rows.
+    try {
+      await updateTransfer(transferId, { status: 'failed' })
+    } catch { /* ignore */ }
+    await cancelStreamWrite(transferId).catch(() => {})
+    await cleanupOPFS(transferId).catch(() => {})
+    await deleteChunks(transferId).catch(() => {})
+    receiveSessions.delete(transferId)
+    clearReceiverReady(transferId)
+    return
+  }
+  await runTerminalCleanup(transferId, 'failed', reason, 0, scope)
 }
 
 /** Legacy name kept for callers/tests that only want the assembled File. */
@@ -1211,12 +1781,13 @@ export function cancelReceive(transferId: string): Promise<void> {
 /**
  * Build the receiver's resume request.
  *
- * SECURITY-015: `owner` scopes the request. A persisted record that belongs to
- * a different peer session (or a previous epoch) must not have its received
- * bitmap disclosed — that bitmap is exactly the "how much of which file did
- * these two devices exchange" fact a third device in the same identity cluster
- * should not be able to fish for. Records written before ownership existed
- * (`peerSessionId` absent) stay resumable so an upgrade doesn't strand them.
+ * SECURITY-015: `owner` scopes the request via the durable row (not the
+ * in-memory owner map). After reload/epoch reset `transferOwners` is empty,
+ * but a matching persisted receive row must still produce a resume bitmap.
+ * A record that belongs to a different peer session (or a previous epoch)
+ * must not have its received bitmap disclosed. Records written before
+ * ownership existed (`peerSessionId` absent) stay resumable so an upgrade
+ * doesn't strand them.
  */
 export async function buildResumeRequest(
   transferId: string,
@@ -1224,11 +1795,9 @@ export async function buildResumeRequest(
 ): Promise<ResumeRequest | null> {
   const record = await getTransfer(transferId)
   if (!record || record.status !== 'active') return null
-  if (owner) {
-    if (record.peerSessionId && record.peerSessionId !== owner.peerSessionId) return null
-    if (record.epoch !== undefined && record.epoch !== owner.epoch) return null
-    if (!assertTransferOwner(transferId, owner)) return null
-  }
+  // Durable-row check only — assertTransferOwner rejects unknown in-memory
+  // ids (correct for peer control) and would break reload-then-resume.
+  if (!matchesDurableReceiveOwner(record, owner)) return null
 
   // Merge the persisted record's bitmap with the actual chunks on disk —
   // disk is the authoritative source if the record was flushed before

@@ -1,6 +1,10 @@
 import { useState } from 'react'
 import MisakaButton from '@/components/ui/MisakaButton'
-import { markDownloadArtifactStarted, releaseDownloadArtifact } from '@/store/network'
+import {
+  isDownloadArtifactStarted,
+  markDownloadArtifactStarted,
+  releaseDownloadArtifact,
+} from '@/store/network'
 
 interface Props {
   id: string
@@ -12,9 +16,12 @@ interface Props {
  * Blob URL downloads expose no completion event. OPFS-backed File objects
  * are lazy, so a large download may still be reading long after the click.
  * Keep the backing entry until the user confirms that browser saving ended.
+ *
+ * Initial `started` is read from the artifact registry so a remount after
+ * blockPeer rehome shows Release rather than a second Download.
  */
 export default function DownloadArtifactActions({ id, url, fileName }: Props) {
-  const [started, setStarted] = useState(false)
+  const [started, setStarted] = useState(() => isDownloadArtifactStarted(url))
   const [released, setReleased] = useState(false)
   const [releasing, setReleasing] = useState(false)
 

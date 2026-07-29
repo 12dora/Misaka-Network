@@ -29,7 +29,7 @@ import { storeGet, storeSet } from './store-access'
 import { deps } from './deps'
 import { appendSystemChat, appendFileChat } from './chat-controller'
 import { selectPrunedTerminalTransfers } from './selectors'
-import { registerDownloadArtifact } from './download-artifacts'
+import { registerDownloadArtifact, releaseDownloadArtifact } from './download-artifacts'
 import type { ResumeFailureCode } from './contracts'
 
 export const EMPTY_CIPHERTEXT = new ArrayBuffer(0)
@@ -53,7 +53,11 @@ export const transferSpeedSamples = new Map<string, { bytes: number; at: number 
 // (queued → delivered → saved) that the ✓ badge must not overstate.
 export const transferDelivery = new Map<string, DeliveryState>()
 
-/** Cleanup owner: session-scope.endNetworkEpoch (OPEN: not cleared on every path — see report) */
+/**
+ * Queued transfer-done ACKs until primary is open.
+ * Cleanup owner: flush success / cleanupPeerConnection (per peer) /
+ * endNetworkEpoch (all). Keyed `${peerSessionId}\0${transferId}`.
+ */
 export const pendingDurableAcks = new Map<string, PendingDurableAck>()
 
 interface PendingDurableAck {
@@ -69,9 +73,6 @@ export function setSendingFileForTests(transferId: string, file: File | null): v
   else sendingFiles.delete(transferId)
 }
 
-
-/** Receiver-side chat msgId dedupe (per peer session). */
-/** Cleanup owner: session-scope.endNetworkEpoch / PEER_LEFT (OPEN: incomplete paths — see report) */
 
 export function getTransferDeliveryState(transferId: string): DeliveryState | undefined {
   return transferDelivery.get(transferId)
@@ -589,33 +590,59 @@ export async function deliverCompletedFile(transferId: string, peerSessionId: st
   const receiptEpoch = deps.getNetworkEpoch()
   const receiptOwner = deps.ownerFor(peerSessionId)
 
+  // finalizeReceive is the sole delivery source. Publication failures must
+  // NOT route through abortInboundTransfer (failed cleanup destroys a
+  // completed backend). An in-memory File cannot survive tab close.
+  let finalized: { file: File; bytes: number; cleanup?: () => Promise<void> } | undefined
   try {
-    const { file, bytes, cleanup } = await finalizeReceive(transferId)
+    finalized = await finalizeReceive(transferId)
+  } catch (err) {
+    failTransferRecord(transferId, String(err))
+    deliveredTransfers.delete(transferId)
+    playSound('error')
+    await abortInboundTransfer(transferId, String(err)).catch(() => {})
+    if (!hasLiveSendTask(transferId)) clearTransferSignal(transferId)
+    for (const peerMap of shortIdToTransferId.values()) {
+      for (const [shortId, tid] of peerMap) {
+        if (tid === transferId) peerMap.delete(shortId)
+      }
+    }
+    return
+  }
+
+  try {
     if (
       deps.getNetworkEpoch() !== receiptEpoch
       || receiptOwner.epoch !== deps.getNetworkEpoch()
     ) {
       // Epoch crossed during finalization: do not publish URL/chat/ACK into
-      // the new identity. Drop the artefact and stop.
-      try { await cleanup?.() } catch { /* ignore */ }
+      // the new identity. Drop OPFS cleanup only — never failed-path abort.
+      try { await finalized.cleanup?.() } catch { /* ignore */ }
       deliveredTransfers.delete(transferId)
       return
     }
-    const url = URL.createObjectURL(file)
-    registerDownloadArtifact(url, { cleanup })
-    appendFileChat(peerSessionId, file.name, file.size, url)
+    const url = URL.createObjectURL(finalized.file)
+    registerDownloadArtifact(url, { cleanup: finalized.cleanup })
+    try {
+      appendFileChat(peerSessionId, finalized.file.name, finalized.file.size, url)
+    } catch (publishErr) {
+      // Registration succeeded but chat publish failed — release the URL so
+      // it is not orphaned without a chat owner.
+      await releaseDownloadArtifact(url).catch(() => {})
+      throw publishErr
+    }
     playSound('complete')
     cleanupTransferRecord(transferId)
     // BUG-016: tell the sender the bytes are durably written. Only now may it
     // report "saved" and release the retry source.
-    sendDurableAck(peerSessionId, transferId, bytes)
+    sendDurableAck(peerSessionId, transferId, finalized.bytes)
   } catch (err) {
+    // Publication failed after a successful finalize — surface error but do
+    // not destroy the completed artefact via abortInboundTransfer.
+    console.warn('[net] deliverCompletedFile publish failed after finalize', transferId, err)
     failTransferRecord(transferId, String(err))
     deliveredTransfers.delete(transferId)
     playSound('error')
-    // Single abnormal terminal API — never hand-delete chunks while leaving
-    // session/bitmap inconsistent (ghost resume).
-    await abortInboundTransfer(transferId, String(err)).catch(() => {})
   }
   // Common cleanup: demux entry for any peer's map that pointed at this
   // transferId. Signal is cleared by finalizeReceive / abortInboundTransfer

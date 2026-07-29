@@ -25,7 +25,12 @@ interface OutgoingItem { payload: string; msgId?: string }
 /** Cleanup owner: failPendingMessages / cleanupPeerConnection */
 export const outgoingQueue = new Map<string, OutgoingItem[]>()
 export const queuedMessageIds = new Map<string, Set<string>>()
-/** Cleanup owner: endNetworkEpoch / PEER_LEFT (OPEN: incomplete paths) */
+/**
+ * Per-peer inbound chat id dedupe.
+ * Cleanup owner: clearPeerChatState / cleanupPeerConnection / endNetworkEpoch.
+ * Covers PEER_LEFT (dead DC), block, reconnect, and later local DC death after
+ * a live-DC PEER_LEFT (cleanupPeerConnection is the shared owner).
+ */
 export const seenInboundChatIds = new Map<string, Set<string>>()
 const MAX_SEEN_CHAT_IDS = 500
 
