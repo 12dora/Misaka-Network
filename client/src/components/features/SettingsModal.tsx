@@ -1,4 +1,4 @@
-import { useState, useEffect, useId, useMemo } from 'react'
+import { useState, useEffect, useId, useMemo, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
@@ -74,31 +74,38 @@ export default function SettingsModal({ onClose }: Props) {
 
   // Poll server TURN status while the TURN tab is open — cheap (no secrets),
   // gives the user live view of the kill switch + monthly burn.
-  // BUG-026: `fetchTurnStatus()` returns null on any failure and the old
-  // code just bailed, so the whole status card silently never rendered and
-  // the user had no idea whether the server was reachable.
+  // Serial schedule (settle → wait 10s → next) so a hung network cannot
+  // pile up ~60 overlapping requests. Each request has its own deadline
+  // inside fetchTurnStatus; unmount aborts the in-flight one.
   useEffect(() => {
     if (tab !== 'turn') return
     let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const ac = new AbortController()
     const tick = async () => {
       setTurnStatusState(prev => (prev === 'idle' ? 'running' : prev))
-      const s = await fetchTurnStatus()
+      const s = await fetchTurnStatus(ac.signal)
       if (cancelled) return
       if (!s) {
         setTurnStatusState('error')
-        return
+      } else {
+        setTurnStatus({
+          enabled: s.enabled, configured: s.configured,
+          available: s.available, reason: s.reason,
+          credentialTtlSec: s.credentialTtlSec,
+        })
+        setTurnStatusState('done')
+        setAutoTurnActive(getAutoTurnState())
       }
-      setTurnStatus({
-        enabled: s.enabled, configured: s.configured,
-        available: s.available, reason: s.reason,
-        credentialTtlSec: s.credentialTtlSec,
-      })
-      setTurnStatusState('done')
-      setAutoTurnActive(getAutoTurnState())
+      if (cancelled) return
+      timer = setTimeout(() => { void tick() }, 10_000)
     }
     void tick()
-    const id = window.setInterval(tick, 10_000)
-    return () => { cancelled = true; window.clearInterval(id) }
+    return () => {
+      cancelled = true
+      ac.abort()
+      if (timer) clearTimeout(timer)
+    }
   }, [tab, turnStatusRetry])
 
   async function handleDetectNat() {
@@ -125,7 +132,19 @@ export default function SettingsModal({ onClose }: Props) {
     url: '', username: '', credential: '',
   })
 
+  // Persist only after a *real* value change relative to the loaded baseline.
+  // A one-shot "first effect run" ref is NOT enough: React StrictMode re-runs
+  // setup→cleanup→setup on the same instance, so the second setup would write
+  // the default `enabled:false` and collapse unset → disabled.
+  const turnSettingsBaseline = useRef<string | null>(null)
   useEffect(() => {
+    const snap = JSON.stringify(turnSettings)
+    if (turnSettingsBaseline.current === null) {
+      turnSettingsBaseline.current = snap
+      return
+    }
+    if (snap === turnSettingsBaseline.current) return
+    turnSettingsBaseline.current = snap
     saveTurnSettings(turnSettings)
   }, [turnSettings])
 
@@ -442,19 +461,20 @@ export default function SettingsModal({ onClose }: Props) {
               关闭「启用 TURN 中继」后，自动下发和手工服务器都不会用于连接。
             </p>
 
-            {/* TURN issuance trigger — shown when pending */}
+            {/* TURN issuance trigger — shown when pending; gated on master switch */}
             {turnStatus?.available && !autoTurnActive.active && (
               <div className="flex flex-col items-center gap-2">
                 <MisakaButton
                   variant="primary"
                   size="sm"
-                  disabled={issuing}
+                  disabled={issuing || !turnSettings.enabled}
                   onClick={async () => {
-                    if (issuing) return
+                    if (issuing || !turnSettings.enabled) return
                     setIssuing(true)
                     setIssueError(null)
                     try {
-                      const servers = await refreshAutoTurn()
+                      // force: user gesture may re-issue even after a prior fail
+                      const servers = await refreshAutoTurn({ force: true })
                       setAutoTurnActive(getAutoTurnState())
                       if (servers.length === 0) {
                         setIssueError('暂时无法获取中继凭证。请检查网络后重试。')

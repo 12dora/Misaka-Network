@@ -25,6 +25,13 @@ const authState = {
   releaseAllFromIp: vi.fn(async () => 0),
   dismissIpFullPrompt: vi.fn(),
   clearError: vi.fn(),
+  // Added by the auth-lifecycle track: LoginCard gates its connect button on
+  // the NETWORK_FULL / SERVER_BUSY retry policy, so this mock has to model it.
+  lastAuthErrorCode: null as string | null,
+  connectBlockedUntil: null as number | null,
+  isConnectBlocked: () => false,
+  recoveryUnavailableNotice: false,
+  dismissRecoveryNotice: vi.fn(),
 }
 
 function useAuthStoreMock(sel?: (s: typeof authState) => unknown) {

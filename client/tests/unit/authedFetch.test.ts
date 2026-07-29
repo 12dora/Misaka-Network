@@ -31,6 +31,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 const mockState = vi.hoisted(() => ({
   session: null as { token: string; sessionId: string; expiresAt: number } | null,
   connectCalls: 0,
+  invalidateCalls: 0,
   connectImpl: (() => { /* default no-op */ }) as () => void | Promise<void>,
 }))
 
@@ -41,6 +42,11 @@ vi.mock('@/store/auth', () => ({
       connect: async () => {
         mockState.connectCalls++
         await mockState.connectImpl()
+      },
+      invalidateSession: () => {
+        mockState.invalidateCalls++
+        mockState.session = null
+        try { sessionStorage.removeItem('misaka.session') } catch { /* ignore */ }
       },
     }),
     setState: (patch: Record<string, unknown>) => {
@@ -64,6 +70,7 @@ describe('authedFetch', () => {
   beforeEach(() => {
     mockState.session = { token: 'tok-original', sessionId: 'sess-1', expiresAt: Date.now() + 60_000 }
     mockState.connectCalls = 0
+    mockState.invalidateCalls = 0
     mockState.connectImpl = () => {
       mockState.session = { token: 'tok-refreshed', sessionId: 'sess-2', expiresAt: Date.now() + 60_000 }
     }
@@ -130,7 +137,7 @@ describe('authedFetch', () => {
     expect(retryHeaders.get('Authorization')).toBe('Bearer tok-refreshed')
   })
 
-  it('on 401 → re-auth fails: clears session and throws AuthRequiredError', async () => {
+  it('on 401 → re-auth fails: clears session via invalidateSession and throws AuthRequiredError', async () => {
     fetchSpy.mockResolvedValueOnce(jsonResponse(401))
     mockState.connectImpl = () => { mockState.session = null }
 
@@ -138,9 +145,10 @@ describe('authedFetch', () => {
 
     expect(fetchSpy).toHaveBeenCalledTimes(1) // no retry without a token
     expect(sessionStorage.getItem('misaka.session')).toBeNull()
+    expect(mockState.invalidateCalls).toBe(1)
   })
 
-  it('on 401 → retry also 401: clears session and throws AuthRequiredError', async () => {
+  it('on 401 → retry also 401: clears session via invalidateSession and throws AuthRequiredError', async () => {
     fetchSpy
       .mockResolvedValueOnce(jsonResponse(401))
       .mockResolvedValueOnce(jsonResponse(401))
@@ -149,6 +157,7 @@ describe('authedFetch', () => {
 
     expect(fetchSpy).toHaveBeenCalledTimes(2)
     expect(sessionStorage.getItem('misaka.session')).toBeNull()
+    expect(mockState.invalidateCalls).toBe(1)
   })
 
   it('with no cached token: re-auths first, then sends the request', async () => {

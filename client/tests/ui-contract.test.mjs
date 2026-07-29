@@ -82,20 +82,24 @@ const networkCopy = read('src/copy/zh-CN/network.ts')
 assert.match(networkCopy, /tokenRenderFailed:.*二维码渲染失败|二维码渲染失败/)
 
 // authedFetch core contract: retry once with a fresh token after 401, then
-// throw AuthRequiredError (not just resolve a 401 response).
+// throw AuthRequiredError (not just resolve a 401 response). Terminal failure
+// goes through invalidateSession() so the node Web Lock is released.
 assert.match(api, /export class AuthRequiredError/)
 assert.match(api, /export async function authedFetch/)
 assert.match(api, /res\.status !== 401/)
 assert.match(api, /throw new AuthRequiredError\(\)/)
-assert.match(api, /sessionStorage\.removeItem\('misaka\.session'\)/)
+assert.match(api, /invalidateSession\(\)/)
 
 // WS close codes 4001/4002 (AUTH_REQUIRED / INVALID_TOKEN) must trigger the
 // auth-invalid signal — otherwise the client loops on the dead token forever.
+// Recovery uses /api/re-register with a stored proof (Contract 1), never
+// /register with an empty passcode.
 assert.match(signaling, /e\.code === 4001 \|\| e\.code === 4002/)
 assert.match(signaling, /export function onAuthInvalid/)
 assert.match(authStore, /onAuthInvalid\(\(\)\s*=>/)
-assert.match(authStore, /store\.clearSession\(\)/)
-assert.match(authStore, /void store\.connect\(\)/)
+assert.match(authStore, /invalidateSession\(\)/)
+assert.match(authStore, /reRegisterProof/)
+assert.match(authStore, /\/api\/re-register/)
 
 assert.match(network, /type="file" multiple/)
 assert.match(network, /webkitdirectory/)

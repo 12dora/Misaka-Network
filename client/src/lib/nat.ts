@@ -19,6 +19,12 @@ export { classifyNat, parseCandidate, isPrivateAddress } from './nat-classify'
 // graph re-apply config when the local NAT type changes.
 
 let lastNatType: NatType = 'unknown'
+let natGeneration = 0
+/** Live probe PC — closed early when a newer generation supersedes it. */
+let activeProbePc: RTCPeerConnection | null = null
+let activeProbeGeneration = 0
+/** Rejects the in-flight detectNatType race when the probe is superseded. */
+let activeProbeCancel: ((err: Error) => void) | null = null
 type NatTypeListener = (t: NatType) => void
 const natListeners = new Set<NatTypeListener>()
 
@@ -46,10 +52,28 @@ export function onNatTypeChange(fn: NatTypeListener): () => void {
   return () => natListeners.delete(fn)
 }
 
+function closeActiveProbe() {
+  if (activeProbeCancel) {
+    try { activeProbeCancel(new Error('NAT_PROBE_SUPERSEDED')) } catch { /* ignore */ }
+    activeProbeCancel = null
+  }
+  if (!activeProbePc) return
+  try {
+    activeProbePc.onicecandidate = null
+    activeProbePc.close()
+  } catch { /* ignore */ }
+  activeProbePc = null
+  activeProbeGeneration = 0
+}
+
 // P1-6: discard the cached verdict (e.g. on network change / unhide) so
 // the next detectNatType() re-probes from scratch. Goes through
-// setDetectedNatType so all subscribers see the reset.
+// setDetectedNatType so all subscribers see the reset. Bumps generation
+// so any in-flight probe from the old network cannot publish, and closes
+// its RTCPeerConnection immediately rather than waiting for ICE to finish.
 export function invalidateDetectedNatType() {
+  natGeneration++
+  closeActiveProbe()
   setDetectedNatType('unknown')
 }
 
@@ -65,57 +89,121 @@ export async function detectNatType(
     }
   }
 
+  // Bump so concurrent/stale probes from a previous network cannot overwrite.
+  // Close any prior probe PC early — ICE agents are not free.
+  const generation = ++natGeneration
+  closeActiveProbe()
+
   // Same-host Playwright peers need no external discovery. Keeping the NAT
   // probe host-only prevents a supposedly deterministic test run from
   // quietly issuing public STUN DNS requests before the real peer is built.
-  const pc = new RTCPeerConnection({
-    iceServers: isE2eHostIceOnly() ? [] : stunServers,
-  })
-  // Need at least one m-line so the browser actually gathers.
-  pc.createDataChannel('nat-probe')
+  let pc: RTCPeerConnection
+  try {
+    pc = new RTCPeerConnection({
+      iceServers: isE2eHostIceOnly() ? [] : stunServers,
+    })
+  } catch (err) {
+    return {
+      type: 'unknown',
+      publicEndpoints: [],
+      hasHostCandidate: false,
+      reason: `无法创建 RTCPeerConnection：${String(err)}`,
+    }
+  }
+  activeProbePc = pc
+  activeProbeGeneration = generation
 
   const candidates: ParsedCandidate[] = []
-  const done = new Promise<void>(resolve => {
-    let timer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-      timer = null
-      resolve()
-    }, NAT_DETECTION_TIMEOUT_MS)
-
-    pc.onicecandidate = (e) => {
-      if (e.candidate?.candidate) {
-        const parsed = parseCandidate(e.candidate.candidate)
-        if (parsed) candidates.push(parsed)
-      } else {
-        if (timer) { clearTimeout(timer); timer = null }
-        resolve()
-      }
-    }
-  })
-
   try {
+    // createDataChannel (and everything else) lives inside try/finally so a
+    // policy/hardening throw cannot leak the ICE agent.
+    pc.createDataChannel('nat-probe')
+
+    const done = new Promise<void>(resolve => {
+      let timer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+        timer = null
+        resolve()
+      }, NAT_DETECTION_TIMEOUT_MS)
+
+      pc.onicecandidate = (e) => {
+        if (e.candidate?.candidate) {
+          const parsed = parseCandidate(e.candidate.candidate)
+          if (parsed) candidates.push(parsed)
+        } else {
+          if (timer) { clearTimeout(timer); timer = null }
+          resolve()
+        }
+      }
+    })
+
     let timeout: ReturnType<typeof setTimeout> | null = null
     const deadline = new Promise<never>((_, reject) => {
       timeout = setTimeout(() => reject(new Error('NAT_DETECTION_TIMEOUT')), NAT_DETECTION_TIMEOUT_MS)
+    })
+    const cancelled = new Promise<never>((_, reject) => {
+      activeProbeCancel = reject
     })
     try {
       await Promise.race([
         (async () => {
           const offer = await pc.createOffer()
+          if (generation !== natGeneration) throw new Error('NAT_PROBE_SUPERSEDED')
           await pc.setLocalDescription(offer)
+          if (generation !== natGeneration) throw new Error('NAT_PROBE_SUPERSEDED')
           await done
         })(),
         deadline,
+        cancelled,
       ])
     } finally {
       if (timeout) clearTimeout(timeout)
+      if (activeProbeCancel) activeProbeCancel = null
     }
+
+    if (generation !== natGeneration) {
+      return {
+        type: 'unknown',
+        publicEndpoints: [],
+        hasHostCandidate: false,
+        reason: '检测已被更新的网络状态取代。',
+      }
+    }
+
     const result = classifyNat(candidates)
-    // P1: stash the latest type so buildIceConfig can switch to relay
-    // automatically when we're behind a symmetric NAT — without this the
-    // user had to manually toggle "强制使用 TURN" in Settings.
-    setDetectedNatType(result.type)
+    // Only publish if this probe is still the latest generation.
+    if (generation === natGeneration) {
+      setDetectedNatType(result.type)
+    }
     return result
+  } catch (err) {
+    // Outer deadline still rejects so callers (and existing tests) can
+    // distinguish timeout from a soft "unknown" classification.
+    if (err instanceof Error && err.message === 'NAT_DETECTION_TIMEOUT') {
+      throw err
+    }
+    if (err instanceof Error && err.message === 'NAT_PROBE_SUPERSEDED') {
+      return {
+        type: 'unknown',
+        publicEndpoints: [],
+        hasHostCandidate: false,
+        reason: '检测已被更新的网络状态取代。',
+      }
+    }
+    return {
+      type: 'unknown',
+      publicEndpoints: [],
+      hasHostCandidate: false,
+      reason: `网络类型检测失败：${String(err)}`,
+    }
   } finally {
-    pc.close()
+    if (activeProbePc === pc && activeProbeGeneration === generation) {
+      activeProbePc = null
+      activeProbeGeneration = 0
+      activeProbeCancel = null
+    }
+    try {
+      pc.onicecandidate = null
+      pc.close()
+    } catch { /* ignore */ }
   }
 }

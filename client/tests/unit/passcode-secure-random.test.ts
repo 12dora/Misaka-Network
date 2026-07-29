@@ -49,6 +49,10 @@ describe('secureRandomInt', () => {
   it('throws on an inverted range instead of silently returning NaN', () => {
     expect(() => secureRandomInt(10, 1)).toThrow(RangeError)
   })
+
+  it('rejects a range larger than 2^32 instead of spinning forever', () => {
+    expect(() => secureRandomInt(0, 0x1_0000_0000)).toThrow(RangeError)
+  })
 })
 
 describe('generatePassCode', () => {
