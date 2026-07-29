@@ -17,6 +17,9 @@
 //      format/range check; unknown parameters are rejected outright;
 //   6. the fragment is dropped.
 //
+// Contract 7 — only `type=node` is supported. `file` / `channel` types are
+// rejected so they cannot be scanned into a no-op "node join".
+//
 // The return value is a *relative* path, never a caller-supplied string, so
 // there is no way for an unvalidated value to reach the navigation.
 
@@ -37,16 +40,15 @@ export type ParsedJoinLink =
   | { ok: false; reason: JoinLinkRejection }
 
 const APP_SCHEME = 'misaka://'
-const ALLOWED_TYPES = new Set(['node', 'file', 'channel'])
+/** Only node invites are supported end-to-end (Contract 7). */
+const ALLOWED_TYPES = new Set(['node'])
 /** QR tokens are server-generated opaque ids; keep the charset tight. */
 const TOKEN_RE = /^[A-Za-z0-9_-]{8,128}$/
-/** file-session / channel ids are uuid-ish opaque ids. */
-const OPAQUE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
 // Reusable passcodes are deliberately not an invite parameter. A QR/share
 // URL carries only the opaque, expiring server token; the scanner enters the
 // passcode separately and receives a transactional single-use admission
 // grant after successful redemption.
-const ALLOWED_PARAMS = new Set(['type', 'id', 't', 'fid', 'cid'])
+const ALLOWED_PARAMS = new Set(['type', 'id', 't'])
 
 function normalisePath(p: string): string {
   return p.length > 1 && p.endsWith('/') ? p.slice(0, -1) : p
@@ -121,19 +123,12 @@ export function parseJoinLink(
   const token = params.get('t')
   if (!token || !TOKEN_RE.test(token)) return { ok: false, reason: 'BAD_PARAM' }
 
-  for (const key of ['fid', 'cid'] as const) {
-    const v = params.get(key)
-    if (v !== null && !OPAQUE_ID_RE.test(v)) return { ok: false, reason: 'BAD_PARAM' }
-  }
-
   // Rebuild the query from validated values only — never echo the caller's
   // raw search string, and drop the fragment.
   const clean = new URLSearchParams()
   clean.set('type', type)
   clean.set('id', String(id))
   clean.set('t', token)
-  if (params.get('fid')) clean.set('fid', params.get('fid') as string)
-  if (params.get('cid')) clean.set('cid', params.get('cid') as string)
   return { ok: true, path: `${normalisePath(joinRoute)}?${clean.toString()}` }
 }
 

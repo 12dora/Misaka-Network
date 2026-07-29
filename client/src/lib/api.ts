@@ -33,6 +33,13 @@ function withAuthHeader(init: RequestInit | undefined, token: string): RequestIn
   return { ...init, headers }
 }
 
+function terminalAuthFailure(): never {
+  // Single cleanup entry point — must release the node Web Lock, not only
+  // clear sessionStorage / Zustand. Hard contract: still throw AuthRequiredError.
+  useAuthStore.getState().invalidateSession()
+  throw new AuthRequiredError()
+}
+
 // Fetch `path` (relative — prefixed via apiUrl) with the current Bearer
 // token. On 401 we retry once with a freshly re-registered session.
 // Throws AuthRequiredError if even re-auth comes back unauthorized so the
@@ -41,7 +48,7 @@ export async function authedFetch(path: string, init?: RequestInit): Promise<Res
   let token = currentToken()
   if (!token) {
     token = await reAuth()
-    if (!token) throw new AuthRequiredError()
+    if (!token) terminalAuthFailure()
   }
 
   const url = apiUrl(path)
@@ -49,16 +56,8 @@ export async function authedFetch(path: string, init?: RequestInit): Promise<Res
   if (res.status !== 401) return res
 
   const fresh = await reAuth()
-  if (!fresh) {
-    useAuthStore.setState({ session: null, isConnected: false })
-    sessionStorage.removeItem('misaka.session')
-    throw new AuthRequiredError()
-  }
+  if (!fresh) terminalAuthFailure()
   res = await fetch(url, withAuthHeader(init, fresh))
-  if (res.status === 401) {
-    useAuthStore.setState({ session: null, isConnected: false })
-    sessionStorage.removeItem('misaka.session')
-    throw new AuthRequiredError()
-  }
+  if (res.status === 401) terminalAuthFailure()
   return res
 }

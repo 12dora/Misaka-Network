@@ -58,6 +58,7 @@ function autoTurnResponse(): Response {
 import {
   loadTurnSettings, saveTurnSettings,
   onTurnConfigChange, refreshAutoTurn, clearAutoTurn, getAutoTurnIceServers,
+  resetTurnSettingsMemory, getTurnRelayPreference,
 } from '../../src/lib/turn'
 import { buildIceConfig, applyIceConfigToAll, isRelayAllowed, hasUsableTurnServer } from '../../src/lib/webrtc'
 import { setDetectedNatType } from '../../src/lib/nat'
@@ -72,6 +73,7 @@ function turnUrlsIn(cfg: RTCConfiguration): string[] {
 beforeEach(() => {
   vi.unstubAllEnvs()
   localStorage.clear()
+  resetTurnSettingsMemory()
   clearAutoTurn()
   setDetectedNatType('unknown')
 })
@@ -125,12 +127,29 @@ describe('turnSettings.enabled = false (CLAUDE.md contract)', () => {
   })
 
   it('keeps server-issued auto TURN when the user has never opened Settings', async () => {
-    // No stored record at all: `enabled:false` is only the struct default, not
-    // an opt-out. The server is the canonical gate for auto TURN (budget +
-    // kill-switch), so it must still reach the ICE config out of the box.
+    // No stored record: preference is the tri-state `unset`, NOT the struct
+    // default `enabled:false`. isRelayAllowed consults the tri-state, never
+    // `loadTurnSettings().enabled` in isolation.
+    expect(getTurnRelayPreference()).toBe('unset')
+    expect(loadTurnSettings().enabled).toBe(false)
+    expect(isRelayAllowed()).toBe(true)
     await refreshAutoTurn()
     expect(turnUrlsIn(buildIceConfig())).toEqual([AUTO_TURN_URL])
-    expect(isRelayAllowed()).toBe(true)
+  })
+
+  it('live memory disable wins over a stale enabled storage record', async () => {
+    await refreshAutoTurn()
+    localStorage.setItem('misaka.turnServers', JSON.stringify({
+      v: 1, enabled: true, forceRelay: false, servers: [],
+    }))
+    // Simulate a failed setItem after the user turns relay off.
+    const realSet = localStorage.setItem.bind(localStorage)
+    localStorage.setItem = () => { throw new Error('QuotaExceededError') }
+    saveTurnSettings({ enabled: false, forceRelay: false, servers: [] })
+    localStorage.setItem = realSet
+
+    expect(isRelayAllowed()).toBe(false)
+    expect(turnUrlsIn(buildIceConfig())).toEqual([])
   })
 
   it('re-enabling the master switch brings auto TURN back', async () => {

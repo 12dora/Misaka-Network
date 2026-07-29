@@ -36,12 +36,16 @@ describe('SECURITY-006 happy path', () => {
     expect(r).toEqual({ ok: true, path: `/join?type=node&id=10032&t=${TOKEN}` })
   })
 
-  it('accepts file and channel invites with their opaque ids', () => {
+  it('rejects file and channel invite types (Contract 7)', () => {
     expect(link(`${ORIGIN}${JOIN}?type=file&id=1&t=${TOKEN}&fid=sess-01`)).toEqual({
-      ok: true, path: `/join?type=file&id=1&t=${TOKEN}&fid=sess-01`,
+      ok: false, reason: 'BAD_PARAM',
     })
     expect(link(`${ORIGIN}${JOIN}?type=channel&id=20001&t=${TOKEN}&cid=chan_9`)).toEqual({
-      ok: true, path: `/join?type=channel&id=20001&t=${TOKEN}&cid=chan_9`,
+      ok: false, reason: 'BAD_PARAM',
+    })
+    // type=file alone (no fid) is still rejected
+    expect(link(`${ORIGIN}${JOIN}?type=file&id=1&t=${TOKEN}`)).toEqual({
+      ok: false, reason: 'BAD_PARAM',
     })
   })
 

@@ -24,11 +24,15 @@ const UINT32_SPACE = 0x1_0000_0000
 
 /** Uniform integer in [min, max] (inclusive) from `crypto.getRandomValues`. */
 export function secureRandomInt(min: number, max: number): number {
-  if (!Number.isInteger(min) || !Number.isInteger(max) || max < min) {
+  if (!Number.isSafeInteger(min) || !Number.isSafeInteger(max) || max < min) {
     throw new RangeError(`secureRandomInt: invalid range ${min}..${max}`)
   }
   const range = max - min + 1
   if (range === 1) return min
+  // Uint32 rejection sampling only covers ranges that fit in 2^32.
+  if (range > UINT32_SPACE) {
+    throw new RangeError(`secureRandomInt: range ${range} exceeds 2^32`)
+  }
   // Largest multiple of `range` that fits in 2^32; anything at or above it is
   // re-drawn. The expected number of draws is < 2 for any sane range.
   const limit = Math.floor(UINT32_SPACE / range) * range
