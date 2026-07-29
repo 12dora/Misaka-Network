@@ -81,6 +81,9 @@ describe('A11Y-002: every declared pair meets its WCAG minimum', () => {
   )
 })
 
+// Call-site contrast is asserted by rendered tests (network-layout-a11y unread-badge).
+// Source-presence regex scans are not regression proof.
+
 describe('A11Y-002 edge case: raw fill tokens stay unusable as small text', () => {
   // These are the exact tokens the audit caught being painted as 10–14 px
   // text. If one ever passes AA on white AND on blue the `*-on-light` /

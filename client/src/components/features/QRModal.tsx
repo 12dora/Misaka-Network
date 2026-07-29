@@ -8,27 +8,21 @@ import { authedFetch, AuthRequiredError } from '@/lib/api'
 import { playSound } from '@/lib/sound'
 import { appUrl } from '@/lib/appBase'
 import { useModalExit } from '@/hooks/useModalExit'
+import { network as netCopy } from '@/copy/zh-CN/network'
+import { toUserMessage } from '@/copy/errors'
+import { common } from '@/copy/zh-CN/common'
 
 interface Props {
   nodeId: number
   passCode: string
-  qrType?: 'node' | 'file' | 'channel'
-  fileSessionId?: string
-  channelId?: string
   onClose: () => void
 }
 
-function buildURL(
-  type: string,
-  nodeId: number,
-  qrToken: string,
-  fileSessionId?: string,
-  channelId?: string,
-) {
+// Contract 7: only `type=node` QR is generated. `file`/`channel` entry points
+// and docs claims are removed this wave.
+function buildURL(nodeId: number, qrToken: string) {
   const base = appUrl('/join')
-  const params = new URLSearchParams({ type, id: String(nodeId), t: qrToken })
-  if (type === 'file' && fileSessionId) params.set('fid', fileSessionId)
-  if (type === 'channel' && channelId) params.set('cid', channelId)
+  const params = new URLSearchParams({ type: 'node', id: String(nodeId), t: qrToken })
   return `${base}?${params.toString()}`
 }
 
@@ -39,7 +33,7 @@ function buildURL(
 const QR_MAX_PX = 220
 const QR_RENDER_PX = 440   // render at 2× and downscale for crisp display
 
-export default function QRModal({ nodeId, passCode, qrType = 'node', fileSessionId, channelId, onClose }: Props) {
+export default function QRModal({ nodeId, passCode, onClose }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [qrToken, setQrToken] = useState<string | null>(null)
   const [expiresAt, setExpiresAt] = useState<number>(0)
@@ -71,13 +65,16 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
         // No channel-switch needed: clusters are now identity-scoped, so a
         // scanner who joins with the same nodeId+passcode lands automatically.
       } else {
-        setQrError(`QR 令牌获取失败（HTTP ${res.status}）`)
+        // Keep raw status for diagnostics only — never paint HTTP codes in UI.
+        console.warn('QR token failed', res.status)
+        setQrError(netCopy.qr.tokenFailed)
       }
     } catch (e) {
+      console.error('QR token fetch error:', e)
       if (e instanceof AuthRequiredError) {
-        setQrError('会话已失效，请重新接入后再试')
+        setQrError(toUserMessage('session-expired'))
       } else {
-        setQrError('QR 令牌获取失败，请检查后端连接')
+        setQrError(netCopy.qr.tokenFailed)
       }
     }
     setLoading(false)
@@ -88,14 +85,14 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
   }, [fetchToken])
 
   const shareUrl = qrToken
-    ? buildURL(qrType, nodeId, qrToken, fileSessionId, channelId)
+    ? buildURL(nodeId, qrToken)
     : ''
 
   // Draw QR
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas || !qrToken) return
-    const url = buildURL(qrType, nodeId, qrToken, fileSessionId, channelId)
+    const url = buildURL(nodeId, qrToken)
     setQrError(null)
     QRCode.toCanvas(canvas, url, {
       width: QR_RENDER_PX,
@@ -112,9 +109,9 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
         color: { dark: '#0E2A6B', light: '#FFFFFF' },
       })
         .then(setQrImageUrl)
-        .catch(() => setQrError('QR 渲染失败，请刷新重试'))
+        .catch(() => setQrError(netCopy.qr.tokenRenderFailed))
     })
-  }, [qrToken, nodeId, qrType, fileSessionId, channelId])
+  }, [qrToken, nodeId])
 
   // BUG-031: the old failure path told the user to "手动选取下方链接" — there
   // was no link anywhere in the modal. And the feedback lived in an
@@ -129,10 +126,10 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
     try {
       if (!navigator.clipboard?.writeText) throw new Error('clipboard unavailable')
       await navigator.clipboard.writeText(shareUrl)
-      setCopyToast('链接已复制')
+      setCopyToast(netCopy.qr.linkCopied)
     } catch {
       setCopyFailed(true)
-      setCopyToast('无法复制链接。请长按下方链接复制，或使用系统分享。')
+      setCopyToast(netCopy.qr.copyFailedHelp)
       // Select the text so a long-press / Ctrl+C lands on the whole URL.
       try {
         linkRef.current?.focus()
@@ -145,77 +142,60 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
   async function handleShare() {
     if (!shareUrl) return
     try {
-      await navigator.share({ url: shareUrl, title: '御坂网络接入链接' })
+      await navigator.share({ url: shareUrl, title: netCopy.qr.shareTitle })
     } catch {
       // User cancelled the sheet, or share is unavailable — no error state,
       // the link is still on screen and copy is still offered.
     }
   }
 
-  const qrLabel = {
-    node: '节点 QR',
-    file: '文件 QR',
-    channel: '批次 QR',
-  }[qrType]
-
   return (
     <MisakaDialog
-      title="我的接入 QR"
-      description="用于让其他设备接入当前节点"
+      title={netCopy.qr.myAccessQr}
+      description={netCopy.qr.accessQrForDevices}
       onRequestClose={modal.requestClose}
       backdropClass={modal.backdropClass}
       panelClass={modal.panelClass}
       backdropStyle={{ background: 'rgba(14,42,107,0.75)', backdropFilter: 'blur(10px)' }}
-      panelClassName="relative flex flex-col items-center gap-5 rounded-2xl p-6 xs:p-8"
+      // 08 P2: use misaka-dialog-panel max-height (safe-area aware). Do NOT
+      // set inline maxHeight — it overrides the class and defeats the fix.
+      panelClassName="relative flex flex-col items-center gap-5 rounded-2xl p-6 xs:p-8 misaka-dialog-panel"
       panelStyle={{
         background: 'var(--surface)',
         boxShadow: 'var(--shadow-float)',
-        // P0-2: drop the hard `minWidth: 300`. On a 320px-wide iPhone SE
-        // with the outer `p-4` (16px) backdrop padding, available content
-        // width is 288px — the old minWidth would force horizontal
-        // overflow. Use a clamp so the modal still tries to be 360px on
-        // wider screens but gracefully shrinks down on phones.
         width: 'min(360px, 100% - 8px)',
-        // P1-13: previously had no maxHeight, so on iPhone landscape /
-        // iPad split-view the QR + node info + buttons stack ran off the
-        // viewport and the close / refresh / copy actions became
-        // unreachable. Cap to 90svh with internal scroll.
-        maxHeight: '90svh',
         overflowY: 'auto',
       }}
       renderHeader={({ titleId, descriptionId }) => (
         <>
-          {/* Close */}
           <button
             className="tap-target absolute top-4 right-4 w-7 h-7 flex items-center justify-center rounded-full cursor-pointer hover:opacity-70 transition-opacity"
             style={{ border: 'none', background: 'var(--surface-tint)', color: 'var(--text-on-white)' }}
             onClick={modal.requestClose}
-            aria-label="关闭接入 QR"
+            aria-label={common.close}
           >
             ✕
           </button>
 
-          {/* Header */}
           <div className="flex items-center gap-2">
             <MisakaKanjiBlock char="我" size="md" />
             <div>
               <h2 id={titleId} className="font-kanji font-bold text-base text-[var(--text-on-white)] m-0">
-                我的接入 QR
+                {netCopy.qr.myAccessQr}
               </h2>
               <p id={descriptionId} className="font-kanji text-xs text-[var(--text-on-white-2)] m-0">
-                用于让其他设备接入当前节点
+                {netCopy.qr.accessQrForDevices}
               </p>
             </div>
           </div>
         </>
       )}
     >
-      {/* QR type badge */}
       <span
         className="font-kanji text-[11px] px-2 py-0.5 rounded-full"
         style={{ background: 'var(--surface-tint)', color: 'var(--text-on-white-2)' }}
       >
-        {qrLabel}
+        {netCopy.qr.nodeQr}
       </span>
 
       {/* QR canvas — UX-LAYOUT-006: never wider than the content box. */}
@@ -231,7 +211,7 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
       >
         {loading && !qrToken ? (
           <div className="w-full aspect-square flex items-center justify-center" style={{ maxWidth: QR_MAX_PX }}>
-            <span className="font-kanji text-sm text-[var(--text-muted-on-light)]">生成中…</span>
+            <span className="font-kanji text-sm text-[var(--text-muted-on-light)]">{netCopy.qr.generating}</span>
           </div>
         ) : qrError ? (
           <div className="w-full aspect-square flex flex-col items-center justify-center gap-2 px-4 text-center" style={{ maxWidth: QR_MAX_PX }}>
@@ -250,7 +230,7 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
             {qrImageUrl && (
               <img
                 src={qrImageUrl}
-                alt="接入 QR"
+                alt="接入二维码"
                 style={{ width: '100%', maxWidth: QR_MAX_PX, height: 'auto', display: 'block' }}
               />
             )}
@@ -271,41 +251,36 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
         )}
       </div>
 
-      {/* Node info */}
       <div className="text-center">
         <div className="font-kanji font-bold text-sm text-[var(--text-on-white)]">
-          御坂 {nodeId} 号
+          {netCopy.qr.misakaNumber(nodeId)}
         </div>
         <div className="font-kanji text-xs text-[var(--text-on-white-2)]">
-          当前节点
+          {netCopy.qr.currentDevice}
         </div>
       </div>
 
-      {/* Pass code */}
       <div className="text-center">
-        <div className="font-kanji text-xs text-[var(--text-on-white-2)] mb-1">通行码</div>
+        <div className="font-kanji text-xs text-[var(--text-on-white-2)] mb-1">{netCopy.qr.passCode}</div>
         <div className="font-mono font-bold text-xl tracking-[0.25em] text-[var(--text-on-white)]">
           {passCode}
         </div>
       </div>
 
       <p className="font-kanji text-[11px] text-[var(--text-on-white-2)] leading-snug w-full m-0">
-        链接仅包含一次性接入令牌，不包含可重复使用的通行码。扫码设备仍需单独输入通行码。
+        {netCopy.qr.tokenNoPasscode}
       </p>
 
-      {/* Expiry */}
       {expiresAt > 0 && (
         <div className="font-mono text-[10px] text-[var(--text-muted-on-light)]">
-          {new Date(expiresAt).toLocaleTimeString()} 前有效
+          {netCopy.qr.expiresBefore(new Date(expiresAt).toLocaleTimeString())}
         </div>
       )}
 
-      {/* BUG-031: the link is ALWAYS on screen and selectable, so "长按下方
-          链接复制" refers to something that exists. */}
       {shareUrl && (
         <div className="w-full flex flex-col gap-1">
           <label htmlFor="qr-share-url" className="font-kanji text-[11px] text-[var(--text-on-white-2)]">
-            接入链接
+            {netCopy.qr.accessLink}
           </label>
           <input
             id="qr-share-url"
@@ -319,25 +294,21 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
         </div>
       )}
 
-      {/* Actions */}
       <div className="flex gap-2 w-full">
-        {/* `loading` is set during BOTH first-fetch and refresh in fetchToken,
-            so disabling here also prevents spam-clicking during refresh. */}
         <MisakaButton variant="pill" size="sm" fullWidth onClick={fetchToken} disabled={loading}>
-          {loading && qrToken ? '刷新中…' : '刷新 QR'}
+          {loading && qrToken ? netCopy.qr.refreshing : netCopy.qr.refreshQr}
         </MisakaButton>
         <MisakaButton variant="pill" size="sm" fullWidth onClick={handleCopy} disabled={!qrToken || loading}>
-          复制链接
+          {netCopy.qr.copyLink}
         </MisakaButton>
       </div>
 
       {canShare && shareUrl && (
         <MisakaButton variant="pill" size="sm" fullWidth onClick={handleShare}>
-          系统分享
+          {netCopy.qr.systemShare}
         </MisakaButton>
       )}
 
-      {/* Feedback in normal flow — never clipped by the panel's overflow. */}
       {copyToast && (
         <p
           className="w-full text-center px-3 py-1.5 rounded-md text-xs font-kanji leading-snug"
@@ -352,7 +323,7 @@ export default function QRModal({ nodeId, passCode, qrType = 'node', fileSession
       )}
 
       <MisakaButton variant="pill" size="sm" fullWidth onClick={modal.requestClose}>
-        关闭
+        {netCopy.qr.close}
       </MisakaButton>
     </MisakaDialog>
   )

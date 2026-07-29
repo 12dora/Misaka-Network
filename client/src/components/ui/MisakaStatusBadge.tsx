@@ -11,13 +11,16 @@ interface Props {
 // foreground for the same state rendered as 12 px text. The badge is used on
 // both light cards and the blue page background, so each state carries both
 // variants and the caller picks via `surface`.
+// Functional-page vocabulary (07 P2): 连接 / 正在连接 / 正在恢复连接 / 已断开 /
+// 正在传输. ACGN lore terms (脑波 / 数据流 / 通信终止) stay on the activity
+// stream and ACGN page only.
 const config: Record<NodeStatus, { color: string; onLight: string; onBlue: string; label: string }> = {
-  online:        { color: 'var(--state-success)', onLight: 'var(--state-success-on-light)', onBlue: 'var(--state-success-on-blue)', label: '脑波同步中' },
-  transferring:  { color: 'var(--accent-cyan)',   onLight: 'var(--text-on-white)',          onBlue: 'var(--accent-cyan-on-blue)',   label: '数据流注入中' },
-  connecting:    { color: 'var(--state-warn)',    onLight: 'var(--state-warn-on-light)',    onBlue: 'var(--state-warn-on-blue)',    label: '信道协商中' },
-  reconnecting:  { color: 'var(--state-warn)',    onLight: 'var(--state-warn-on-light)',    onBlue: 'var(--state-warn-on-blue)',    label: '重新协商中' },
+  online:        { color: 'var(--state-success)', onLight: 'var(--state-success-on-light)', onBlue: 'var(--state-success-on-blue)', label: '连接' },
+  transferring:  { color: 'var(--accent-cyan)',   onLight: 'var(--text-on-white)',          onBlue: 'var(--accent-cyan-on-blue)',   label: '正在传输' },
+  connecting:    { color: 'var(--state-warn)',    onLight: 'var(--state-warn-on-light)',    onBlue: 'var(--state-warn-on-blue)',    label: '正在连接' },
+  reconnecting:  { color: 'var(--state-warn)',    onLight: 'var(--state-warn-on-light)',    onBlue: 'var(--state-warn-on-blue)',    label: '正在恢复连接' },
   unauthorized:  { color: 'var(--state-danger)',  onLight: 'var(--state-danger-on-light)',  onBlue: 'var(--state-danger-on-blue)',  label: '通行码错误' },
-  offline:       { color: 'var(--text-muted)',    onLight: 'var(--text-muted-on-light)',    onBlue: 'var(--text-on-blue-2)',        label: '通信终止' },
+  offline:       { color: 'var(--text-muted)',    onLight: 'var(--text-muted-on-light)',    onBlue: 'var(--text-on-blue-2)',        label: '已断开' },
 }
 
 export default function MisakaStatusBadge({ status, className = '', surface = 'light' }: Props) {

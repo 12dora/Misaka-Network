@@ -7,12 +7,24 @@ import ScanModal from '@/components/features/ScanModal'
 import SettingsModal from '@/components/features/SettingsModal'
 import { scrollIntoViewSafely } from '@/hooks/useReducedMotion'
 import { deriveNetworkStatus, networkStatusLabel, useNetworkStore } from '@/store/network'
+import { common } from '@/copy/zh-CN/common'
+import { network as netCopy } from '@/copy/zh-CN/network'
 
 const LINKS = [
-  { to: '/',        label: '首页',  kanji: '首' },
-  { to: '/network', label: '网络',  kanji: '网' },
-  { to: '/acgn',   label: 'ACGN', kanji: 'A' },
+  { to: '/',        label: common.home,    kanji: '首' },
+  { to: '/network', label: common.network, kanji: '网' },
+  { to: '/acgn',    label: common.acgn,    kanji: 'A' },
 ]
+
+// Functional status vocabulary (07 P2). Store labels still exist for other
+// consumers; the nav paints through this map so "重新连接" becomes "恢复连接".
+const NAV_STATUS: Record<string, string> = {
+  online: netCopy.status.online,
+  transferring: netCopy.status.transferring,
+  connecting: netCopy.status.connecting,
+  reconnecting: netCopy.status.reconnecting,
+  offline: netCopy.status.offline,
+}
 
 export default function TopNav() {
   const location   = useLocation()
@@ -135,9 +147,6 @@ export default function TopNav() {
           <MisakaKanjiBlock char="御" size="md" />
           <span className="font-kanji font-bold text-white leading-tight">
             <span className="text-base">御坂网络</span>
-            <span className="hidden md:block font-mono text-[10px] font-normal text-[var(--text-on-blue-2)] tracking-widest">
-              MISAKA NETWORK
-            </span>
           </span>
         </Link>
 
@@ -196,7 +205,7 @@ export default function TopNav() {
                 </button>
               )}
               <button type="button" className="nav-pill text-sm !px-3" onClick={() => setShowQR(true)}>
-                🔲 我的 QR
+                🔲 我的二维码
               </button>
               <button type="button" className="nav-pill text-sm !px-3" onClick={() => setShowScan(true)}>
                 📷 扫描
@@ -221,22 +230,42 @@ export default function TopNav() {
             </svg>
           </button>
 
-          {/* Status */}
-          <span className="h-8 inline-flex items-center gap-1.5 text-xs font-mono leading-none text-[var(--text-on-blue-2)]">
-            <span
-              className={isConnected && networkStatus === 'online' ? 'pulse-dot' : ''}
-              style={{
-                display: 'inline-block',
-                width: 8, height: 8, borderRadius: '50%',
-                background: !isConnected || networkStatus === 'offline' ? 'var(--text-muted)'
-                  : networkStatus === 'transferring' ? 'var(--accent-cyan)'
-                  : networkStatus === 'online' ? 'var(--state-success)'
-                  : 'var(--state-warn)',
-                flexShrink: 0,
-              }}
-            />
-            <span className="hidden xs:inline">{isConnected ? networkStatusLabel(networkStatus) : '未接入'}</span>
-          </span>
+          {/* Status — 08 P2: never remove the name from the a11y tree below
+              390px. Colour alone is not enough; keep an sr-only label and a
+              non-colour glyph cue. */}
+          {(() => {
+            const statusText = isConnected
+              ? (NAV_STATUS[networkStatus] ?? networkStatusLabel(networkStatus))
+              : common.notJoined
+            const statusGlyph = !isConnected || networkStatus === 'offline' ? '○'
+              : networkStatus === 'transferring' ? '▲'
+              : networkStatus === 'online' ? '●'
+              : '◎'
+            return (
+              <span
+                className="h-8 inline-flex items-center gap-1.5 text-xs font-mono leading-none text-[var(--text-on-blue-2)]"
+                role="status"
+                aria-live="polite"
+                aria-label={statusText}
+              >
+                <span
+                  className={isConnected && networkStatus === 'online' ? 'pulse-dot' : ''}
+                  aria-hidden="true"
+                  style={{
+                    display: 'inline-block',
+                    width: 8, height: 8, borderRadius: '50%',
+                    background: !isConnected || networkStatus === 'offline' ? 'var(--text-muted)'
+                      : networkStatus === 'transferring' ? 'var(--accent-cyan)'
+                      : networkStatus === 'online' ? 'var(--state-success)'
+                      : 'var(--state-warn)',
+                    flexShrink: 0,
+                  }}
+                />
+                <span aria-hidden="true" className="text-[10px] opacity-80">{statusGlyph}</span>
+                <span className="sr-only xs:not-sr-only">{statusText}</span>
+              </span>
+            )
+          })()}
 
           {/* Mobile hamburger — A11Y-006: expose the menu's expanded state
               and what it controls. */}
@@ -336,7 +365,7 @@ export default function TopNav() {
                 </button>
               )}
               <button type="button" className="nav-pill text-sm flex-1 min-w-0" onClick={() => { setMenuOpen(false); setShowQR(true) }}>
-                🔲 我的 QR
+                🔲 我的二维码
               </button>
               <button type="button" className="nav-pill text-sm flex-1 min-w-0" onClick={() => { setMenuOpen(false); setShowScan(true) }}>
                 📷 扫描

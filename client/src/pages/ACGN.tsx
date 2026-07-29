@@ -7,6 +7,7 @@ import MisakaHeroTitle from '@/components/ui/MisakaHeroTitle'
 import { QUOTES, CHARACTERS, LORE_LOG, LORE_TIMELINE, getCharacterByNodeId } from '@/data/lore'
 import { publicAssetUrl } from '@/lib/appBase'
 import { scrollIntoViewSafely, useCoarsePointer, useReducedMotion } from '@/hooks/useReducedMotion'
+import { acgn as acgnCopy } from '@/copy/zh-CN/acgn'
 
 const HERO_CHARACTER = publicAssetUrl('assets/misaka.webp')
 
@@ -26,9 +27,10 @@ function SectionHeader({ kanji, title, furigana }: { kanji: string; title: strin
 
 // ── Characters Section ────────────────────────────────────────────
 function CharacterSection() {
+  const sec = acgnCopy.sections.characters
   return (
     <section id="characters" className="px-5 md:px-8 py-14 scroll-mt-20">
-      <SectionHeader kanji="体" title="实验体档案" furigana="実験体ファイル" />
+      <SectionHeader kanji={sec.kanji} title={sec.title} furigana={sec.furigana} />
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 max-w-3xl">
         {CHARACTERS.map(c => (
           <MisakaCard
@@ -98,23 +100,24 @@ function EasterEggSection() {
     const n = parseInt(nodeQuery, 10)
     if (isNaN(n) || n < 1 || n > 20001) {
       setQueryError(true)
-      setQueryResult('节点编号范围为 1~20001')
+      setQueryResult(acgnCopy.nodeOutOfRange)
       return
     }
     setQueryError(false)
     setQueryResult(getCharacterByNodeId(n))
   }
 
+  const eggSec = acgnCopy.sections.easterEggs
   return (
     <section id="easter-eggs" className="px-5 md:px-8 py-14 scroll-mt-20">
-      <SectionHeader kanji="戯" title="彩蛋功能" furigana="おまけ機能" />
+      <SectionHeader kanji={eggSec.kanji} title={eggSec.title} furigana={eggSec.furigana} />
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6 max-w-5xl">
 
         {/* Quote Generator */}
         <MisakaCard padding="md" className="flex flex-col">
           <div className="flex items-center gap-2 mb-4">
             <MisakaKanjiBlock char="語" size="sm" />
-            <span className="font-kanji font-bold text-sm text-[var(--text-on-white)]">妹妹语录生成器</span>
+            <span className="font-kanji font-bold text-sm text-[var(--text-on-white)]">{acgnCopy.quoteGenerator}</span>
           </div>
           <div className="flex-1 flex items-center justify-center py-4">
             <p className="font-jp text-lg text-[var(--text-on-white)] leading-loose text-center">
@@ -122,7 +125,7 @@ function EasterEggSection() {
             </p>
           </div>
           <MisakaButton variant="pill" size="sm" fullWidth onClick={randomQuote}>
-            ↻ 重新生成
+            {acgnCopy.regenerate}
           </MisakaButton>
         </MisakaCard>
 
@@ -130,11 +133,11 @@ function EasterEggSection() {
         <MisakaCard padding="md" className="flex flex-col">
           <div className="flex items-center gap-2 mb-4">
             <MisakaKanjiBlock char="号" size="sm" />
-            <span className="font-kanji font-bold text-sm text-[var(--text-on-white)]">实验体编号查询</span>
+            <span className="font-kanji font-bold text-sm text-[var(--text-on-white)]">{acgnCopy.nodeQuery}</span>
           </div>
           {/* A11Y-004: a placeholder is not a label. */}
           <label htmlFor={nodeQueryId} className="block font-kanji text-xs text-[var(--text-on-white-2)] mb-1.5">
-            实验体编号，范围 1–20001
+            {acgnCopy.nodeQueryLabel}
           </label>
           {/* UX-LAYOUT-005: a `flex-1` number input keeps its intrinsic
               min-content width unless `min-width: 0` is set, so in a narrow
@@ -148,7 +151,7 @@ function EasterEggSection() {
               min={1}
               max={20001}
               inputMode="numeric"
-              placeholder="1~20001"
+              placeholder={acgnCopy.nodeQueryPlaceholder}
               value={nodeQuery}
               onChange={e => { setNodeQuery(e.target.value); setQueryError(false) }}
               onKeyDown={e => e.key === 'Enter' && queryNode()}
@@ -160,7 +163,7 @@ function EasterEggSection() {
               className="misaka-focus-ring flex-1 min-w-0 px-3 py-2 rounded-lg text-sm font-mono focus:outline-none"
               style={{ border: '1px solid var(--border-card)', background: 'var(--surface)', color: 'var(--text-on-white)' }}
             />
-            <MisakaButton variant="primary" size="sm" className="shrink-0" onClick={queryNode}>查询</MisakaButton>
+            <MisakaButton variant="primary" size="sm" className="shrink-0" onClick={queryNode}>{acgnCopy.query}</MisakaButton>
           </div>
           {queryResult && (
             <div
@@ -183,7 +186,7 @@ function EasterEggSection() {
           <div className="flex items-center justify-between gap-2 mb-4">
             <div className="flex items-center gap-2 min-w-0">
               <MisakaKanjiBlock char="録" size="sm" />
-              <span className="font-kanji font-bold text-sm text-[var(--text-on-white)]">网络日志</span>
+              <span className="font-kanji font-bold text-sm text-[var(--text-on-white)]">{acgnCopy.loreLog}</span>
             </div>
             {/* A11Y-008: keyboard- and touch-reachable pause. Hidden when
                 motion is already off, so we never offer a control that
@@ -196,7 +199,7 @@ function EasterEggSection() {
                 aria-pressed={lorePaused}
                 onClick={() => setLorePaused(p => !p)}
               >
-                {lorePaused ? '▶ 继续滚动' : '⏸ 暂停滚动'}
+                {lorePaused ? acgnCopy.resumeScroll : acgnCopy.pauseScroll}
               </MisakaButton>
             )}
           </div>
@@ -224,9 +227,10 @@ function EasterEggSection() {
 
 // ── Timeline Section ──────────────────────────────────────────────
 function TimelineSection() {
+  const sec = acgnCopy.sections.timeline
   return (
     <section id="timeline" className="px-5 md:px-8 py-14 scroll-mt-20">
-      <SectionHeader kanji="史" title="世界观时间线" furigana="タイムライン" />
+      <SectionHeader kanji={sec.kanji} title={sec.title} furigana={sec.furigana} />
       <div className="max-w-4xl grid grid-cols-1 md:grid-cols-2 gap-5">
         {LORE_TIMELINE.map(item => (
           <MisakaCard key={item.title} padding="md">
@@ -280,7 +284,7 @@ export default function ACGN() {
           />
           <img
             src={HERO_CHARACTER}
-            alt="御坂美琴"
+            alt={acgnCopy.heroAlt}
             className="animate-float select-none pointer-events-none"
             loading="eager"
             fetchPriority="high"
@@ -304,15 +308,15 @@ export default function ACGN() {
         <div className="relative z-10 flex flex-col items-center px-5 -mt-8 pb-10 gap-4">
           <MisakaHeroTitle width="min(230px, 62vw)" />
           <p className="font-jp text-sm text-[var(--text-on-blue-2)] text-center leading-loose">
-            连接全部御坂妹妹的脑量子波共享网络<br />
-            <span className="text-xs">全ての御坂妹妹を繋ぐ脳量子波ネットワーク</span>
+            {acgnCopy.heroTagline}<br />
+            <span className="text-xs">{acgnCopy.heroTaglineSub}</span>
           </p>
           <MisakaButton
             variant="pill"
             size="sm"
             onClick={() => scrollIntoViewSafely(document.getElementById('about'))}
           >
-            了解更多
+            {acgnCopy.learnMore}
           </MisakaButton>
         </div>
       </section>
@@ -329,7 +333,7 @@ export default function ACGN() {
         <div className="relative flex items-end justify-center">
           <img
             src={HERO_CHARACTER}
-            alt="御坂美琴"
+            alt={acgnCopy.heroAlt}
             className="animate-float select-none pointer-events-none"
             loading="eager"
             fetchPriority="high"
@@ -349,8 +353,8 @@ export default function ACGN() {
         >
           <MisakaHeroTitle width="clamp(280px, 32vw, 460px)" />
           <p className="font-jp text-lg text-[var(--text-on-blue)] leading-loose">
-            连接全部御坂妹妹的脑量子波共享网络<br />
-            <span className="text-sm text-[var(--text-on-blue-2)]">全ての御坂妹妹を繋ぐ脳量子波ネットワーク</span>
+            {acgnCopy.heroTagline}<br />
+            <span className="text-sm text-[var(--text-on-blue-2)]">{acgnCopy.heroTaglineSub}</span>
           </p>
           <div className="flex gap-3">
             <MisakaButton
@@ -358,7 +362,7 @@ export default function ACGN() {
               size="sm"
               onClick={() => scrollIntoViewSafely(document.getElementById('about'))}
             >
-              了解更多
+              {acgnCopy.learnMore}
             </MisakaButton>
           </div>
         </div>
@@ -374,24 +378,23 @@ export default function ACGN() {
 
       {/* ── About ────────────────────────────────────────────────── */}
       <section id="about" className="px-5 md:px-8 py-14 scroll-mt-20">
-        <SectionHeader kanji="設" title="关于御坂网络" furigana="みさかネットワークについて" />
+        <SectionHeader kanji="設" title={acgnCopy.aboutTitle} furigana={acgnCopy.aboutFurigana} />
         <MisakaCard padding="lg" className="max-w-3xl">
           <div className="font-kanji text-base text-[var(--text-on-white)] leading-[1.85] space-y-4">
             <p>
-              <strong style={{ color: 'var(--bg-deep)' }}>御坂网络</strong>是连接全部御坂妹妹的
-              <span style={{ color: 'var(--bg-deep)' }}>脑量子波</span>
-              共享网络。
+              <strong style={{ color: 'var(--bg-deep)' }}>{acgnCopy.aboutLead.name}</strong>
+              {acgnCopy.aboutLead.mid}
+              <span style={{ color: 'var(--bg-deep)' }}>{acgnCopy.aboutLead.accent}</span>
+              {acgnCopy.aboutLead.after}
             </p>
             <p>
-              在《某科学的超电磁炮》设定中，约 20,000 名
-              <span style={{ color: 'var(--bg-deep)' }}>实验体</span>
-              通过脑量子波互联，形成
-              <span style={{ color: 'var(--bg-deep)' }}>分布式</span>
-              意识网络。每个妹妹既是独立个体，又能共享视觉、记忆、知识。
+              {acgnCopy.aboutBody.before}
+              <span style={{ color: 'var(--bg-deep)' }}>{acgnCopy.aboutBody.accent1}</span>
+              {acgnCopy.aboutBody.mid}
+              <span style={{ color: 'var(--bg-deep)' }}>{acgnCopy.aboutBody.accent2}</span>
+              {acgnCopy.aboutBody.after}
             </p>
-            <p>
-              本 APP 借用这一设定作为美学骨架，构建 P2P 文件传输工具：每位用户都是一个「节点」，节点之间通过加密信道直接共享数据——文件本体永不经过服务器。
-            </p>
+            <p>{acgnCopy.aboutClosing}</p>
           </div>
         </MisakaCard>
       </section>

@@ -1,7 +1,7 @@
 {
-  "name": "御坂网络 Misaka Network",
+  "name": "御坂网络",
   "short_name": "御坂网络",
-  "description": "零注册、强隐私、跨设备的 P2P 文件传输网络",
+  "description": "无需注册、注重隐私、可跨设备使用的点对点文件传输工具",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",

@@ -159,7 +159,7 @@ export default function LoginCard() {
           </MisakaButton>
           <div className="flex gap-2">
             <MisakaButton variant="pill" size="sm" className="flex-1" onClick={() => setShowQR(true)}>
-              🔲 显示 QR
+              🔲 显示二维码
             </MisakaButton>
             <MisakaButton
               variant="pill"
@@ -334,7 +334,7 @@ export default function LoginCard() {
         onClick={handleConnect}
         disabled={isLoading || !passComplete}
       >
-        {isLoading ? '正在接入...' : '接入网络'}
+        {isLoading ? '正在接入…' : '接入网络'}
       </MisakaButton>
 
       <div
@@ -358,7 +358,7 @@ export default function LoginCard() {
             読
           </span>
           <span className="min-w-0 flex-1">
-            <span className="block font-kanji text-sm font-semibold">QR 接入</span>
+            <span className="block font-kanji text-sm font-semibold">二维码接入</span>
             <span className="block font-kanji text-[11px] text-[var(--text-on-white-2)] leading-relaxed">
               扫描或粘贴对方节点链接，自动填入身份并接入
             </span>
@@ -367,8 +367,11 @@ export default function LoginCard() {
         </button>
       </div>
 
-      <p className="text-[10px] text-[var(--text-on-white-2)] text-center mt-3 font-kanji">
-        ⓘ 30 分钟无活动会话自动释放
+      <p
+        className="text-[10px] text-[var(--text-on-white-2)] text-center mt-3 font-kanji"
+        data-testid="session-ttl-hint"
+      >
+        ⓘ 会话在持续使用时自动续期，闲置约 30 分钟后释放
       </p>
     </MisakaCard>
     </>
