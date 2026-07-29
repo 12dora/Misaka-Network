@@ -253,7 +253,7 @@ describe('BUG-001: explicit Disconnect ends the network epoch', () => {
   it('destroys peer connections, drops the token and releases the session', async () => {
     const { useNetworkStore, useAuthStore, resetCrypto } = await freshModules()
     useAuthStore.setState({
-      session: { token: 'tok-1', sessionId: 'sid-A', expiresAt: Date.now() + 1e6 },
+      session: { token: 'tok-1', sessionId: 'sid-A', expiresAt: Date.now() + 1e6, reRegisterProof: 'proof-1' },
       isConnected: true,
     })
     useNetworkStore.getState().init('tok-1')
@@ -288,7 +288,7 @@ describe('BUG-001: explicit Disconnect ends the network epoch', () => {
   it('a released token cannot silently reconnect on the next `online` event', async () => {
     const { useNetworkStore, useAuthStore } = await freshModules()
     useAuthStore.setState({
-      session: { token: 'tok-1', sessionId: 'sid-A', expiresAt: Date.now() + 1e6 },
+      session: { token: 'tok-1', sessionId: 'sid-A', expiresAt: Date.now() + 1e6, reRegisterProof: 'proof-1' },
       isConnected: true,
     })
     useNetworkStore.getState().init('tok-1')
@@ -308,7 +308,7 @@ describe('BUG-001: explicit Disconnect ends the network epoch', () => {
   it('is idempotent — a double click releases once and tears down once', async () => {
     const { useNetworkStore, useAuthStore } = await freshModules()
     useAuthStore.setState({
-      session: { token: 'tok-1', sessionId: 'sid-A', expiresAt: Date.now() + 1e6 },
+      session: { token: 'tok-1', sessionId: 'sid-A', expiresAt: Date.now() + 1e6, reRegisterProof: 'proof-1' },
       isConnected: true,
     })
     useNetworkStore.getState().init('tok-1')
@@ -329,7 +329,7 @@ describe('BUG-001: explicit Disconnect ends the network epoch', () => {
   it('logging out then back in re-registers signaling handlers exactly once', async () => {
     const { useNetworkStore, useAuthStore } = await freshModules()
     useAuthStore.setState({
-      session: { token: 'tok-1', sessionId: 'sid-A', expiresAt: Date.now() + 1e6 },
+      session: { token: 'tok-1', sessionId: 'sid-A', expiresAt: Date.now() + 1e6, reRegisterProof: 'proof-1' },
       isConnected: true,
     })
     useNetworkStore.getState().init('tok-1')

@@ -254,3 +254,53 @@ describe('BUG-026 (UI): a failed TURN status fetch is surfaced, not swallowed', 
     expect(document.body.textContent).toContain('暂时无法获取中继服务状态')
   })
 })
+
+describe('TURN three-state: open settings must not persist defaults', () => {
+  it('does not call saveTurnSettings on mount with no user change', async () => {
+    loaded = { servers: [], enabled: false, forceRelay: false }
+    render()
+    await act(async () => { await Promise.resolve() })
+    // Mount alone must not write — that used to flip unset → disabled.
+    expect(saved).toHaveLength(0)
+  })
+
+  it('StrictMode double effect setup still does not persist defaults', async () => {
+    // The app wraps itself in <StrictMode> (main.tsx). A one-shot ref skips
+    // only the first effect setup; the second setup must also avoid writing.
+    const { StrictMode } = await import('react')
+    loaded = { servers: [], enabled: false, forceRelay: false }
+    await act(async () => {
+      root.render(
+        <StrictMode>
+          <SettingsModal onClose={() => {}} />
+        </StrictMode>,
+      )
+    })
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    expect(saved).toHaveLength(0)
+  })
+
+  it('gates the issue button when master switch is off', async () => {
+    const { fetchTurnStatus, refreshAutoTurn } = await import('../../src/lib/turn')
+    vi.mocked(fetchTurnStatus).mockResolvedValue({
+      enabled: true,
+      configured: true,
+      provider: 'cf',
+      credentialTtlSec: 600,
+      available: true,
+      detailed: false,
+    })
+    loaded = { servers: [], enabled: false, forceRelay: false }
+    render()
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+
+    const buttons = Array.from(document.querySelectorAll('button'))
+    const issue = buttons.find(b => b.textContent?.includes('下发中继凭证'))
+    expect(issue).toBeTruthy()
+    expect(issue!.disabled).toBe(true)
+
+    // Even if clicked somehow, force path is gated in UI.
+    await act(async () => { issue!.click() })
+    expect(refreshAutoTurn).not.toHaveBeenCalled()
+  })
+})

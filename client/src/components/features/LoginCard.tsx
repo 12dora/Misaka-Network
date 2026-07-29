@@ -1,4 +1,4 @@
-import { useRef, useState, KeyboardEvent } from 'react'
+import { useEffect, useRef, useState, KeyboardEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuthStore } from '@/store/auth'
 import MisakaCard from '@/components/ui/MisakaCard'
@@ -20,8 +20,10 @@ export default function LoginCard() {
   const navigate = useNavigate()
   const {
     identity, session, isConnected, isLoading, error, ipFullPrompt,
+    connectBlockedUntil, lastAuthErrorCode, recoveryUnavailableNotice,
     setNodeId, setPassCode, regenerateNodeId, regeneratePassCode,
     connect, disconnect, releaseAllFromIp, dismissIpFullPrompt,
+    dismissRecoveryUnavailableNotice, isConnectBlocked,
   } = useAuthStore()
 
   const passInputs = useRef<(HTMLInputElement | null)[]>([])
@@ -31,13 +33,25 @@ export default function LoginCard() {
   // P1-8: track when the user types a node id outside the legal range so we
   // can surface an inline hint instead of silently no-op'ing setState.
   const [nodeIdError, setNodeIdError] = useState<string | null>(null)
+  // Re-render when a finite SERVER_BUSY cooldown expires so the button re-arms.
+  const [, setCooldownTick] = useState(0)
+  const blocked = isConnectBlocked()
+  useEffect(() => {
+    if (connectBlockedUntil == null || connectBlockedUntil >= Number.MAX_SAFE_INTEGER) return
+    const remaining = connectBlockedUntil - Date.now()
+    if (remaining <= 0) return
+    const t = window.setTimeout(() => setCooldownTick(n => n + 1), remaining + 10)
+    return () => clearTimeout(t)
+  }, [connectBlockedUntil])
 
   async function handleReleaseAndRetry(): Promise<number> {
     setReleasing(true)
     try {
       const released = await releaseAllFromIp()
-      if (released > 0) await connect()
-      if (useAuthStore.getState().isConnected) navigate('/network')
+      if (released > 0) {
+        const committed = await connect()
+        if (committed) navigate('/network')
+      }
       return released
     } finally {
       setReleasing(false)
@@ -102,8 +116,8 @@ export default function LoginCard() {
   const specialHint = SPECIAL_NODE_HINTS[identity.nodeId]
 
   async function handleConnect() {
-    await connect()
-    if (useAuthStore.getState().isConnected) {
+    const committed = await connect()
+    if (committed) {
       navigate('/network')
     }
   }
@@ -126,6 +140,27 @@ export default function LoginCard() {
           />
           <span className="font-kanji text-sm font-semibold text-[var(--text-on-white-2)]">✓ 已接入</span>
         </div>
+        {recoveryUnavailableNotice && (
+          <div
+            role="status"
+            className="rounded-lg px-3 py-2 mb-4 font-kanji text-xs leading-relaxed flex items-start gap-2"
+            style={{ background: 'var(--surface-tint)', color: 'var(--text-on-white)', border: '1px solid var(--border-card)' }}
+            data-testid="recovery-unavailable-notice"
+          >
+            <span className="min-w-0 flex-1">
+              当前会话无法在断线后自动恢复。若连接中断，需要重新输入通行码接入。
+            </span>
+            <button
+              type="button"
+              onClick={dismissRecoveryUnavailableNotice}
+              className="shrink-0 font-kanji text-[11px] underline cursor-pointer"
+              style={{ background: 'none', border: 'none', color: 'var(--text-on-white-2)' }}
+              aria-label="关闭提示"
+            >
+              知道了
+            </button>
+          </div>
+        )}
         <div className="font-kanji font-bold text-2xl text-[var(--text-on-white)] mb-0.5">
           御坂 {identity.nodeId} 号
         </div>
@@ -327,14 +362,20 @@ export default function LoginCard() {
         </p>
       )}
 
-      {/* Connect Button */}
+      {/* Connect Button — NETWORK_FULL stays blocked; SERVER_BUSY has cooldown */}
       <MisakaButton
         variant="primary"
         fullWidth
         onClick={handleConnect}
-        disabled={isLoading || !passComplete}
+        disabled={isLoading || !passComplete || blocked}
       >
-        {isLoading ? '正在接入...' : '接入网络'}
+        {isLoading
+          ? '正在接入...'
+          : blocked && lastAuthErrorCode === 'NETWORK_FULL'
+            ? '网络已满，请稍后再试'
+            : blocked
+              ? '请稍候再试'
+              : '接入网络'}
       </MisakaButton>
 
       <div

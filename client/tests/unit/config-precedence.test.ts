@@ -12,7 +12,7 @@
 // @vitest-environment jsdom
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { mergeRuntimeConfig, validateConfig, loadConfig, getConfig, __resetConfig } from '../../src/config'
+import { mergeRuntimeConfig, validateConfig, loadConfig, getConfig, __resetConfig, apiUrl } from '../../src/config'
 
 const INJECTED = { API_BASE: 'https://private.internal', WS_URL: 'wss://private.internal/ws' }
 const PUBLIC_JSON = { API_BASE: 'https://misaka.konata.tv', WS_URL: 'wss://misaka.konata.tv/ws' }
@@ -63,6 +63,38 @@ describe('CONFIG-006: schema validation', () => {
   it('keeps the valid half of a partially bad object', () => {
     expect(validateConfig({ API_BASE: 'https://ok.example', WS_URL: 'garbage' }, 'test'))
       .toEqual({ API_BASE: 'https://ok.example' })
+  })
+
+  it.each([
+    ['API_BASE with fragment', { API_BASE: 'https://api.example/base#frag' }],
+    ['API_BASE with query', { API_BASE: 'https://api.example/base?tenant=1' }],
+    ['API_BASE with credentials', { API_BASE: 'https://user:pw@api.example/base' }],
+    ['WS_URL with fragment', { WS_URL: 'wss://signal.example/ws#fragment' }],
+    ['WS_URL with credentials', { WS_URL: 'wss://user:pw@signal.example/ws' }],
+  ])('drops unconsumable URL: %s', (_label, raw) => {
+    expect(validateConfig(raw, 'test')).toEqual({})
+  })
+})
+
+describe('apiUrl path join', () => {
+  beforeEach(() => {
+    __resetConfig()
+    window.__MISAKA_CONFIG__ = { API_BASE: 'https://api.example/base' }
+  })
+  afterEach(() => {
+    __resetConfig()
+    delete window.__MISAKA_CONFIG__
+  })
+
+  it('joins with the URL API (no string concat of query onto path)', async () => {
+    // Force memoised config from injected base.
+    globalThis.fetch = vi.fn(async () => ({
+      ok: false,
+      json: async () => ({}),
+    })) as unknown as typeof fetch
+    await loadConfig()
+    expect(apiUrl('/api/register')).toBe('https://api.example/base/api/register')
+    expect(apiUrl('api/register')).toBe('https://api.example/base/api/register')
   })
 })
 

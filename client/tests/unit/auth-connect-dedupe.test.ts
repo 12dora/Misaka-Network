@@ -8,10 +8,19 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 // Avoid pulling in the real signaling module (WebSocket side effects on import).
-vi.mock('../../src/lib/signaling', () => ({ onAuthInvalid: vi.fn() }))
+vi.mock('../../src/lib/signaling', () => ({
+  onAuthInvalid: vi.fn(),
+  endSession: vi.fn(),
+}))
 
 const fetchSpy = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(
-  JSON.stringify({ token: 't-1', sessionId: 's-1', expiresAt: Date.now() + 60_000, resumed: false }),
+  JSON.stringify({
+    token: 't-1',
+    sessionId: 's-1',
+    expiresAt: Date.now() + 60_000,
+    reRegisterProof: 'proof-1',
+    resumed: false,
+  }),
   { status: 200, headers: { 'Content-Type': 'application/json' } },
 ))
 
@@ -26,6 +35,7 @@ import { useAuthStore } from '../../src/store/auth'
 describe('connect() dedupes concurrent callers', () => {
   it('three concurrent connect() calls trigger exactly one /api/register', async () => {
     const store = useAuthStore.getState()
+    store.setPassCode('123456')
     await Promise.all([store.connect(), store.connect(), store.connect()])
 
     const registerCalls = fetchSpy.mock.calls.filter(([url]) => String(url).includes('/api/register'))
@@ -35,22 +45,60 @@ describe('connect() dedupes concurrent callers', () => {
     expect(useAuthStore.getState().error).toBeNull()
   })
 
-  it('a subsequent connect() after the first settles issues a fresh register', async () => {
+  it('a subsequent connect() after the first settles issues a fresh auth request', async () => {
     const store = useAuthStore.getState()
+    store.setPassCode('123456')
     await store.connect()
     fetchSpy.mockClear()
+    // Clear typed passcode so the second connect prefers /api/re-register
+    // (Contract 1) over a full /register, using the live recovery proof.
+    useAuthStore.setState({
+      identity: { ...useAuthStore.getState().identity, passCode: '' },
+    })
     await store.connect()
-    const registerCalls = fetchSpy.mock.calls.filter(([url]) => String(url).includes('/api/register'))
-    expect(registerCalls.length).toBe(1)
+    const authCalls = fetchSpy.mock.calls.filter(([url]) => {
+      const u = String(url)
+      return u.includes('/api/register') || u.includes('/api/re-register')
+    })
+    expect(authCalls.length).toBe(1)
   })
 
   it('forwards a QR admission grant only on the registration that commits it', async () => {
     const store = useAuthStore.getState()
+    store.setPassCode('123456')
     await store.connect({ admissionGrant: 'g'.repeat(64) })
 
     const [, init] = fetchSpy.mock.calls.find(([url]) => String(url).includes('/api/register'))!
     expect(JSON.parse(String(init?.body))).toMatchObject({
       admissionGrant: 'g'.repeat(64),
     })
+  })
+
+  it('does not coalesce connect() with connect({ admissionGrant })', async () => {
+    const gates: Array<(r: Response) => void> = []
+    fetchSpy.mockImplementation(async () => {
+      return new Promise<Response>(resolve => { gates.push(resolve) })
+    })
+
+    const store = useAuthStore.getState()
+    store.setPassCode('123456')
+    const a = store.connect()
+    // Let the first request reach fetch before superseding.
+    for (let i = 0; i < 5; i++) await Promise.resolve()
+    const b = store.connect({ admissionGrant: 'g'.repeat(64) })
+    for (let i = 0; i < 5; i++) await Promise.resolve()
+
+    for (const g of gates) {
+      g(new Response(
+        JSON.stringify({ token: 't-x', sessionId: 's-x', expiresAt: Date.now() + 60_000, reRegisterProof: 'p', resumed: false }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ))
+    }
+    await Promise.all([a, b])
+
+    const registerCalls = fetchSpy.mock.calls.filter(([url]) => String(url).includes('/api/register'))
+    expect(registerCalls.length).toBeGreaterThanOrEqual(2)
+    const bodies = registerCalls.map(([, init]) => JSON.parse(String(init?.body)))
+    expect(bodies.some(b => b.admissionGrant === 'g'.repeat(64))).toBe(true)
   })
 })

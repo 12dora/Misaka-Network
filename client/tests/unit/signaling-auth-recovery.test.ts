@@ -79,17 +79,34 @@ async function settle() {
   await new Promise(r => setTimeout(r, 0))
 }
 
-function seedSession(useAuthStore: Modules['useAuthStore'], token: string) {
-  const session = { token, sessionId: 'sid-old', expiresAt: Date.now() + 3_600_000 }
+function seedSession(
+  useAuthStore: Modules['useAuthStore'],
+  token: string,
+  proof: string | null = 'proof-seed',
+) {
+  const session = {
+    token,
+    sessionId: 'sid-old',
+    expiresAt: Date.now() + 3_600_000,
+    reRegisterProof: proof,
+  }
   sessionStorage.setItem('misaka.session', JSON.stringify(session))
   useAuthStore.setState({ session, isConnected: true })
 }
 
+let lastRegisterBody: unknown = null
+let lastReRegisterBody: unknown = null
+let reRegisterCalls = 0
+
 beforeEach(() => {
-  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+  lastRegisterBody = null
+  lastReRegisterBody = null
+  reRegisterCalls = 0
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
-    if (url.includes('/api/register')) {
-      registerCalls++
+    if (url.includes('/api/re-register')) {
+      reRegisterCalls++
+      lastReRegisterBody = init?.body ? JSON.parse(String(init.body)) : null
       issuedToken++
       return {
         ok: true,
@@ -98,6 +115,23 @@ beforeEach(() => {
           token: `fresh-token-${issuedToken}`,
           sessionId: `sid-${issuedToken}`,
           expiresAt: Date.now() + 3_600_000,
+          reRegisterProof: `proof-${issuedToken}`,
+          resumed: false,
+        }),
+      } as unknown as Response
+    }
+    if (url.includes('/api/register')) {
+      registerCalls++
+      lastRegisterBody = init?.body ? JSON.parse(String(init.body)) : null
+      issuedToken++
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          token: `fresh-token-${issuedToken}`,
+          sessionId: `sid-${issuedToken}`,
+          expiresAt: Date.now() + 3_600_000,
+          reRegisterProof: `proof-${issuedToken}`,
           resumed: false,
         }),
       } as unknown as Response
@@ -160,8 +194,11 @@ describe('WS 4001/4002 → clear session → re-register → fresh AUTH (TEST-00
 
       await settle()
 
-      // Exactly one re-registration, and the new session is cached again.
-      expect(registerCalls).toBe(1)
+      // Exactly one re-registration via /api/re-register with the stored proof
+      // (Contract 1) — never /api/register with an empty passcode.
+      expect(reRegisterCalls).toBe(1)
+      expect(registerCalls).toBe(0)
+      expect(lastReRegisterBody).toEqual({ proof: 'proof-seed' })
       expect(useAuthStore.getState().session?.token).toBe('fresh-token-1')
       expect(JSON.parse(sessionStorage.getItem('misaka.session')!).token).toBe('fresh-token-1')
 
@@ -191,7 +228,8 @@ describe('WS 4001/4002 → clear session → re-register → fresh AUTH (TEST-00
     constructed[1].fireClose(4002)
 
     await settle()
-    expect(registerCalls).toBe(1)
+    expect(reRegisterCalls).toBe(1)
+    expect(registerCalls).toBe(0)
   })
 
   it('a transient close (1006) keeps the session and schedules a reconnect', async () => {
@@ -236,6 +274,129 @@ describe('WS 4001/4002 → clear session → re-register → fresh AUTH (TEST-00
     expect(seen.length).toBe(1)
     expect(useAuthStore.getState().session).toBeNull()
     off()
+  })
+
+  for (const code of [4001, 4002]) {
+    it(`close ${code} with null reRegisterProof → credentials-required, no empty /api/register`, async () => {
+      const { signaling, useAuthStore } = await freshModules()
+      seedSession(useAuthStore, 'stale-token', null)
+      // Empty passcode is the dangerous default after restore.
+      useAuthStore.setState({
+        identity: { nodeId: 7, passCode: '', createdAt: Date.now() },
+      })
+
+      signaling.connect('stale-token')
+      constructed[0].open()
+      constructed[0].fireClose(code)
+
+      await settle()
+
+      expect(useAuthStore.getState().credentialsRequired).toBe(true)
+      expect(useAuthStore.getState().isConnected).toBe(false)
+      expect(useAuthStore.getState().session).toBeNull()
+      expect(registerCalls).toBe(0)
+      expect(reRegisterCalls).toBe(0)
+      // Must never have fired /api/register with an empty passcode.
+      expect(lastRegisterBody).toBeNull()
+      expect(useAuthStore.getState().error).toMatch(/通行码|会话/)
+    })
+  }
+
+  it('stale pending proof cannot defeat a later proofless session null (two-cycle)', async () => {
+    // Cycle 1: live proof recovery fails → leaves credentials-required.
+    // Cycle 2: user logs in manually with no recovery proof (null).
+    // A subsequent 4001/4002 must honour the live null and go straight to
+    // credentials-required — never re-attempt /api/re-register with the
+    // stale pending proof from cycle 1.
+    const { signaling, useAuthStore } = await freshModules()
+
+    // Override fetch: first re-register fails; later register is proofless.
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/re-register')) {
+        reRegisterCalls++
+        lastReRegisterBody = init?.body ? JSON.parse(String(init.body)) : null
+        return {
+          ok: false,
+          status: 401,
+          json: async () => ({ error: 'INVALID_PROOF', message: '会话已失效，请重新输入通行码接入' }),
+        } as unknown as Response
+      }
+      if (url.includes('/api/register')) {
+        registerCalls++
+        lastRegisterBody = init?.body ? JSON.parse(String(init.body)) : null
+        issuedToken++
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            token: `fresh-token-${issuedToken}`,
+            sessionId: `sid-${issuedToken}`,
+            expiresAt: Date.now() + 3_600_000,
+            // Explicit null — degraded recovery (the whole point of nullable).
+            reRegisterProof: null,
+            resumed: false,
+          }),
+        } as unknown as Response
+      }
+      if (url.includes('/api/release')) {
+        return { ok: true, status: 200, json: async () => ({ ok: true }) } as unknown as Response
+      }
+      return { ok: true, status: 200, json: async () => ({}) } as unknown as Response
+    }))
+
+    // ── Cycle 1: proof recovery fails ────────────────────────────────
+    seedSession(useAuthStore, 'stale-token', 'proof-stale-pending')
+    useAuthStore.setState({
+      identity: { nodeId: 7, passCode: '', createdAt: Date.now() },
+    })
+    signaling.connect('stale-token')
+    constructed[0].open()
+    constructed[0].fireClose(4001)
+    await settle()
+
+    expect(reRegisterCalls).toBe(1)
+    expect(lastReRegisterBody).toEqual({ proof: 'proof-stale-pending' })
+    expect(useAuthStore.getState().credentialsRequired).toBe(true)
+    expect(useAuthStore.getState().isConnected).toBe(false)
+
+    // ── Cycle 2: manual proofless login ──────────────────────────────
+    reRegisterCalls = 0
+    registerCalls = 0
+    lastReRegisterBody = null
+    lastRegisterBody = null
+    useAuthStore.getState().setPassCode('123456')
+    const committed = await useAuthStore.getState().connect()
+    await settle()
+    expect(committed).toBe(true)
+    expect(useAuthStore.getState().isConnected).toBe(true)
+    expect(useAuthStore.getState().session?.reRegisterProof).toBeNull()
+    expect(registerCalls).toBe(1)
+    expect(reRegisterCalls).toBe(0)
+
+    // ── Cycle 2 close: live null must win over any leftover pending ──
+    reRegisterCalls = 0
+    registerCalls = 0
+    lastReRegisterBody = null
+    lastRegisterBody = null
+    // Empty passcode again (typed only for the connect; recovery path sees empty).
+    useAuthStore.setState({
+      identity: { ...useAuthStore.getState().identity, passCode: '' },
+    })
+    const liveToken = useAuthStore.getState().session!.token
+    signaling.connect(liveToken)
+    constructed[constructed.length - 1].open()
+    constructed[constructed.length - 1].fireClose(4002)
+    await settle()
+
+    expect(useAuthStore.getState().credentialsRequired).toBe(true)
+    expect(useAuthStore.getState().isConnected).toBe(false)
+    expect(useAuthStore.getState().session).toBeNull()
+    // The live session's null must win: no re-register, no empty-passcode register.
+    expect(reRegisterCalls).toBe(0)
+    expect(registerCalls).toBe(0)
+    expect(lastReRegisterBody).toBeNull()
+    expect(lastRegisterBody).toBeNull()
   })
 })
 

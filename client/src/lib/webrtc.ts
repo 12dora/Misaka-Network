@@ -1,6 +1,6 @@
 import {
   getTurnIceServers, getAutoTurnIceServers, loadTurnSettings, refreshAutoTurn, isAutoTurnStaleWithin,
-  SUPPLEMENTAL_STUN,
+  getTurnRelayPreference, SUPPLEMENTAL_STUN,
 } from './turn'
 import { getDetectedNatType } from './nat'
 import { isE2eHostIceOnly } from './e2e-ice'
@@ -104,32 +104,19 @@ export async function getSelectedIcePath(pc: RTCPeerConnection): Promise<Selecte
 }
 
 // ── TURN master switch ───────────────────────────────────────────────
-// BUG-008: "启用 TURN 中继" is presented as a master switch, but only the
-// MANUAL server list honoured it — server-issued auto credentials were
-// injected unconditionally, so a user who turned relaying off kept relaying
-// (with whatever creds were already cached) until the tab was closed.
+// BUG-008: "启用 TURN 中继" is a master switch over BOTH manual servers and
+// server-issued auto credentials. The preference is three-state (see
+// getTurnRelayPreference in turn.ts):
+//   unset    — never chosen; auto TURN allowed (server is the gate)
+//   enabled  — user opted in
+//   disabled — user opted out; no turn:/turns: URLs may enter the PC
 //
-// The one nuance: `loadTurnSettings()` has no "unset" state and returns
-// `enabled: false` for a user who has simply never opened Settings. Treating
-// that struct default as an opt-out would disable server-issued TURN for
-// everybody out of the box. So: an explicitly persisted record is honoured
-// verbatim; the absence of a record leaves auto TURN on (the server remains
-// the canonical gate via its budget / kill-switch) and manual TURN off
-// (there are no manual servers before the record exists anyway).
-//
-// Mirrors turn.ts's STORAGE_KEY — duplicated rather than exported because
-// turn.ts owns the persistence format and we only need "has the user ever
-// expressed a preference".
-const TURN_SETTINGS_STORAGE_KEY = 'misaka.turnServers'
-
-function hasStoredTurnPreference(): boolean {
-  try { return localStorage.getItem(TURN_SETTINGS_STORAGE_KEY) !== null } catch { return false }
-}
+// Never consult `loadTurnSettings().enabled` in isolation: the struct
+// default is `enabled:false` for "unset", which is NOT an opt-out.
 
 /** Whether ANY relay (auto or manual) may be attached to a peer connection. */
 export function isRelayAllowed(): boolean {
-  if (loadTurnSettings().enabled) return true
-  return !hasStoredTurnPreference()
+  return getTurnRelayPreference() !== 'disabled'
 }
 
 function isTurnUrl(u: unknown): boolean {
