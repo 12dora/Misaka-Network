@@ -2,14 +2,19 @@ import express from 'express'
 import cors from 'cors'
 import { createServer } from 'http'
 import { WebSocketServer } from 'ws'
-import { router } from './http.js'
-import { setupWS, setTrustProxyFn } from './ws.js'
+import { router, getClientIP, installTestInstanceHeader } from './http.js'
+import { setupWS, setTrustProxyFn, checkPendingAuthAdmission } from './ws.js'
 import { setWSS } from './activity.js'
 import { startCleanupTask, stopCleanupTask } from './cleanup.js'
-import { loadTurnState, startPersistFlusher, stopPersistFlusher, flushTurnState, loadPersistedLocks, flushPersistedLocks } from './persist.js'
+import {
+  loadTurnState, startPersistFlusher, stopPersistFlusher,
+  flushTurnState, loadPersistedLocks, flushPersistedLocks,
+} from './persist.js'
 import { startTurnPollers, stopTurnPollers, startTurnRevokeRetry, stopTurnRevokeRetry } from './turn.js'
-import { allowedOrigins, isOriginAllowed, isOriginAllowedForRequest, isWildcardOriginMode } from './origin.js'
-import { PORT, SHUTDOWN_TIMEOUT_MS, TRUST_PROXY, WS_MAX_PAYLOAD_BYTES, validateStartupConfig } from './config.js'
+import { allowedOrigins, isOriginAllowed, isOriginAllowedForRequest, isWildcardOriginMode, setOriginTrustProxyFn } from './origin.js'
+import { PORT, SHUTDOWN_TIMEOUT_MS, TURN_CF_TIMEOUT_MS, TRUST_PROXY, WS_MAX_PAYLOAD_BYTES, validateStartupConfig } from './config.js'
+import { checkRateLimit } from './ratelimit.js'
+import { RATE_LIMIT_PER_MIN, RATE_WINDOW_MS } from './config.js'
 
 // Deployment errors must fail before listeners, cleanup timers or provider
 // pollers are created. In particular, an "enabled" automatic TURN service
@@ -27,7 +32,11 @@ app.set('trust proxy', TRUST_PROXY)
 // the upgrade handshake resolves the client IP through exactly the same hop
 // rules as `req.ip`. Before this the WS side took the left-most (i.e.
 // client-controlled) X-Forwarded-For entry and could be handed a forged IP.
-setTrustProxyFn(app.get('trust proxy fn'))
+// Origin scheme resolution uses the same predicate so X-Forwarded-Proto is
+// only trusted from a peer that the configured hop/CIDR policy allows.
+const trustProxyFn = app.get('trust proxy fn')
+setTrustProxyFn(trustProxyFn)
+setOriginTrustProxyFn(trustProxyFn)
 
 // CORS policy:
 //   - ALLOWED_ORIGINS=* → wildcard mode (echo any Origin). Intended for the
@@ -47,9 +56,89 @@ app.use((req, res, next) => {
   return cors({ origin: ok ? origin : false, credentials: false })(req, res, next)
 })
 
+// Graceful-shutdown gate: once SIGTERM lands we refuse new business before
+// the final security flush, so a credential issued during serialisation can
+// never miss the snapshot.
+let shuttingDown = false
+/** In-flight non-health HTTP requests — shutdown waits for these to finish. */
+let inFlightRequests = 0
+export function isShuttingDown(): boolean {
+  return shuttingDown
+}
+/** Test hook. */
+export function _inFlightForTest(): number {
+  return inFlightRequests
+}
+
+app.use((req, res, next) => {
+  if (shuttingDown) {
+    // Health stays up so the orchestrator can still observe the draining pod.
+    if (req.path === '/api/health' || req.path === '/api/ready') return next()
+    res.status(503).json({ error: 'SHUTTING_DOWN', message: '服务器正在关闭' })
+    return
+  }
+  // Track work that may mutate security/money state so shutdown can wait for
+  // a real drain instead of racing a fixed 2s timer against an 8s provider.
+  if (req.path.startsWith('/api')) {
+    inFlightRequests++
+    let settled = false
+    const done = () => {
+      if (settled) return
+      settled = true
+      inFlightRequests = Math.max(0, inFlightRequests - 1)
+    }
+    res.on('finish', done)
+    res.on('close', done)
+  }
+  next()
+})
+
+// Test-instance header must be set on EVERY /api response — including those
+// short-circuited by the pre-parser rate limit below — so the integration
+// harness can reject a stale process on a fixed port.
+installTestInstanceHeader(app)
+
+// Body-independent /api IP rate limit MUST run before express.json().
+// Malformed / oversized bodies previously burned parse resources outside every
+// IP budget, and with NODE_ENV=development returned Express's default HTML
+// error page instead of a stable JSON error.
+// Health/ready are excluded so orchestrator probes and test readiness polls
+// never starve the business budget.
+app.use('/api', (req, res, next) => {
+  if (req.path === '/health' || req.path === '/ready') return next()
+  const ip = getClientIP(req)
+  if (!checkRateLimit(`api:${ip}`, RATE_LIMIT_PER_MIN, RATE_WINDOW_MS)) {
+    res.status(429).json({ error: 'RATE_LIMITED', message: '请求过于频繁，请稍后再试' })
+    return
+  }
+  next()
+})
+
 // 64kb body cap — same ceiling as the WS frame guard, so a single bad
 // request can't burn a megabyte of buffer.
 app.use(express.json({ limit: '64kb' }))
+
+// Map body-parser failures to stable JSON in EVERY environment (including
+// development, where Express would otherwise return an HTML stack page).
+app.use((err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (!err || typeof err !== 'object') return next(err)
+  const e = err as { type?: string; status?: number; statusCode?: number; message?: string }
+  if (e.type === 'entity.parse.failed') {
+    res.status(400).json({ error: 'INVALID_JSON', message: '请求体不是合法 JSON' })
+    return
+  }
+  if (e.type === 'entity.too.large') {
+    res.status(413).json({ error: 'BODY_TOO_LARGE', message: '请求体过大' })
+    return
+  }
+  // status 400 from body-parser on other parse issues
+  if (e.status === 400 || e.statusCode === 400) {
+    res.status(400).json({ error: 'BAD_REQUEST', message: e.message ?? '请求无效' })
+    return
+  }
+  next(err)
+})
+
 app.use('/api', router)
 
 // Catch-all for non-API routes — always return JSON
@@ -63,7 +152,8 @@ const httpServer = createServer(app)
 // browsers always send on WS) is missing/disallowed. Non-browser callers
 // without an Origin header are still allowed — they cannot be tricked by a
 // malicious page, and the AUTH frame is still required within 5s of connect
-// (enforced in ws.ts).
+// (enforced in ws.ts). Pending-auth caps run here so we never allocate a
+// socket for a connection that will only be rejected for capacity.
 const wss = new WebSocketServer({
   server: httpServer,
   path: '/ws',
@@ -76,11 +166,20 @@ const wss = new WebSocketServer({
   // continuation frames — so nothing oversize is ever fully buffered.
   maxPayload: WS_MAX_PAYLOAD_BYTES,
   verifyClient: (info, done) => {
+    if (shuttingDown) {
+      done(false, 503, 'SHUTTING_DOWN')
+      return
+    }
     const origin = info.req.headers.origin
     // No Origin (non-browser); allowlist hit; or same-origin (Origin matches
     // our own Host). Reject otherwise — the upgrade fails before the WS
     // handshake completes so no socket is left dangling.
     if (!origin || isOriginAllowed(origin) || isOriginAllowedForRequest(info.req)) {
+      const admission = checkPendingAuthAdmission(info.req)
+      if (!admission.ok) {
+        done(false, 503, admission.reason)
+        return
+      }
       done(true)
       return
     }
@@ -118,11 +217,21 @@ startTurnPollers()
 startTurnRevokeRetry()
 
 httpServer.listen(PORT, () => {
-  console.log(`御坂信令服务器 listening on :${PORT}`)
+  const addr = httpServer.address()
+  const actualPort = typeof addr === 'object' && addr ? addr.port : PORT
+  console.log(`御坂信令服务器 listening on :${actualPort}`)
+  // Always emit the real port so PORT=0 test helpers can parse it (even when
+  // TEST_INSTANCE_NONCE is unset by a custom spawn).
+  console.log(`MISAKA_LISTEN_PORT=${actualPort}`)
 })
 
-// Graceful shutdown: notify all connected nodes before exiting
-let shuttingDown = false
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+// Graceful shutdown: gate → stop accepting → drain in-flight → strict flush →
+// re-check / re-flush → exit. Never exit 0 with mutations after the final
+// snapshot.
 async function gracefulShutdown(signal: string) {
   if (shuttingDown) return
   shuttingDown = true
@@ -136,7 +245,13 @@ async function gracefulShutdown(signal: string) {
   }, SHUTDOWN_TIMEOUT_MS)
   hardExit.unref?.()
 
-  // 1. Broadcast SHUTDOWN to every connected client
+  // 1. Stop accepting NEW connections immediately. In-flight requests keep
+  // running until they finish (or the hard backstop fires).
+  const closeHttp = new Promise<void>((resolve) => {
+    httpServer.close(() => resolve())
+  })
+
+  // 2. Broadcast SHUTDOWN to every connected client
   const shutdownMsg = JSON.stringify({ t: 'SERVER_SHUTDOWN', reason: '服务器维护中，请稍后重连' })
   for (const client of wss.clients) {
     if (client.readyState === 1) {
@@ -144,26 +259,76 @@ async function gracefulShutdown(signal: string) {
     }
   }
 
-  // 2. Close all WS connections with code 1001 (going away)
+  // 3. Close all WS connections with code 1001 (going away)
   for (const client of wss.clients) {
     client.close(1001, 'SERVER_SHUTDOWN')
   }
 
-  // 3. Stop TURN pollers and flush persisted state. AWAIT the flush — the
-  // money-critical monthly byte tally (and the brute-force locks) must hit
-  // disk before we exit. Fire-and-forget here used to lose the final delta
-  // whenever httpServer.close resolved before the async write/rename landed.
+  // 4. Stop background work so no more dirty state is produced during flush.
   stopCleanupTask()
   stopTurnPollers()
   stopTurnRevokeRetry()
   stopPersistFlusher()
-  await Promise.allSettled([flushTurnState(true), flushPersistedLocks()])
 
-  // 4. Stop accepting new connections, then exit
-  httpServer.close(() => {
-    console.log('信令服务器已安全关闭')
-    process.exit(0)
-  })
+  // 5. Real drain: wait for in-flight HTTP handlers up to the provider
+  // deadline budget (not a fixed 2s race that loses mutations).
+  const drainBudgetMs = Math.min(
+    SHUTDOWN_TIMEOUT_MS - 1500,
+    Math.max(TURN_CF_TIMEOUT_MS + 500, 3000),
+  )
+  const drainDeadline = Date.now() + Math.max(500, drainBudgetMs)
+  while (inFlightRequests > 0 && Date.now() < drainDeadline) {
+    await sleep(25)
+  }
+  await Promise.race([
+    closeHttp,
+    sleep(Math.max(0, drainDeadline - Date.now())),
+  ])
+
+  // 6. Strict security flush. force=true REJECTS on failure so we never claim
+  // "安全关闭" with the month's tally / deny list / locks unwritten.
+  async function strictFlush(): Promise<string | null> {
+    let flushFailed: string | null = null
+    try {
+      await flushTurnState(true)
+    } catch (err) {
+      flushFailed = (err as Error).message
+      console.error('[shutdown] TURN state flush failed:', flushFailed)
+    }
+    try {
+      await flushPersistedLocks(true)
+    } catch (err) {
+      const msg = (err as Error).message
+      flushFailed = flushFailed ? `${flushFailed}; ${msg}` : msg
+      console.error('[shutdown] locks flush failed:', msg)
+    }
+    return flushFailed
+  }
+
+  let flushFailed = await strictFlush()
+
+  // 7. If a late handler is still mutating (or finished after flush), wait
+  // briefly and flush again so we never exit 0 with an absent mutation.
+  if (inFlightRequests > 0) {
+    const extraDeadline = Date.now() + 500
+    while (inFlightRequests > 0 && Date.now() < extraDeadline) {
+      await sleep(20)
+    }
+    const second = await strictFlush()
+    if (second) flushFailed = flushFailed ? `${flushFailed}; ${second}` : second
+  }
+
+  clearTimeout(hardExit)
+  if (flushFailed) {
+    console.error(`信令服务器关闭时持久化失败: ${flushFailed}`)
+    process.exit(1)
+  }
+  if (inFlightRequests > 0) {
+    console.error(`信令服务器关闭时仍有 ${inFlightRequests} 个在途请求，拒绝声明安全关闭`)
+    process.exit(1)
+  }
+  console.log('信令服务器已安全关闭')
+  process.exit(0)
 }
 
 process.on('SIGTERM', () => void gracefulShutdown('SIGTERM').catch(() => process.exit(1)))

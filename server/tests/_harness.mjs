@@ -186,3 +186,58 @@ export async function waitForTestServer(proc, healthUrl, { timeoutMs = 10_000 } 
   })()
   return Promise.race([ready, exited])
 }
+
+/**
+ * Spawn a signaling server on an OS-assigned port (PORT=0) and return the
+ * real listening port. Avoids fixed-port collisions between parallel runs
+ * and other checkouts. Parses `MISAKA_LISTEN_PORT=` from child stdout.
+ */
+export async function spawnTestServer(envExtra = {}, { timeoutMs = 15_000 } = {}) {
+  const env = {
+    ...process.env,
+    PORT: '0',
+    TEST_INSTANCE_NONCE,
+    SERVER_SECRET: process.env.SERVER_SECRET || '11'.repeat(32),
+    // Default auto-TURN off so spawn does not require CF credentials.
+    TURN_AUTO_ENABLED: process.env.TURN_AUTO_ENABLED ?? 'false',
+    ...envExtra,
+  }
+  const proc = spawn(process.execPath, ['dist/index.js'], {
+    cwd: new URL('..', import.meta.url).pathname,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let port = null
+  let log = ''
+  const onData = (buf) => {
+    const text = buf.toString()
+    log += text
+    const m = text.match(/MISAKA_LISTEN_PORT=(\d+)/)
+    if (m) port = Number(m[1])
+  }
+  proc.stdout.on('data', onData)
+  proc.stderr.on('data', onData)
+
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (proc.exitCode !== null || proc.signalCode !== null) {
+      throw new Error(`server child exited before listen (code=${proc.exitCode}): ${log.slice(-800)}`)
+    }
+    if (port) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/api/health`)
+        if (res.ok) {
+          return {
+            proc,
+            port,
+            base: `http://127.0.0.1:${port}/api`,
+            wsUrl: `ws://127.0.0.1:${port}/ws`,
+          }
+        }
+      } catch { /* not ready */ }
+    }
+    await new Promise(r => setTimeout(r, 40))
+  }
+  await killChild(proc)
+  throw new Error(`spawnTestServer timed out after ${timeoutMs}ms (port=${port}): ${log.slice(-800)}`)
+}

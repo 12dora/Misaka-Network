@@ -73,6 +73,16 @@ services:
       # Durable state directory inside the container (see the volume below).
       TURN_PERSIST_DIR: /app/data
       TURN_PERSIST_INTERVAL_SEC: 10
+    # Hardening: the app only needs to write /app/data. Drop every capability
+    # and mount the rootfs read-only; the named volume below is the writable
+    # exception for the security/money snapshots.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
     expose:
       - "9080"
     volumes:

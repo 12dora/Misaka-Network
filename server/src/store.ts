@@ -11,6 +11,10 @@ import { SERVER_SECRET_KEY, SCRYPT_MAX_CONCURRENT, SCRYPT_MAX_QUEUE } from './co
 // The mapping is one-way: someone with CF logs alone cannot recover the
 // sessionId, while the server keeps both halves in memory and can revoke /
 // look up by either side. The redacted form is for log files we ship off-box.
+//
+// customIdentifier is deliberately session-bound: it ties a Cloudflare
+// credential to one session so revoke can target that grant. Abuse DENY
+// keys use `deriveTurnPrincipal` instead, which is restart-stable.
 export function deriveCustomIdentifier(sessionId: string): string {
   return createHmac('sha256', SERVER_SECRET_KEY)
     .update('misaka:turn-custom-id:v1\0')
@@ -21,6 +25,102 @@ export function deriveCustomIdentifier(sessionId: string): string {
 
 export function redactCustomIdentifier(cid: string): string {
   return `[redacted-${cid.slice(0, 4)}]`
+}
+
+/**
+ * Restart-stable TURN principal for durable denial. HMAC over the identity
+ * tuple (nodeId + passCodeHash) so the same person re-registering after a
+ * process restart still hits the deny list. Never used as a Cloudflare
+ * customIdentifier — that stays session-bound for revoke association.
+ */
+export function deriveTurnPrincipal(nodeId: number, passCodeHash: string): string {
+  return createHmac('sha256', SERVER_SECRET_KEY)
+    .update('misaka:turn-principal:v1\0')
+    .update(String(nodeId))
+    .update('\0')
+    .update(passCodeHash)
+    .digest('hex')
+    .slice(0, 32)
+}
+
+// ── Re-registration proof (Contract 1) ───────────────────────────────
+//
+// Opaque single-purpose token that authenticates re-registration of the SAME
+// identity after a tab refresh / WS 4001-4002 without needing the plaintext
+// passcode. Stored on the session; rotated on every successful use or renew.
+// Index is O(1) by proof so /api/re-register does not scan the session map.
+
+const reRegisterProofIndex = new Map<string, string>() // proof → sessionId
+// Tombstones keep nodeId attribution for retired/rotated proofs so failed
+// re-register attempts still feed the owning identity's freeze budget
+// (exactly like a wrong passcode) instead of a synthetic node 0.
+const reRegisterProofTombstones = new Map<string, { nodeId: number; until: number }>()
+const PROOF_TOMBSTONE_TTL_MS = 60 * 60_000
+
+export function mintReRegisterProof(): string {
+  return randomBytes(32).toString('hex')
+}
+
+export function indexReRegisterProof(proof: string, sessionId: string): void {
+  reRegisterProofIndex.set(proof, sessionId)
+  reRegisterProofTombstones.delete(proof)
+}
+
+export function unindexReRegisterProof(proof: string | undefined | null, nodeId?: number): void {
+  if (!proof) return
+  reRegisterProofIndex.delete(proof)
+  if (typeof nodeId === 'number' && nodeId > 0) {
+    reRegisterProofTombstones.set(proof, { nodeId, until: Date.now() + PROOF_TOMBSTONE_TTL_MS })
+  }
+}
+
+export function findSessionByReRegisterProof(proof: string): NodeSession | null {
+  const r = resolveReRegisterProof(proof)
+  return r.status === 'ok' ? r.session : null
+}
+
+/**
+ * Resolve a re-register proof. On failure, `nodeId` is the owning identity
+ * when known (live/expired session, or a recently-retired tombstone) so the
+ * freeze budget can be charged exactly like a wrong passcode.
+ */
+export function resolveReRegisterProof(proof: string):
+  | { status: 'ok'; session: NodeSession }
+  | { status: 'invalid'; nodeId: number | null } {
+  if (!proof || proof.length < 32) return { status: 'invalid', nodeId: null }
+  const sessionId = reRegisterProofIndex.get(proof)
+  if (sessionId) {
+    const session = nodes.get(sessionId)
+    if (!session) {
+      reRegisterProofIndex.delete(proof)
+    } else if (session.reRegisterProof !== proof) {
+      reRegisterProofIndex.delete(proof)
+      // Mismatch — index was stale; still charge the session's node if present.
+      return { status: 'invalid', nodeId: session.nodeId }
+    } else if (isSessionExpired(session)) {
+      return { status: 'invalid', nodeId: session.nodeId }
+    } else {
+      return { status: 'ok', session }
+    }
+  }
+  const tomb = reRegisterProofTombstones.get(proof)
+  if (tomb) {
+    if (Date.now() > tomb.until) {
+      reRegisterProofTombstones.delete(proof)
+      return { status: 'invalid', nodeId: null }
+    }
+    return { status: 'invalid', nodeId: tomb.nodeId }
+  }
+  return { status: 'invalid', nodeId: null }
+}
+
+/** Rotate proof in place (session-renew). Returns the new proof. */
+export function rotateReRegisterProof(session: NodeSession): string {
+  unindexReRegisterProof(session.reRegisterProof, session.nodeId)
+  const next = mintReRegisterProof()
+  session.reRegisterProof = next
+  indexReRegisterProof(next, session.sessionId)
+  return next
 }
 
 // Sessions keyed by unique sessionId (one entry per WS session). Multiple
@@ -124,13 +224,91 @@ export function isSessionExpired(session: NodeSession, now = Date.now()): boolea
  * socket.
  */
 export function findSessionByToken(token: string): NodeSession | null {
+  const r = resolveSessionByToken(token)
+  return r.kind === 'ok' ? r.session : null
+}
+
+// Short-lived memory of tokens that belonged to sessions purged for expiry.
+// Cleanup removes the session from `nodes`, but Contract 3 still requires
+// AUTH with that token to close 4002 (expired) rather than 4001 (unknown)
+// until the tombstone ages out.
+const expiredTokenTombstones = new Map<string, number>()
+const EXPIRED_TOKEN_TOMBSTONE_MS = 5 * 60_000
+
+/** Record that `token` belonged to a session that expired (cleanup path). */
+export function markTokenExpired(token: string | undefined | null): void {
+  if (!token) return
+  expiredTokenTombstones.set(token, Date.now() + EXPIRED_TOKEN_TOMBSTONE_MS)
+}
+
+/**
+ * Discriminated token resolution for Contract 3 close-code mapping:
+ *   - ok      → live session
+ *   - expired → token matches a session past expiresAt, or a recent expiry tombstone → WS 4002
+ *   - invalid → unknown token → WS 4001
+ */
+export function resolveSessionByToken(token: string):
+  | { kind: 'ok'; session: NodeSession }
+  | { kind: 'expired' }
+  | { kind: 'invalid' } {
+  if (!token) return { kind: 'invalid' }
   const now = Date.now()
+  let sawExpired = false
   for (const s of nodes.values()) {
     if (s.token !== token) continue
-    if (isSessionExpired(s, now)) return null
-    return s
+    if (isSessionExpired(s, now)) {
+      sawExpired = true
+      markTokenExpired(token)
+      continue
+    }
+    return { kind: 'ok', session: s }
   }
-  return null
+  if (sawExpired) return { kind: 'expired' }
+  const until = expiredTokenTombstones.get(token)
+  if (until !== undefined) {
+    if (now < until) return { kind: 'expired' }
+    expiredTokenTombstones.delete(token)
+  }
+  return { kind: 'invalid' }
+}
+
+/**
+ * Drop expired re-register-proof and token tombstones. Called from the
+ * periodic cleanup task: both maps used to grow without bound because
+ * expiry was lazy and only fired when that exact key was presented again —
+ * normal expiry/release/renew/rotation never re-presents those keys.
+ */
+export function cleanupExpiredTombstones(now = Date.now()): { proofs: number; tokens: number } {
+  let proofs = 0
+  for (const [proof, tomb] of reRegisterProofTombstones) {
+    if (now > tomb.until) {
+      reRegisterProofTombstones.delete(proof)
+      proofs++
+    }
+  }
+  let tokens = 0
+  for (const [token, until] of expiredTokenTombstones) {
+    if (now >= until) {
+      expiredTokenTombstones.delete(token)
+      tokens++
+    }
+  }
+  return { proofs, tokens }
+}
+
+/** Test hooks for tombstone map sizing. */
+export function _tombstoneCountsForTest(): { proofs: number; tokens: number } {
+  return { proofs: reRegisterProofTombstones.size, tokens: expiredTokenTombstones.size }
+}
+
+/** Test hook — seed a proof tombstone with an absolute expiry. */
+export function _seedProofTombstoneForTest(proof: string, nodeId: number, until: number): void {
+  reRegisterProofTombstones.set(proof, { nodeId, until })
+}
+
+/** Test hook — seed a token tombstone with an absolute expiry. */
+export function _seedTokenTombstoneForTest(token: string, until: number): void {
+  expiredTokenTombstones.set(token, until)
 }
 
 export function findSessionsByNodeAndHash(nodeId: number, passCodeHash: string): NodeSession[] {
@@ -228,7 +406,14 @@ export function scryptQueueDepth(): { inFlight: number; queued: number } {
   return { inFlight: scryptInFlight, queued: scryptWaiters.length }
 }
 
+/** Test hook — number of scrypt hashes started (occupied wrong-passcode path). */
+export let _scryptInvokeCountForTest = 0
+export function _resetScryptInvokeCountForTest(): void {
+  _scryptInvokeCountForTest = 0
+}
+
 export async function hashPassCodeScrypt(code: string, saltHex: string): Promise<string> {
+  _scryptInvokeCountForTest++
   await acquireScryptSlot()
   try {
     const salt = Buffer.from(saltHex, 'hex')

@@ -8,6 +8,18 @@ export interface NodeSession {
   passCodeSalt?: string        // 16-byte hex salt for scrypt; absent for legacy sha256 records
   passCodeAlgo?: 'sha256' | 'scrypt'  // absent = 'sha256' (legacy)
   token: string             // auth token (private)
+  /**
+   * Contract 1: opaque single-purpose re-registration proof. 32 random bytes
+   * hex. Authenticates re-registration of THIS identity only — never accepted
+   * as a Bearer token. Rotated on every successful use / renew.
+   */
+  reRegisterProof: string
+  /**
+   * Restart-stable TURN principal (server HMAC over identity tuple). Used as
+   * the deny-list key so an abuse ban survives re-registration. Distinct from
+   * customIdentifier, which stays session-bound for Cloudflare revoke.
+   */
+  turnPrincipal: string
   socket: WebSocket | null
   lastSeen: number
   channelId: string | null
@@ -16,10 +28,8 @@ export interface NodeSession {
   lockedUntil: number
   joinedAt: number
   // Absolute session expiry (SECURITY-001). Stamped once at register time
-  // from SESSION_TTL_MS and never extended — reconnecting with the same token
-  // does not buy more time. Every token resolution, WS frame and cleanup pass
-  // compares against this, so HTTP, WS, QR, TURN and release permissions all
-  // stop at the same instant.
+  // from SESSION_TTL_MS. Reconnects alone never extend it; only an explicit
+  // authenticated POST /api/session-renew does (Contract 2).
   expiresAt: number
   ip: string
 }

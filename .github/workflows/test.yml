@@ -14,8 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # guard script diffs against origin/<base>
+        # Shallow clone is enough for the test jobs. Only the guard job below
+        # needs full history to diff against origin/<base>.
 
       - uses: actions/setup-node@v4
         with:
@@ -36,8 +36,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -123,8 +121,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -154,6 +150,8 @@ jobs:
           path: client/playwright-report
           retention-days: 7
 
+  # Floor: src/ changes must touch tests/. A real patch-coverage gate is
+  # added below so a comment-only test change cannot satisfy the guard alone.
   tests-touched-guard:
     name: Guard — src/ changes must touch tests/
     runs-on: ubuntu-latest
@@ -171,3 +169,93 @@ jobs:
           GITHUB_BASE_REF: ${{ github.base_ref }}
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: node scripts/guard-tests-touched.mjs
+
+  # Coverage floor for core server modules. Thresholds start at today's
+  # baseline and must only ratchet upward.
+  server-coverage:
+    name: Server coverage floor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - name: Install server deps
+        working-directory: server
+        run: npm ci
+      - name: Build
+        working-directory: server
+        run: npm run build
+      - name: Install c8 + run real coverage gate
+        working-directory: server
+        # Real multi-test coverage via coverage-runner.mjs (each test is a
+        # real child process; c8 merges V8 coverage). --per-file enforces
+        # thresholds on every included module; check-changed-line-coverage
+        # scores executable lines touched by the PR diff.
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+          BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || 'HEAD~1' }}
+          MIN_CHANGED_PCT: '60'
+        run: |
+          set -e
+          npm ci
+          npm run build
+          npx c8 \
+            --include 'dist/ratelimit.js' \
+            --include 'dist/store.js' \
+            --include 'dist/ws.js' \
+            --include 'dist/persist.js' \
+            --include 'dist/origin.js' \
+            --include 'dist/session-lifecycle.js' \
+            --reporter=text \
+            --reporter=text-summary \
+            --reporter=json \
+            --reports-dir=coverage \
+            --check-coverage \
+            --per-file \
+            --lines 40 \
+            --statements 40 \
+            --functions 35 \
+            --branches 25 \
+            node tests/coverage-runner.mjs \
+              tests/ratelimit-sliding.test.mjs \
+              tests/occupied-scrypt.test.mjs \
+              tests/pending-auth-cap.test.mjs \
+              tests/persist-validation.test.mjs \
+              tests/activity-broadcast-scale.test.mjs \
+              tests/tombstone-cleanup.test.mjs \
+              tests/origin-lockdown.test.mjs \
+              tests/release-terminates.test.mjs \
+              tests/session-renew.test.mjs
+          node scripts/check-changed-line-coverage.mjs
+
+  # Aggregate job so deploy (and branch protection) can require one check
+  # that only goes green when every suite above succeeded.
+  all-green:
+    name: All tests green
+    runs-on: ubuntu-latest
+    needs: [server-tests, client-tests, client-build, e2e-tests, server-coverage]
+    if: always()
+    steps:
+      - name: Check all required jobs
+        run: |
+          set -e
+          echo "server-tests=${{ needs.server-tests.result }}"
+          echo "client-tests=${{ needs.client-tests.result }}"
+          echo "client-build=${{ needs.client-build.result }}"
+          echo "e2e-tests=${{ needs.e2e-tests.result }}"
+          echo "server-coverage=${{ needs.server-coverage.result }}"
+          for r in \
+            "${{ needs.server-tests.result }}" \
+            "${{ needs.client-tests.result }}" \
+            "${{ needs.client-build.result }}" \
+            "${{ needs.e2e-tests.result }}" \
+            "${{ needs.server-coverage.result }}"; do
+            if [ "$r" != "success" ]; then
+              echo "::error::required job did not succeed (got $r)"
+              exit 1
+            fi
+          done
+          echo "all required jobs green"

@@ -50,8 +50,13 @@ function readBool(name: string, fallback: boolean): boolean {
 }
 
 // ── HTTP / Process ────────────────────────────────────────────────────
-export const PORT = readInt('PORT', 9080, { min: 1, max: 65535 })
-export const SHUTDOWN_TIMEOUT_MS = 5_000
+// PORT=0 is the OS-assigned ephemeral port (integration tests use it to avoid
+// fixed-port collisions). Production defaults to 9080.
+export const PORT = readInt('PORT', 9080, { min: 0, max: 65535 })
+// Must outlast the longest in-flight provider call (TURN_CF_TIMEOUT_MS default
+// 8s) plus a flush budget, otherwise shutdown abandons drain and can exit 0
+// with mutations that never hit the final snapshot.
+export const SHUTDOWN_TIMEOUT_MS = readInt('SHUTDOWN_TIMEOUT_MS', 12_000, { min: 2_000, max: 120_000 })
 // Integration-test process identity. The normal production bootstrap never
 // sets this variable; when a test deliberately launches a production-mode
 // child, it must still echo the nonce so readiness cannot accept a stale
@@ -67,12 +72,30 @@ export const IS_PRODUCTION = (process.env.NODE_ENV ?? '').toLowerCase() === 'pro
 // request and bypasses all of them. Operators running behind exactly one
 // reverse proxy that appends the real client IP set `TRUST_PROXY=1` (the hop
 // count); a CIDR/preset list (e.g. `loopback, 10.0.0.0/8`) is also accepted and
-// passed through to Express verbatim.
+// passed through to Express after compile validation.
+//
+// Production REJECTS boolean `true` — Express then trusts every address in the
+// chain and a client that talks to the service directly can forge every per-IP
+// identity. Allowed forms: false/0/unset, a positive hop count, or a validated
+// CIDR/preset list. Caddy templates use TRUST_PROXY=1 and keep working.
 function parseTrustProxy(raw: string | undefined): number | boolean | string {
-  if (raw === undefined || raw === '' || raw.toLowerCase() === 'false' || raw === '0') return false
-  if (raw.toLowerCase() === 'true') return true
-  if (/^\d+$/.test(raw)) return parseInt(raw, 10)
-  return raw
+  if (raw === undefined || raw.trim() === '' || raw.trim().toLowerCase() === 'false' || raw.trim() === '0') {
+    return false
+  }
+  const s = raw.trim()
+  if (s.toLowerCase() === 'true') {
+    // Boolean true is never safe in production. In non-production we still
+    // refuse it — operators should set an explicit hop count so the intent is
+    // reviewable. Historical tests that relied on true must migrate to `1`.
+    fail('TRUST_PROXY', raw, '布尔 true 已禁用；请使用 hop 数（如 1）或 CIDR/preset 列表')
+  }
+  if (/^\d+$/.test(s)) {
+    const n = parseInt(s, 10)
+    if (n < 1) fail('TRUST_PROXY', raw, 'hop 数必须是正整数')
+    return n
+  }
+  // CIDR / preset list — hand to Express; compile-check at startup.
+  return s
 }
 export const TRUST_PROXY = parseTrustProxy(process.env.TRUST_PROXY)
 export const TRUST_PROXY_ENABLED = TRUST_PROXY !== false
@@ -254,10 +277,17 @@ if (!_serverSecret) {
 export const SERVER_SECRET = _serverSecret
 export const SERVER_SECRET_KEY = Buffer.from(SERVER_SECRET, 'hex')
 
-// Time a freshly-opened WS has to send AUTH before we close it with 4001.
-// Idle connections were free to sit forever before this, which let an
-// attacker exhaust the WS server's connection limit at zero cost.
+// Time a freshly-opened WS has to send AUTH before we close it with 4003
+// AUTH_TIMEOUT (Contract 3). Idle connections were free to sit forever before
+// this, which let an attacker exhaust the WS server's connection limit at zero
+// cost. Pending-auth caps below bound how many such sockets can exist at once.
 export const WS_AUTH_GRACE_MS = readInt('WS_AUTH_GRACE_MS', 5000, { min: 100 })
+
+// Unauthenticated (pre-AUTH) WebSocket connection caps. MAX_NODES only covers
+// registered sessions; without these an attacker can hold open sockets for the
+// full AUTH grace window and exhaust FDs/memory without ever registering.
+export const WS_MAX_PENDING_AUTH = readInt('WS_MAX_PENDING_AUTH', 500, { min: 1 })
+export const WS_MAX_PENDING_AUTH_PER_IP = readInt('WS_MAX_PENDING_AUTH_PER_IP', 20, { min: 1 })
 
 // ── WebSocket resource boundaries (SECURITY-002 / SECURITY-003) ──────
 //
@@ -289,6 +319,9 @@ export const WS_MAX_OVERSIZE_STRIKES = readInt('WS_MAX_OVERSIZE_STRIKES', 3, { m
 export const WS_MSG_BURST = readInt('WS_MSG_BURST', 240, { min: 1 })
 export const WS_MSG_RATE_PER_SEC = readInt('WS_MSG_RATE_PER_SEC', 60, { min: 1 })
 export const WS_MAX_RATE_VIOLATIONS = readInt('WS_MAX_RATE_VIOLATIONS', 200, { min: 1 })
+// Sliding window for inbound rate-violation counting. Configurable so tests
+// can cross the boundary without waiting a full minute on the same socket.
+export const WS_RATE_VIOLATION_WINDOW_MS = readInt('WS_RATE_VIOLATION_WINDOW_MS', 60_000, { min: 50 })
 
 // Slow-reader (outbound) backpressure. Above the soft mark we stop enqueueing
 // forwarded/broadcast frames for that socket; above the hard mark the peer is

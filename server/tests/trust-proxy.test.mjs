@@ -49,14 +49,27 @@ async function testDefaultIgnoresSpoofedXff() {
   procs.push(proc)
   await waitForServer(PORT)
 
-  // 10 registers should succeed; the 11th (distinct spoofed XFF) must be
-  // IP_LIMITED because the header is ignored and all collapse to one socket IP.
-  let sawLimit = false
-  for (let i = 0; i < 11; i++) {
+  // Exact boundary: MAX_NODES_PER_IP = 10.
+  //   attempts 1..10 with distinct spoofed XFF → succeed (collapse to one IP)
+  //   attempt 11 → IP_LIMITED
+  //   attempt 12 → still IP_LIMITED
+  // A "eventually limited" assertion would pass if the cap were silently 1.
+  const CAP = 10
+  for (let i = 0; i < CAP; i++) {
     const r = await postFrom(PORT, '/register', { nodeId: 16000 + i, passCode: '123456' }, `203.0.113.${i}`)
-    if (r.error === 'IP_LIMITED') { sawLimit = true; break }
+    if (r.error === 'IP_LIMITED') {
+      throw new Error(`attempt ${i + 1}/${CAP} must succeed under collapsed IP, got IP_LIMITED`)
+    }
+    if (!r.token) throw new Error(`attempt ${i + 1} expected token, got ${JSON.stringify(r)}`)
   }
-  if (!sawLimit) throw new Error('spoofed XFF bypassed MAX_NODES_PER_IP (trust-proxy default should be OFF)')
+  const trip = await postFrom(PORT, '/register', { nodeId: 16000 + CAP, passCode: '123456' }, `203.0.113.${CAP}`)
+  if (trip.error !== 'IP_LIMITED') {
+    throw new Error(`attempt ${CAP + 1} must be IP_LIMITED, got ${JSON.stringify(trip)}`)
+  }
+  const again = await postFrom(PORT, '/register', { nodeId: 16000 + CAP + 1, passCode: '123456' }, `203.0.113.${CAP + 1}`)
+  if (again.error !== 'IP_LIMITED') {
+    throw new Error(`attempt ${CAP + 2} must still be IP_LIMITED, got ${JSON.stringify(again)}`)
+  }
 }
 
 async function testTrustProxyHonoursXff() {
