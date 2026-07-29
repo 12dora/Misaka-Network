@@ -1,4 +1,4 @@
-import { useState, useEffect, useId, useMemo, useRef } from 'react'
+import { useState, useEffect, useId, useMemo, useRef, useCallback, type KeyboardEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import MisakaKanjiBlock from '@/components/ui/MisakaKanjiBlock'
 import MisakaButton from '@/components/ui/MisakaButton'
@@ -13,20 +13,18 @@ import { detectNatType, type NatDetectionResult } from '@/lib/nat'
 import { isSoundEnabled, setSoundEnabled, subscribeSoundPreference, playSound } from '@/lib/sound'
 import { ensureNotificationPermission } from '@/lib/notify'
 import { useModalExit } from '@/hooks/useModalExit'
+import { settings as copy } from '@/copy/zh-CN/settings'
 
 // A11Y-002: `color` here is the FILL used for the badge background (white
 // text on top), `textColor` is the AA-verified foreground for the same
 // state when it is rendered as small text on a light surface.
 const NAT_TYPE_LABEL: Record<NatDetectionResult['type'], { label: string; color: string; textColor: string }> = {
-  open:       { label: '开放（无 NAT）',     color: 'var(--state-success)', textColor: 'var(--state-success-on-light)' },
-  cone:       { label: '锥型 NAT（可直连）', color: 'var(--state-success)', textColor: 'var(--state-success-on-light)' },
-  // P1-3 (other agent): IPv6-only networks deserve their own label so the
-  // user understands the connection mode rather than being told their NAT
-  // is generic-cone.
-  'cone-v6':  { label: '锥型 NAT（IPv6）',   color: 'var(--state-success)', textColor: 'var(--state-success-on-light)' },
-  symmetric:  { label: '对称 NAT（需 TURN）',color: 'var(--state-warn)',    textColor: 'var(--state-warn-on-light)' },
-  blocked:    { label: 'UDP 受限',          color: 'var(--state-warn)',    textColor: 'var(--state-warn-on-light)' },
-  unknown:    { label: '未知',              color: 'var(--text-muted)',    textColor: 'var(--text-muted-on-light)' },
+  open:       { label: copy.nat.open,       color: 'var(--state-success)', textColor: 'var(--state-success-on-light)' },
+  cone:       { label: copy.nat.cone,       color: 'var(--state-success)', textColor: 'var(--state-success-on-light)' },
+  'cone-v6':  { label: copy.nat['cone-v6'], color: 'var(--state-success)', textColor: 'var(--state-success-on-light)' },
+  symmetric:  { label: copy.nat.symmetric,  color: 'var(--state-warn)',    textColor: 'var(--state-warn-on-light)' },
+  blocked:    { label: copy.nat.blocked,    color: 'var(--state-warn)',    textColor: 'var(--state-warn-on-light)' },
+  unknown:    { label: copy.nat.unknown,    color: 'var(--text-muted)',    textColor: 'var(--text-muted-on-light)' },
 }
 
 interface Props {
@@ -34,6 +32,12 @@ interface Props {
 }
 
 type SettingsTab = 'turn' | 'sound' | 'about'
+
+const TABS: { id: SettingsTab; label: string }[] = [
+  { id: 'turn', label: copy.tabs.turn },
+  { id: 'sound', label: copy.tabs.sound },
+  { id: 'about', label: copy.tabs.about },
+]
 
 interface TurnStatusView {
   enabled: boolean
@@ -64,6 +68,11 @@ export default function SettingsModal({ onClose }: Props) {
   const [autoTurnActive, setAutoTurnActive] = useState(getAutoTurnState())
   const [issuing, setIssuing] = useState(false)
   const [issueError, setIssueError] = useState<string | null>(null)
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  // 08 P1: pending delete confirmation — never persist until the user confirms.
+  const [pendingDelete, setPendingDelete] = useState<TurnServer | null>(null)
+  const keepDeleteRef = useRef<HTMLButtonElement>(null)
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
   const navigate = useNavigate()
   const modal = useModalExit(onClose)
 
@@ -71,6 +80,16 @@ export default function SettingsModal({ onClose }: Props) {
   const urlId = `turn-url-${fieldId}`
   const userId = `turn-user-${fieldId}`
   const passId = `turn-pass-${fieldId}`
+  const tabPanelId = {
+    turn: `settings-panel-turn-${fieldId}`,
+    sound: `settings-panel-sound-${fieldId}`,
+    about: `settings-panel-about-${fieldId}`,
+  }
+  const tabId = {
+    turn: `settings-tab-turn-${fieldId}`,
+    sound: `settings-tab-sound-${fieldId}`,
+    about: `settings-tab-about-${fieldId}`,
+  }
 
   // Poll server TURN status while the TURN tab is open — cheap (no secrets),
   // gives the user live view of the kill switch + monthly burn.
@@ -123,7 +142,7 @@ export default function SettingsModal({ onClose }: Props) {
       // went back to "开始检测" with no result and no reason.
       console.warn('[settings] NAT detection failed', err)
       setNatState('error')
-      setNatError('无法完成网络类型检测。请确认浏览器未屏蔽 WebRTC，然后重试。')
+      setNatError(copy.natDetectFailed)
     }
   }
 
@@ -170,9 +189,9 @@ export default function SettingsModal({ onClose }: Props) {
   }, [turnAvailable, turnSettings.forceRelay])
 
   const forceRelayHint = useMemo(() => {
-    if (!turnSettings.enabled) return '需要先启用 TURN 中继'
-    if (!turnAvailable) return '当前没有可用的中继服务器，开启后将无法建立连接'
-    return '仅测试用：强制所有连接经过中继'
+    if (!turnSettings.enabled) return copy.forceRelayNeedSwitch
+    if (!turnAvailable) return copy.forceRelayNoServer
+    return copy.forceRelayHint
   }, [turnSettings.enabled, turnAvailable])
 
   function handleAdd() {
@@ -205,12 +224,11 @@ export default function SettingsModal({ onClose }: Props) {
   function handleEdit(server: TurnServer) {
     setEditingServer(server)
     setForm({ url: server.url, username: server.username, credential: server.credential })
+    setAdvancedOpen(true)
   }
 
-  function handleDelete(id: string) {
-    // If the user is mid-edit on this row, clear the editing state and reset
-    // the form fields first — otherwise the edit form would silently target a
-    // server that no longer exists and "保存" would no-op.
+  /** Apply a confirmed delete. Persistence is driven by the turnSettings effect. */
+  function commitDelete(id: string) {
     if (editingServer?.id === id) {
       setEditingServer(null)
       setForm({ url: '', username: '', credential: '' })
@@ -221,6 +239,7 @@ export default function SettingsModal({ onClose }: Props) {
       delete next[id]
       return next
     })
+    setPendingDelete(null)
   }
 
   function handleToggleServer(id: string) {
@@ -255,7 +274,7 @@ export default function SettingsModal({ onClose }: Props) {
         [server.id]: {
           reachable: false,
           code: 'SETUP_FAILED',
-          message: '测试无法启动。请检查地址格式后重试。',
+          message: copy.testFailed,
         },
       }))
     } finally {
@@ -269,10 +288,43 @@ export default function SettingsModal({ onClose }: Props) {
     if (next) playSound('scan')
   }
 
+  // 08 P2: roving tabindex + Arrow/Home/End for the settings tablist.
+  const focusTab = useCallback((index: number) => {
+    const next = TABS[index]
+    if (!next) return
+    setTab(next.id)
+    tabRefs.current[index]?.focus()
+  }, [])
+
+  function onTabKeyDown(e: KeyboardEvent<HTMLButtonElement>, index: number) {
+    let nextIndex: number | null = null
+    switch (e.key) {
+      case 'ArrowRight':
+      case 'ArrowDown':
+        nextIndex = (index + 1) % TABS.length
+        break
+      case 'ArrowLeft':
+      case 'ArrowUp':
+        nextIndex = (index - 1 + TABS.length) % TABS.length
+        break
+      case 'Home':
+        nextIndex = 0
+        break
+      case 'End':
+        nextIndex = TABS.length - 1
+        break
+      default:
+        return
+    }
+    e.preventDefault()
+    focusTab(nextIndex)
+  }
+
   return (
+    <>
     <MisakaDialog
-      title="设置"
-      description="中继、音效与关于本应用的设置"
+      title={copy.title}
+      description={copy.description}
       onRequestClose={modal.requestClose}
       backdropClass={modal.backdropClass}
       panelClass={modal.panelClass}
@@ -294,32 +346,32 @@ export default function SettingsModal({ onClose }: Props) {
           >
             <div className="flex items-center gap-2">
               <MisakaKanjiBlock char="設" size="sm" />
-              <h2 id={titleId} className="font-kanji font-bold text-sm text-[var(--text-on-white)] m-0">设置</h2>
+              <h2 id={titleId} className="font-kanji font-bold text-sm text-[var(--text-on-white)] m-0">{copy.title}</h2>
             </div>
             <button
               className="tap-target w-7 h-7 flex items-center justify-center rounded-full cursor-pointer hover:opacity-70 transition-opacity"
               style={{ border: 'none', background: 'var(--surface-tint)', color: 'var(--text-on-white)' }}
-              onClick={modal.requestClose}
-              aria-label="关闭设置"
+              onClick={() => modal.requestClose()}
+              aria-label={copy.closeAria}
             >
               ✕
             </button>
           </div>
-          <p id={descriptionId} className="sr-only">中继、音效与关于本应用的设置</p>
+          <p id={descriptionId} className="sr-only">{copy.description}</p>
         </>
       )}
     >
-      {/* Tabs */}
+      {/* Tabs — roving tabindex, aria-controls ↔ tabpanel */}
       <div className="flex border-b" style={{ borderColor: 'var(--border-card)' }} role="tablist" aria-label="设置分类">
-        {([
-          { id: 'turn' as const, label: '中继' },
-          { id: 'sound' as const, label: '音效' },
-          { id: 'about' as const, label: '关于' },
-        ]).map(t => (
+        {TABS.map((t, index) => (
           <button
             key={t.id}
+            ref={el => { tabRefs.current[index] = el }}
+            id={tabId[t.id]}
             role="tab"
             aria-selected={tab === t.id}
+            aria-controls={tabPanelId[t.id]}
+            tabIndex={tab === t.id ? 0 : -1}
             className="flex-1 py-2.5 text-center font-kanji text-xs cursor-pointer transition-colors"
             style={{
               border: 'none',
@@ -329,6 +381,7 @@ export default function SettingsModal({ onClose }: Props) {
               fontWeight: tab === t.id ? 700 : 400,
             }}
             onClick={() => setTab(t.id)}
+            onKeyDown={e => onTabKeyDown(e, index)}
           >
             {t.label}
           </button>
@@ -337,18 +390,23 @@ export default function SettingsModal({ onClose }: Props) {
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-6">
-        {/* ── TURN Settings ───────────────────────────────── */}
+        {/* ── Connection / TURN Settings ──────────────────── */}
         {tab === 'turn' && (
-          <div className="flex flex-col gap-4">
+          <div
+            className="flex flex-col gap-4"
+            role="tabpanel"
+            id={tabPanelId.turn}
+            aria-labelledby={tabId.turn}
+          >
             {/* ── NAT type probe ──────────────────────────────── */}
             <div
               className="rounded-lg p-3 flex flex-col gap-2"
               style={{ background: 'var(--surface-tint)', border: '1px solid var(--border-card)' }}
             >
               <div className="flex items-center justify-between gap-2">
-                <span className="font-kanji text-sm text-[var(--text-on-white)]">网络类型检测</span>
+                <span className="font-kanji text-sm text-[var(--text-on-white)]">{copy.networkType}</span>
                 <MisakaButton size="sm" onClick={handleDetectNat} disabled={natState === 'running'}>
-                  {natState === 'running' ? '检测中…' : (natResult ? '重新检测' : '开始检测')}
+                  {natState === 'running' ? copy.detecting : (natResult ? copy.redetect : copy.startDetect)}
                 </MisakaButton>
               </div>
               {natState === 'error' && natError && (
@@ -367,7 +425,7 @@ export default function SettingsModal({ onClose }: Props) {
                     </span>
                     {natResult.publicEndpoints.length > 0 && (
                       <span className="font-mono text-[11px] text-[var(--text-muted-on-light)]">
-                        {natResult.publicEndpoints.length} 个公网映射
+                        {copy.publicMappings(natResult.publicEndpoints.length)}
                       </span>
                     )}
                   </div>
@@ -375,7 +433,7 @@ export default function SettingsModal({ onClose }: Props) {
                     {natResult.reason}
                     {(natResult.type === 'symmetric' || natResult.type === 'blocked') && (
                       <span className="block mt-1" style={{ color: 'var(--state-warn-on-light)' }}>
-                        建议在下方启用 TURN 中继，否则与同类网络的对端可能无法直连。
+                        {copy.natNeedAssist}
                       </span>
                     )}
                   </p>
@@ -391,7 +449,7 @@ export default function SettingsModal({ onClose }: Props) {
                 role="status"
               >
                 <span className="font-kanji text-[11px]" style={{ color: 'var(--state-warn-on-light)' }}>
-                  暂时无法获取中继服务状态
+                  {copy.cannotFetchStatus}
                 </span>
                 <MisakaButton
                   variant="pill"
@@ -403,7 +461,7 @@ export default function SettingsModal({ onClose }: Props) {
                     setTurnStatusRetry(value => value + 1)
                   }}
                 >
-                  重试
+                  {copy.retry}
                 </MisakaButton>
               </div>
             )}
@@ -416,7 +474,7 @@ export default function SettingsModal({ onClose }: Props) {
                 }}
               >
                 <div className="flex items-center justify-between">
-                  <span className="font-kanji text-sm text-[var(--text-on-white)]">服务器自动下发</span>
+                  <span className="font-kanji text-sm text-[var(--text-on-white)]">{copy.autoIssue}</span>
                   <span
                     className="inline-block px-2 py-0.5 rounded text-[10px] font-kanji text-white"
                     style={{
@@ -425,10 +483,10 @@ export default function SettingsModal({ onClose }: Props) {
                         : turnStatus.available && autoTurnActive.active ? 'var(--state-success-on-light)' : 'var(--state-warn-on-light)',
                     }}
                   >
-                    {!turnStatus.enabled ? '已停用'
-                      : !turnStatus.configured ? '未配置'
-                      : !turnStatus.available ? '暂不可用'
-                      : autoTurnActive.active ? '已下发' : '待下发'}
+                    {!turnStatus.enabled ? copy.statusDisabled
+                      : !turnStatus.configured ? copy.statusUnconfigured
+                      : !turnStatus.available ? copy.statusUnavailable
+                      : autoTurnActive.active ? copy.statusIssued : copy.statusPending}
                   </span>
                 </div>
 
@@ -436,29 +494,30 @@ export default function SettingsModal({ onClose }: Props) {
                   <div className="flex items-center justify-between">
                     <span className="font-kanji text-[11px] text-[var(--text-on-white-2)]">凭证剩余</span>
                     <span className="font-mono text-[11px] text-[var(--text-on-white)]">
-                      {Math.max(0, Math.floor((autoTurnActive.expiresAt - Date.now()) / 1000))}s
-                      <span className="text-[var(--text-muted-on-light)]"> · TTL {turnStatus.credentialTtlSec}s</span>
+                      {copy.credentialRemaining(
+                        Math.max(0, Math.floor((autoTurnActive.expiresAt - Date.now()) / 1000)),
+                        turnStatus.credentialTtlSec,
+                      )}
                     </span>
                   </div>
                 )}
 
                 {turnStatus.configured && !turnStatus.available && (
                   <p className="font-kanji text-[10px] leading-snug" style={{ color: 'var(--state-warn-on-light)' }}>
-                    中继服务暂时不可用。请稍后重试，或使用下方经过验证的手工服务器。
+                    {copy.relayTemporarilyUnavailable}
                   </p>
                 )}
 
                 {autoTurnActive.lastFailReason && !autoTurnActive.active && (
                   <p className="font-kanji text-[10px] leading-snug" style={{ color: 'var(--state-warn-on-light)' }}>
-                    暂时无法获取中继凭证，可点击下方按钮重试。
+                    {copy.cannotFetchCredential}
                   </p>
                 )}
               </div>
             )}
 
             <p className="font-kanji text-xs text-[var(--text-on-white-2)] leading-relaxed">
-              服务器配置好中继服务后会自动下发短时效凭证；下方手工添加的 TURN 服务器在启用状态下生效。
-              关闭「启用 TURN 中继」后，自动下发和手工服务器都不会用于连接。
+              {copy.intro}
             </p>
 
             {/* TURN issuance trigger — shown when pending; gated on master switch */}
@@ -477,19 +536,19 @@ export default function SettingsModal({ onClose }: Props) {
                       const servers = await refreshAutoTurn({ force: true })
                       setAutoTurnActive(getAutoTurnState())
                       if (servers.length === 0) {
-                        setIssueError('暂时无法获取中继凭证。请检查网络后重试。')
+                        setIssueError(copy.issueFailed)
                       }
                     } catch (err) {
                       // BUG-026: refreshAutoTurn is not supposed to reject,
                       // but a rejection here used to leave "下发中…" forever.
                       console.warn('[settings] TURN issuance failed', err)
-                      setIssueError('暂时无法获取中继凭证。请检查网络后重试。')
+                      setIssueError(copy.issueFailed)
                     } finally {
                       setIssuing(false)
                     }
                   }}
                 >
-                  {issuing ? '下发中…' : '下发中继凭证'}
+                  {issuing ? copy.issuing : copy.issueCredential}
                 </MisakaButton>
                 {issueError && (
                   <p className="font-kanji text-[11px]" style={{ color: 'var(--state-warn-on-light)' }} role="alert">
@@ -501,15 +560,15 @@ export default function SettingsModal({ onClose }: Props) {
 
             {/* Global toggle (A11Y-003: real switch semantics) */}
             <MisakaSwitch
-              label="启用 TURN 中继"
-              description="同时控制服务器自动下发和下方手工添加的服务器"
+              label={copy.serverAssisted}
+              description={copy.serverAssistedDesc}
               checked={turnSettings.enabled}
               onChange={next => setTurnSettings(s => ({ ...s, enabled: next }))}
             />
 
             {/* Force relay toggle — BUG-008: unusable without an actual relay */}
             <MisakaSwitch
-              label="强制使用 TURN（仅测试）"
+              label={copy.forceRelay}
               description={forceRelayHint}
               labelClassName="font-kanji text-xs text-[var(--text-on-white-2)]"
               checked={turnSettings.forceRelay}
@@ -518,145 +577,182 @@ export default function SettingsModal({ onClose }: Props) {
               onChange={next => setTurnSettings(s => ({ ...s, forceRelay: next }))}
             />
 
-            {/* Server list */}
-            {turnSettings.servers.map(s => {
-              const result = testResults[s.id]
-              return (
-                <div
-                  key={s.id}
-                  className="rounded-xl p-3 flex flex-col gap-2"
-                  style={{ background: 'var(--surface-tint)' }}
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-mono text-xs text-[var(--text-on-white)] truncate min-w-0">{s.url}</span>
-                    <span className="font-mono text-[10px] shrink-0" style={{
-                      color: s.reachable === true ? 'var(--state-success-on-light)'
-                        : s.reachable === false ? 'var(--state-danger-on-light)'
-                        : 'var(--text-muted-on-light)',
-                    }}>
-                      {testingId === s.id ? '测试中…'
-                        : s.reachable === true ? '✓ 可达'
-                        : s.reachable === false ? '✗ 不可达'
-                        : '未测试'}
-                    </span>
-                  </div>
-                  {/* BUG-026: a failed test now says what to do about it. */}
-                  {result && !result.reachable && testingId !== s.id && (
-                    <p className="font-kanji text-[10px] leading-snug" style={{ color: 'var(--state-warn-on-light)' }}>
-                      {result.message}
-                    </p>
-                  )}
-                  <div className="flex flex-wrap gap-1.5">
-                    <MisakaButton variant="pill" size="sm" className="text-[11px] py-1 px-2"
-                      onClick={() => handleToggleServer(s.id)}>
-                      {s.enabled ? '禁用' : '启用'}
-                    </MisakaButton>
-                    <MisakaButton variant="pill" size="sm" className="text-[11px] py-1 px-2"
-                      onClick={() => handleTest(s)}
-                      disabled={testingId === s.id}>
-                      {testingId === s.id ? '测试中…' : '测试'}
-                    </MisakaButton>
-                    <MisakaButton variant="pill" size="sm" className="text-[11px] py-1 px-2"
-                      onClick={() => handleEdit(s)}>
-                      编辑
-                    </MisakaButton>
-                    <MisakaButton variant="pill" size="sm" className="text-[11px] py-1 px-2"
-                      onClick={() => handleDelete(s.id)}>
-                      <span style={{ color: 'var(--state-danger-on-light)' }}>删除</span>
-                    </MisakaButton>
-                  </div>
-                </div>
-              )
-            })}
+            {/* 07 P2: manual server form lives under 高级设置 */}
+            <div className="rounded-xl" style={{ border: '1px solid var(--border-card)' }}>
+              <button
+                type="button"
+                className="w-full flex items-center justify-between px-3 py-2.5 font-kanji text-xs cursor-pointer"
+                style={{
+                  border: 'none',
+                  background: 'var(--surface-tint)',
+                  color: 'var(--text-on-white)',
+                  borderRadius: advancedOpen ? '0.75rem 0.75rem 0 0' : '0.75rem',
+                }}
+                aria-expanded={advancedOpen}
+                onClick={() => setAdvancedOpen(o => !o)}
+              >
+                <span className="font-semibold">{copy.advanced}</span>
+                <span aria-hidden="true">{advancedOpen ? '▴' : '▾'}</span>
+              </button>
 
-            {/* Add / Edit form — A11Y-004: real <label for> associations */}
-            <div
-              className="rounded-xl p-4 flex flex-col gap-3"
-              style={{ background: 'var(--surface-tint)' }}
-            >
-              <div className="font-kanji text-xs font-semibold text-[var(--text-on-white)]">
-                {editingServer ? '编辑 TURN 服务器' : '添加 TURN 服务器'}
-              </div>
-              <div className="flex flex-col gap-1">
-                <label htmlFor={urlId} className="font-kanji text-[11px] text-[var(--text-on-white-2)]">
-                  服务器地址
-                </label>
-                <input
-                  id={urlId}
-                  className="misaka-input text-xs"
-                  placeholder="turn:example.com:3478?transport=udp"
-                  value={form.url}
-                  onChange={e => setForm(f => ({ ...f, url: e.target.value }))}
-                  aria-invalid={form.url.length > 0 && !isValidTurnUrl(form.url) ? true : undefined}
-                />
-                {form.url.length > 0 && !isValidTurnUrl(form.url) && (
-                  <p className="font-kanji text-[10px]" style={{ color: 'var(--state-danger-on-light)' }} role="alert">
-                    请输入以 turn: 或 turns: 开头的服务器地址
-                  </p>
-                )}
-              </div>
-              <div className="flex gap-2">
-                <div className="flex flex-col gap-1 flex-1 min-w-0">
-                  <label htmlFor={userId} className="font-kanji text-[11px] text-[var(--text-on-white-2)]">
-                    用户名
-                  </label>
-                  <input
-                    id={userId}
-                    className="misaka-input text-xs"
-                    autoComplete="off"
-                    value={form.username}
-                    onChange={e => setForm(f => ({ ...f, username: e.target.value }))}
-                  />
+              {advancedOpen && (
+                <div className="flex flex-col gap-4 p-3">
+                  {/* Server list */}
+                  {turnSettings.servers.map(s => {
+                    const result = testResults[s.id]
+                    return (
+                      <div
+                        key={s.id}
+                        className="rounded-xl p-3 flex flex-col gap-2"
+                        style={{ background: 'var(--surface-tint)' }}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-mono text-xs text-[var(--text-on-white)] truncate min-w-0">{s.url}</span>
+                          <span className="font-mono text-[10px] shrink-0" style={{
+                            color: s.reachable === true ? 'var(--state-success-on-light)'
+                              : s.reachable === false ? 'var(--state-danger-on-light)'
+                              : 'var(--text-muted-on-light)',
+                          }}>
+                            {testingId === s.id ? copy.testing
+                              : s.reachable === true ? copy.reachable
+                              : s.reachable === false ? copy.unreachable
+                              : copy.untested}
+                          </span>
+                        </div>
+                        {/* BUG-026: a failed test now says what to do about it. */}
+                        {result && !result.reachable && testingId !== s.id && (
+                          <p className="font-kanji text-[10px] leading-snug" style={{ color: 'var(--state-warn-on-light)' }}>
+                            {result.message}
+                          </p>
+                        )}
+                        <div className="flex flex-wrap gap-1.5">
+                          <MisakaButton variant="pill" size="sm" className="text-[11px] py-1 px-2"
+                            onClick={() => handleToggleServer(s.id)}>
+                            {s.enabled ? copy.disable : copy.enable}
+                          </MisakaButton>
+                          <MisakaButton variant="pill" size="sm" className="text-[11px] py-1 px-2"
+                            onClick={() => handleTest(s)}
+                            disabled={testingId === s.id}>
+                            {testingId === s.id ? copy.testing : copy.test}
+                          </MisakaButton>
+                          <MisakaButton variant="pill" size="sm" className="text-[11px] py-1 px-2"
+                            onClick={() => handleEdit(s)}>
+                            {copy.edit}
+                          </MisakaButton>
+                          {/* 08 P1: danger action must not share pill weight of 测试/编辑 */}
+                          <button
+                            type="button"
+                            className="font-kanji text-[11px] py-1 px-2 rounded cursor-pointer"
+                            style={{
+                              border: '1px solid var(--state-danger-on-light)',
+                              background: 'transparent',
+                              color: 'var(--state-danger-on-light)',
+                            }}
+                            onClick={() => setPendingDelete(s)}
+                          >
+                            {copy.delete}
+                          </button>
+                        </div>
+                      </div>
+                    )
+                  })}
+
+                  {/* Add / Edit form — A11Y-004: real <label for> associations */}
+                  <div
+                    className="rounded-xl p-4 flex flex-col gap-3"
+                    style={{ background: 'var(--surface-tint)' }}
+                  >
+                    <div className="font-kanji text-xs font-semibold text-[var(--text-on-white)]">
+                      {editingServer ? copy.editServer : copy.addServer}
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <label htmlFor={urlId} className="font-kanji text-[11px] text-[var(--text-on-white-2)]">
+                        {copy.serverUrl}
+                      </label>
+                      <input
+                        id={urlId}
+                        className="misaka-input text-xs"
+                        placeholder={copy.serverUrlPlaceholder}
+                        value={form.url}
+                        onChange={e => setForm(f => ({ ...f, url: e.target.value }))}
+                        aria-invalid={form.url.length > 0 && !isValidTurnUrl(form.url) ? true : undefined}
+                      />
+                      {form.url.length > 0 && !isValidTurnUrl(form.url) && (
+                        <p className="font-kanji text-[10px]" style={{ color: 'var(--state-danger-on-light)' }} role="alert">
+                          {copy.serverUrlInvalid}
+                        </p>
+                      )}
+                    </div>
+                    <div className="flex gap-2">
+                      <div className="flex flex-col gap-1 flex-1 min-w-0">
+                        <label htmlFor={userId} className="font-kanji text-[11px] text-[var(--text-on-white-2)]">
+                          {copy.username}
+                        </label>
+                        <input
+                          id={userId}
+                          className="misaka-input text-xs"
+                          autoComplete="off"
+                          value={form.username}
+                          onChange={e => setForm(f => ({ ...f, username: e.target.value }))}
+                        />
+                      </div>
+                      <div className="flex flex-col gap-1 flex-1 min-w-0">
+                        <label htmlFor={passId} className="font-kanji text-[11px] text-[var(--text-on-white-2)]">
+                          {copy.password}
+                        </label>
+                        <input
+                          id={passId}
+                          className="misaka-input text-xs"
+                          type="password"
+                          autoComplete="off"
+                          value={form.credential}
+                          onChange={e => setForm(f => ({ ...f, credential: e.target.value }))}
+                        />
+                      </div>
+                    </div>
+                    <div className="flex gap-2">
+                      {editingServer ? (
+                        <>
+                          <MisakaButton variant="primary" size="sm" onClick={handleUpdate} disabled={!isValidTurnUrl(form.url)}>{copy.save}</MisakaButton>
+                          <MisakaButton variant="pill" size="sm"
+                            onClick={() => { setEditingServer(null); setForm({ url: '', username: '', credential: '' }) }}>
+                            {copy.cancel}
+                          </MisakaButton>
+                        </>
+                      ) : (
+                        <MisakaButton variant="primary" size="sm" onClick={handleAdd} disabled={!isValidTurnUrl(form.url)}>
+                          {copy.add}
+                        </MisakaButton>
+                      )}
+                    </div>
+                  </div>
                 </div>
-                <div className="flex flex-col gap-1 flex-1 min-w-0">
-                  <label htmlFor={passId} className="font-kanji text-[11px] text-[var(--text-on-white-2)]">
-                    密码
-                  </label>
-                  <input
-                    id={passId}
-                    className="misaka-input text-xs"
-                    type="password"
-                    autoComplete="off"
-                    value={form.credential}
-                    onChange={e => setForm(f => ({ ...f, credential: e.target.value }))}
-                  />
-                </div>
-              </div>
-              <div className="flex gap-2">
-                {editingServer ? (
-                  <>
-                    <MisakaButton variant="primary" size="sm" onClick={handleUpdate} disabled={!isValidTurnUrl(form.url)}>保存</MisakaButton>
-                    <MisakaButton variant="pill" size="sm"
-                      onClick={() => { setEditingServer(null); setForm({ url: '', username: '', credential: '' }) }}>
-                      取消
-                    </MisakaButton>
-                  </>
-                ) : (
-                  <MisakaButton variant="primary" size="sm" onClick={handleAdd} disabled={!isValidTurnUrl(form.url)}>
-                    + 添加
-                  </MisakaButton>
-                )}
-              </div>
+              )}
             </div>
           </div>
         )}
 
         {/* ── Sound ─────────────────────────────────────── */}
         {tab === 'sound' && (
-          <div className="flex flex-col gap-4">
+          <div
+            className="flex flex-col gap-4"
+            role="tabpanel"
+            id={tabPanelId.sound}
+            aria-labelledby={tabId.sound}
+          >
             <p className="font-kanji text-xs text-[var(--text-on-white-2)] leading-relaxed">
-              扫码、传输完成、错误提示会播放短音效。设置只保存在本机。
+              {copy.soundIntro}
             </p>
             <MisakaSwitch
-              label="启用操作音效"
+              label={copy.soundEnable}
               checked={soundOn}
               onChange={handleSoundToggle}
             />
             <div className="grid grid-cols-3 gap-2">
               {([
-                ['scan', '扫码'],
-                ['complete', '完成'],
-                ['error', '错误'],
+                ['scan', copy.soundScan],
+                ['complete', copy.soundComplete],
+                ['error', copy.soundError],
               ] as const).map(([event, label]) => (
                 <MisakaButton key={event} variant="pill" size="sm" onClick={() => playSound(event)}>
                   {label}
@@ -665,7 +761,7 @@ export default function SettingsModal({ onClose }: Props) {
             </div>
             <div className="pt-2 border-t" style={{ borderColor: 'var(--border-card)' }}>
               <div className="flex items-center justify-between gap-2">
-                <span className="font-kanji text-xs text-[var(--text-on-white-2)]">文件接收通知</span>
+                <span className="font-kanji text-xs text-[var(--text-on-white-2)]">{copy.fileNotify}</span>
                 <MisakaButton
                   variant="pill"
                   size="sm"
@@ -674,7 +770,7 @@ export default function SettingsModal({ onClose }: Props) {
                     if (p === 'granted') playSound('complete')
                   }}
                 >
-                  授权通知
+                  {copy.authorizeNotify}
                 </MisakaButton>
               </div>
             </div>
@@ -683,36 +779,83 @@ export default function SettingsModal({ onClose }: Props) {
 
         {/* ── About / Legal ──────────────────────────────── */}
         {tab === 'about' && (
-          <div className="flex flex-col gap-4">
+          <div
+            className="flex flex-col gap-4"
+            role="tabpanel"
+            id={tabPanelId.about}
+            aria-labelledby={tabId.about}
+          >
             <div className="font-kanji text-xs text-[var(--text-on-white-2)] leading-relaxed">
-              <p className="mb-2">© Master Huang · Misaka Network</p>
-              <p className="mb-2">
-                文件在浏览器之间端到端加密传输；直连失败时，流量可能经过服务器自动下发的
-                Cloudflare TURN 或你配置的中继。信令会处理会话、IP 安全状态和聚合传输统计，
-                部分安全/额度数据会跨重启保留。
-              </p>
+              <p className="mb-2">{copy.aboutCredit}</p>
+              <p className="mb-2">{copy.aboutBody}</p>
               <a
                 href="https://github.com/12dora/Misaka-Network"
                 target="_blank"
                 rel="noreferrer"
                 className="underline decoration-dotted"
               >
-                GitHub
+                {copy.github}
               </a>
             </div>
             <div className="flex flex-col gap-2">
               <MisakaButton variant="pill" size="sm" fullWidth
-                onClick={() => { modal.requestClose(); window.setTimeout(() => navigate('/tos'), 180) }}>
-                服务条款
+                onClick={() => { modal.requestCloseThen(() => navigate('/tos')) }}>
+                {copy.terms}
               </MisakaButton>
               <MisakaButton variant="pill" size="sm" fullWidth
-                onClick={() => { modal.requestClose(); window.setTimeout(() => navigate('/privacy'), 180) }}>
-                隐私政策
+                onClick={() => { modal.requestCloseThen(() => navigate('/privacy')) }}>
+                {copy.privacy}
               </MisakaButton>
             </div>
           </div>
         )}
       </div>
     </MisakaDialog>
+
+    {/* 08 P1: nested confirm before deleting a TURN server */}
+    {pendingDelete && (
+      <MisakaDialog
+        title={copy.deleteConfirmTitle}
+        description={copy.deleteConfirmBody(pendingDelete.url)}
+        onRequestClose={() => setPendingDelete(null)}
+        initialFocusRef={keepDeleteRef}
+        backdropStyle={{ background: 'rgba(14,42,107,0.7)', backdropFilter: 'blur(6px)', zIndex: 120 }}
+        panelClassName="misaka-card w-full max-w-[360px] p-5"
+        renderHeader={({ titleId, descriptionId }) => (
+          <>
+            <h2 id={titleId} className="font-kanji font-bold text-sm text-[var(--text-on-white)] m-0 mb-2">
+              {copy.deleteConfirmTitle}
+            </h2>
+            <p id={descriptionId} className="font-kanji text-xs text-[var(--text-on-white-2)] m-0 mb-4 break-all">
+              {copy.deleteConfirmBody(pendingDelete.url)}
+            </p>
+          </>
+        )}
+      >
+        <div className="flex gap-2">
+          <MisakaButton
+            ref={keepDeleteRef}
+            variant="primary"
+            fullWidth
+            onClick={() => setPendingDelete(null)}
+          >
+            {copy.keep}
+          </MisakaButton>
+          <button
+            type="button"
+            className="flex-1 font-kanji text-sm py-2 rounded-lg cursor-pointer"
+            style={{
+              border: '1px solid var(--state-danger-on-light)',
+              background: 'transparent',
+              color: 'var(--state-danger-on-light)',
+            }}
+            onClick={() => commitDelete(pendingDelete.id)}
+          >
+            {copy.confirmDelete}
+          </button>
+        </div>
+      </MisakaDialog>
+    )}
+    </>
   )
 }

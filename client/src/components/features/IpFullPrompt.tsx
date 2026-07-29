@@ -14,14 +14,18 @@ interface Props {
 /**
  * Shared IP-quota-exceeded prompt. Previously this UI was inlined in
  * LoginCard, which meant the Join flow had no way to surface the same
- * "本机 IP 已满" recovery hint. Extracted so both entry points show the
- * same modal and route through the same release-and-retry logic.
+ * recovery hint. Extracted so both entry points show the same modal and
+ * route through the same release-and-retry logic.
  *
  * A11Y-001 / UX-LAYOUT-001: now goes through the shared dialog primitive, so
  * it portals to <body> (it used to render inside the transform-animated
  * route wrapper, which made `position: fixed` resolve against the route div
  * rather than the viewport) and gains focus containment, an inert
  * background, scroll lock and focus restoration.
+ *
+ * Copy (07 P2): the server sees a *shared public egress*, not "this device".
+ * Behind CGNAT / dorm / office NAT the other nodes are often someone else's
+ * machine — "本机节点已满" sent users hunting tabs on the wrong device.
  *
  * The unauthenticated recovery proof is intentionally identity-scoped:
  * nodeId + passcode can release only matching sessions on this IP. The
@@ -46,8 +50,8 @@ export default function IpFullPrompt({ onConfirm, onCancel, busy = false }: Prop
 
   return (
     <MisakaDialog
-      title="本机节点已满"
-      description="当前 IP 已达到节点上限"
+      title="当前网络的接入名额已满"
+      description="此网络出口当前最多允许 10 个在线节点"
       onRequestClose={onCancel}
       initialFocusRef={confirmRef}
       // Sits above the other modals — LoginCard can raise it while ScanModal
@@ -59,18 +63,18 @@ export default function IpFullPrompt({ onConfirm, onCancel, busy = false }: Prop
           <div className="flex items-center gap-2 mb-1">
             <MisakaKanjiBlock char="満" size="md" />
             <h2 id={titleId} className="font-kanji font-bold text-lg text-[var(--text-on-white)] m-0">
-              本机节点已满
+              当前网络的接入名额已满
             </h2>
           </div>
           <p id={descriptionId} className="font-kanji text-xs text-[var(--text-on-white-2)] mb-3">
-            当前 IP 已达到节点上限
+            此网络出口当前最多允许 10 个在线节点
           </p>
         </>
       )}
     >
       <p className="font-kanji text-sm text-[var(--text-on-white)] mb-5">
-        本机 IP 同时最多允许 10 个节点。可验证当前节点编号与通行码，并仅释放此 IP 上同一身份的会话；
-        其他身份的节点不会被删除。
+        此网络出口（同一公网地址）同时最多允许 10 个在线节点；占用可能来自宿舍、办公室或运营商共享出口上的其他设备。
+        验证节点编号与通行码后，只会释放同一身份的会话；其他身份的节点不会被删除。
       </p>
       {releaseResult !== null && (
         <p

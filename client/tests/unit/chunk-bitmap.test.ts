@@ -88,19 +88,61 @@ describe('bitmap ↔ index round-trips', () => {
     expect(bitmapToIndexes(newBitmap(100), 100)).toEqual([])
   })
 
-  it('fuzz: random index sets round-trip identically', () => {
+  it('fuzz: seeded PRNG index sets round-trip identically', () => {
+    // Mulberry32 — deterministic, seed printed on failure for repro.
+    const seed = 0xC0FFEE ^ 0x5EED
+    let state = seed >>> 0
+    const rand = () => {
+      state = (state + 0x6D2B79F5) >>> 0
+      let t = state
+      t = Math.imul(t ^ (t >>> 15), t | 1)
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+    }
+
     const TOTAL = 200
     for (let trial = 0; trial < 50; trial++) {
       const want = new Set<number>()
-      const count = Math.floor(Math.random() * TOTAL)
+      const count = Math.floor(rand() * TOTAL)
       for (let k = 0; k < count; k++) {
-        want.add(Math.floor(Math.random() * TOTAL))
+        want.add(Math.floor(rand() * TOTAL))
       }
       const b = bitmapFromIndexes(want, TOTAL)
       const got = new Set(bitmapToIndexes(b, TOTAL))
-      expect(got.size).toBe(want.size)
-      for (const i of want) expect(got.has(i)).toBe(true)
+      try {
+        expect(got.size).toBe(want.size)
+        for (const i of want) expect(got.has(i)).toBe(true)
+      } catch (err) {
+        throw new Error(
+          `bitmap fuzz failed (seed=0x${seed.toString(16)}, trial=${trial}): ${(err as Error).message}`,
+        )
+      }
     }
+  })
+
+  it('byte-boundary cases: 7/8, 31/32, trailing padding bits', () => {
+    // Last bit of the first byte.
+    const b7 = bitmapFromIndexes([7], 16)
+    expect(bitmapToIndexes(b7, 16)).toEqual([7])
+    expect(bitmapPopcount(b7)).toBe(1)
+
+    // First bit of the second byte.
+    const b8 = bitmapFromIndexes([8], 16)
+    expect(bitmapToIndexes(b8, 16)).toEqual([8])
+    expect(bitmapPopcount(b8)).toBe(1)
+
+    // Last bit of the fourth byte / first of the fifth.
+    const b31 = bitmapFromIndexes([31], 40)
+    expect(bitmapToIndexes(b31, 40)).toEqual([31])
+    const b32 = bitmapFromIndexes([32], 40)
+    expect(bitmapToIndexes(b32, 40)).toEqual([32])
+
+    // totalChunks not a multiple of 8 — trailing padding bits must stay clear.
+    const bPad = bitmapFromIndexes([0, 1, 6], 7)
+    expect(bitmapToIndexes(bPad, 7)).toEqual([0, 1, 6])
+    // Setting index 7 would be out of range for total=7.
+    const over = bitmapFromIndexes([0, 7], 7)
+    expect(bitmapToIndexes(over, 7)).toEqual([0])
   })
 })
 

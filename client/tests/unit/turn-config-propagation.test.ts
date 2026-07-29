@@ -268,25 +268,42 @@ describe('force-relay toggle propagates to live PCs', () => {
   // candidate pair — the peers keep using the old path until something else
   // restarts ICE. applyIceConfigToAll therefore reports which live PCs saw a
   // materially different config so the caller can schedule an ICE restart.
-  it('reports the PCs whose effective ICE config actually changed', async () => {
+  //
+  // 02 P1: previous===undefined used to mean "not changed", so a STUN-only PC
+  // never migrated when TURN first arrived. We now compare against the live
+  // getConfiguration() (or the construction-time seed) and only commit the
+  // signature after setConfiguration succeeds.
+  it('reports a first-ever material change against the live configuration', async () => {
     await refreshAutoTurn()
     saveTurnSettings({ enabled: true, forceRelay: false, servers: [] })
 
-    const pc: any = { connectionState: 'connected', setConfiguration: vi.fn() }
+    // Simulate a PC built STUN-only before TURN credentials existed.
+    const pc: any = {
+      connectionState: 'connected',
+      setConfiguration: vi.fn(),
+      getConfiguration: () => ({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+        iceTransportPolicy: 'all',
+      }),
+    }
 
-    // First application only records a baseline — nothing to migrate yet.
-    expect(applyIceConfigToAll([pc])).toEqual([])
-
-    saveTurnSettings({ enabled: true, forceRelay: true, servers: [] })
+    // First application with TURN available is a real change → report pc.
     expect(applyIceConfigToAll([pc])).toEqual([pc])
 
     // Re-applying the same config is a no-op for migration purposes.
     expect(applyIceConfigToAll([pc])).toEqual([])
+
+    saveTurnSettings({ enabled: true, forceRelay: true, servers: [] })
+    expect(applyIceConfigToAll([pc])).toEqual([pc])
   })
 
   it('reports a change when the TURN server set rotates but the policy does not', async () => {
     saveTurnSettings({ enabled: true, forceRelay: false, servers: [] })
-    const pc: any = { connectionState: 'connected', setConfiguration: vi.fn() }
+    const pc: any = {
+      connectionState: 'connected',
+      setConfiguration: vi.fn(),
+      getConfiguration: () => ({ iceServers: [], iceTransportPolicy: 'all' }),
+    }
     applyIceConfigToAll([pc])
 
     saveTurnSettings({
@@ -305,6 +322,28 @@ describe('force-relay toggle propagates to live PCs', () => {
 
     applyIceConfigToAll([bad, good])
     expect(good.setConfiguration).toHaveBeenCalledTimes(1)
+
+    consoleSpy.mockRestore()
+  })
+
+  it('does not commit the signature when setConfiguration throws — retry still reports change', () => {
+    saveTurnSettings({ enabled: true, forceRelay: false, servers: [] })
+    const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    let shouldFail = true
+    const pc: any = {
+      connectionState: 'connected',
+      getConfiguration: () => ({ iceServers: [], iceTransportPolicy: 'all' }),
+      setConfiguration: vi.fn(() => {
+        if (shouldFail) throw new Error('fail')
+      }),
+    }
+
+    expect(applyIceConfigToAll([pc])).toEqual([])
+    shouldFail = false
+    // Same desired config; signature was not committed, so still a change.
+    expect(applyIceConfigToAll([pc])).toEqual([pc])
+    // Now committed — further identical applies are no-ops.
+    expect(applyIceConfigToAll([pc])).toEqual([])
 
     consoleSpy.mockRestore()
   })

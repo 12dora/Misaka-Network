@@ -99,11 +99,11 @@ describe('A11Y-003: the settings toggles are real switches', () => {
     loaded = { servers: [MANUAL_SERVER], enabled: true, forceRelay: false }
     render()
 
-    const master = switchByName('启用 TURN 中继')
+    const master = switchByName('服务器协助连接')
     expect(master.getAttribute('role')).toBe('switch')
     expect(master.getAttribute('aria-checked')).toBe('true')
 
-    const force = switchByName('强制使用 TURN（仅测试）')
+    const force = switchByName('强制服务器协助（仅测试）')
     expect(force.getAttribute('aria-checked')).toBe('false')
   })
 })
@@ -113,7 +113,7 @@ describe('BUG-008 (UI): the master switch is the single gate', () => {
     loaded = { servers: [MANUAL_SERVER], enabled: true, forceRelay: false }
     render()
 
-    expect(switchByName('强制使用 TURN（仅测试）').disabled).toBe(false)
+    expect(switchByName('强制服务器协助（仅测试）').disabled).toBe(false)
   })
 
   it('happy path — with TURN on and auto credentials issued, force relay is available', () => {
@@ -122,7 +122,7 @@ describe('BUG-008 (UI): the master switch is the single gate', () => {
     loaded = { servers: [], enabled: true, forceRelay: false }
     render()
 
-    expect(switchByName('强制使用 TURN（仅测试）').disabled).toBe(false)
+    expect(switchByName('强制服务器协助（仅测试）').disabled).toBe(false)
   })
 
   it('REGRESSION — the master switch off disables force relay even with cached auto TURN', () => {
@@ -133,9 +133,9 @@ describe('BUG-008 (UI): the master switch is the single gate', () => {
     loaded = { servers: [MANUAL_SERVER], enabled: false, forceRelay: false }
     render()
 
-    const force = switchByName('强制使用 TURN（仅测试）')
+    const force = switchByName('强制服务器协助（仅测试）')
     expect(force.disabled).toBe(true)
-    expect(document.body.textContent).toContain('需要先启用 TURN 中继')
+    expect(document.body.textContent).toContain('需要先启用服务器协助连接')
   })
 
   it('REGRESSION — an armed force-relay is CLEARED when no TURN is available', () => {
@@ -143,7 +143,7 @@ describe('BUG-008 (UI): the master switch is the single gate', () => {
     loaded = { servers: [], enabled: true, forceRelay: true }
     render()
 
-    const force = switchByName('强制使用 TURN（仅测试）')
+    const force = switchByName('强制服务器协助（仅测试）')
     expect(force.getAttribute('aria-checked')).toBe('false')
     expect(force.disabled).toBe(true)
     // …and the cleared value is persisted, so the next PC build can't pick
@@ -159,8 +159,8 @@ describe('BUG-008 (UI): the master switch is the single gate', () => {
     }
     render()
 
-    expect(switchByName('强制使用 TURN（仅测试）').disabled).toBe(true)
-    expect(document.body.textContent).toContain('当前没有可用的中继服务器')
+    expect(switchByName('强制服务器协助（仅测试）').disabled).toBe(true)
+    expect(document.body.textContent).toContain('当前没有可用的协助服务器')
   })
 
   it.each([
@@ -174,7 +174,7 @@ describe('BUG-008 (UI): the master switch is the single gate', () => {
     }
     render()
 
-    const force = switchByName('强制使用 TURN（仅测试）')
+    const force = switchByName('强制服务器协助（仅测试）')
     expect(force.disabled).toBe(true)
     expect(force.getAttribute('aria-checked')).toBe('false')
   })
@@ -187,7 +187,7 @@ describe('BUG-008 (UI): the master switch is the single gate', () => {
     }
     render()
 
-    expect(switchByName('强制使用 TURN（仅测试）').disabled).toBe(true)
+    expect(switchByName('强制服务器协助（仅测试）').disabled).toBe(true)
   })
 
   it('REGRESSION — arbitrary text such as "foo" is not a usable relay', () => {
@@ -198,8 +198,8 @@ describe('BUG-008 (UI): the master switch is the single gate', () => {
     }
     render()
 
-    expect(switchByName('强制使用 TURN（仅测试）').disabled).toBe(true)
-    expect(switchByName('强制使用 TURN（仅测试）').getAttribute('aria-checked')).toBe('false')
+    expect(switchByName('强制服务器协助（仅测试）').disabled).toBe(true)
+    expect(switchByName('强制服务器协助（仅测试）').getAttribute('aria-checked')).toBe('false')
   })
 
   it.each([
@@ -217,7 +217,7 @@ describe('BUG-008 (UI): the master switch is the single gate', () => {
     }
     render()
 
-    const force = switchByName('强制使用 TURN（仅测试）')
+    const force = switchByName('强制服务器协助（仅测试）')
     expect(force.disabled).toBe(true)
     expect(force.getAttribute('aria-checked')).toBe('false')
   })
@@ -234,7 +234,7 @@ describe('BUG-008 (UI): the master switch is the single gate', () => {
     }
     render()
 
-    expect(switchByName('强制使用 TURN（仅测试）').disabled).toBe(false)
+    expect(switchByName('强制服务器协助（仅测试）').disabled).toBe(false)
   })
 
   it('the copy states that the master switch governs auto issuance too', () => {

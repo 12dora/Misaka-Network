@@ -45,7 +45,7 @@ import {
   setPeerProtocolVersion, getPeerProtocolVersion,
   negotiatedProtocolVersion, clearPeerProtocolVersion,
   sendFileParallel, markReceiverReady, markTransferAcked,
-  CHUNK_FRAME_TAG, encodeChunkFrame, decodeChunkFrame,
+  markReceiverRejected, applyRepairRequest,
   CHUNK_SIZE,
 } from '../../src/lib/transfer'
 import * as db from '../../src/lib/db'
@@ -149,23 +149,63 @@ describe('version-gated delivery semantics', () => {
   })
 })
 
-describe('the binary chunk frame is UNCHANGED across v1 and v2', () => {
-  it('keeps tag 0x01 and the [tag:1][shortId:4][index:4][iv:12][ciphertext] layout', () => {
-    expect(CHUNK_FRAME_TAG).toBe(0x01)
-    const iv = new Uint8Array(12).fill(7)
-    const cipher = new Uint8Array([1, 2, 3, 4]).buffer
-    const frame = encodeChunkFrame(0xdeadbeef, 0x01020304, iv, cipher)
-    const view = new DataView(frame)
-    expect(view.getUint8(0)).toBe(0x01)
-    expect(view.getUint32(1, false)).toBe(0xdeadbeef)
-    expect(view.getUint32(5, false)).toBe(0x01020304)
-    expect(frame.byteLength).toBe(21 + 4)
+// Frame layout is covered thoroughly by transfer-frame.test.ts. This suite
+// owns the JSON control-plane version differences only (05 P3).
+describe('JSON control-plane version differences', () => {
+  it('v2: transfer-reject ends the wait without ever sending payload', async () => {
+    setPeerProtocolVersion(PEER, 2)
+    const frames: ArrayBuffer[] = []
+    const control: string[] = []
+    const lane = makeLane(frames, control)
+    const file = new File([new Uint8Array(CHUNK_SIZE)], 'reject.bin')
+    const sending = sendFileParallel(
+      [lane], file, 'rej', 1, PEER, undefined, undefined, undefined, 0,
+    )
 
-    const decoded = decodeChunkFrame(frame)!
-    expect(decoded.shortId).toBe(0xdeadbeef)
-    expect(decoded.index).toBe(0x01020304)
-    expect(Array.from(decoded.iv)).toEqual(Array.from(iv))
-    expect(Array.from(new Uint8Array(decoded.ciphertext))).toEqual([1, 2, 3, 4])
+    await new Promise(r => setTimeout(r, 5))
+    expect(frames.length).toBe(0)
+    expect(JSON.parse(control[0])).toMatchObject({ type: 'meta', v: 2 })
+
+    expect(markReceiverRejected('rej', OWNER)).toBe(true)
+    await expect(sending).rejects.toThrow()
+    expect(frames.length).toBe(0)
+  })
+
+  it('v2: transfer-repair re-queues into the live send task (not a second engine)', async () => {
+    setPeerProtocolVersion(PEER, 2)
+    const frames: ArrayBuffer[] = []
+    const lane = makeLane(frames)
+    const file = new File([new Uint8Array(CHUNK_SIZE * 3)], 'repair.bin')
+    const sending = sendFileParallel(
+      [lane], file, 'rep', 1, PEER, undefined, undefined, undefined, 0,
+    )
+    markReceiverReady('rep', OWNER)
+    // Let a chunk or two leave so there is a live task to repair into.
+    await new Promise(r => setTimeout(r, 20))
+    const requeued = applyRepairRequest(
+      { transferId: 'rep', missingRanges: [[0, 1]] },
+      OWNER,
+    )
+    // Live task: returns the number of indexes re-queued (≥ 0). -1 would mean
+    // "no live task — spawn a second engine", which protocol v2 forbids.
+    expect(requeued).toBeGreaterThanOrEqual(0)
+    markTransferAcked('rep', OWNER)
+    await expect(sending).resolves.toMatchObject({ state: 'saved' })
+  })
+
+  it('v1 peer never waits for transfer-ready / transfer-done', async () => {
+    // Already covered above as `delivered` + immediate payload; pin the
+    // control plane: no ready wait means frames leave without markReceiverReady.
+    const frames: ArrayBuffer[] = []
+    const control: string[] = []
+    const lane = makeLane(frames, control)
+    const file = new File([new Uint8Array(8)], 'v1-small.bin')
+    const outcome = await sendFileParallel(
+      [lane], file, 'v1s', 1, PEER, undefined, undefined, undefined, 0,
+    )
+    expect(JSON.parse(control[0])).toMatchObject({ type: 'meta', v: PROTOCOL_VERSION })
+    expect(frames.length).toBeGreaterThan(0)
+    expect(outcome).toEqual({ state: 'delivered', acked: false, legacyPeer: true })
   })
 })
 

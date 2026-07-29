@@ -1,6 +1,6 @@
 import type { WSServerMessage, WSMessage } from '@/types'
 import { wsUrl } from '@/config'
-import { HEARTBEAT_INTERVAL_MS, RECONNECT_DELAYS_MS } from '@/constants'
+import { HEARTBEAT_INTERVAL_MS, RECONNECT_DELAYS_MS, WS_CONNECT_TIMEOUT_MS } from '@/constants'
 
 // BUG-006: handlers are allowed to be async. Previously the type said
 // `void`, every network.ts signaling handler was `async`, and the returned
@@ -19,9 +19,13 @@ const authInvalidHandlers = new Set<ConnectionHandler>()
 const sessionEndHandlers = new Set<ConnectionHandler>()
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null
+let connectWatchdogTimer: ReturnType<typeof setTimeout> | null = null
 let token = ''
 let reconnectAttempts = 0
 let serverShutdown = false
+// Monotonic generation so a stale close/error/message from a detached socket
+// cannot stop the NEW socket's heartbeat, broadcast disconnect, or clear auth.
+let socketGeneration = 0
 
 // Invoke a set of subscribers so that one bad handler — throwing synchronously
 // or rejecting later — can neither abort the dispatch loop nor escape as an
@@ -73,6 +77,46 @@ export function onSessionEnd(handler: ConnectionHandler) {
   return () => { sessionEndHandlers.delete(handler) }
 }
 
+/**
+ * Detach every callback and close `sock`. If it is still the module's current
+ * socket, clear `ws` so a later stale event cannot be mistaken for the live one.
+ * Does NOT schedule reconnect — callers that want backoff do that themselves.
+ */
+function detachAndClose(sock: WebSocket | null) {
+  if (!sock) return
+  sock.onclose = null
+  sock.onerror = null
+  sock.onmessage = null
+  sock.onopen = null
+  if (connectWatchdogTimer && ws === sock) {
+    clearTimeout(connectWatchdogTimer)
+    connectWatchdogTimer = null
+  }
+  try { sock.close() } catch { /* already closed / closing */ }
+  if (ws === sock) ws = null
+}
+
+function clearConnectWatchdog() {
+  if (connectWatchdogTimer) {
+    clearTimeout(connectWatchdogTimer)
+    connectWatchdogTimer = null
+  }
+}
+
+/** Per-socket connect watchdog: a black-holing firewall can leave CONNECTING forever. */
+function armConnectWatchdog(sock: WebSocket, generation: number) {
+  clearConnectWatchdog()
+  connectWatchdogTimer = setTimeout(() => {
+    connectWatchdogTimer = null
+    // Only the socket that armed this timer may be closed.
+    if (ws !== sock || generation !== socketGeneration) return
+    if (sock.readyState === WebSocket.CONNECTING) {
+      detachAndClose(sock)
+      scheduleReconnect()
+    }
+  }, WS_CONNECT_TIMEOUT_MS)
+}
+
 export function connect(t: string) {
   // Auth recovery (4001/4002 close → fresh token) re-enters this function.
   // The old socket is still attached to its onclose; if we leave it alone the
@@ -80,12 +124,7 @@ export function connect(t: string) {
   // never sent. Force-detach + close the old socket first.
   const tokenChanged = token !== t
   if (tokenChanged && ws) {
-    ws.onclose = null
-    ws.onerror = null
-    ws.onmessage = null
-    ws.onopen = null
-    try { ws.close() } catch { /* ignore */ }
-    ws = null
+    detachAndClose(ws)
   }
   token = t
   reconnectAttempts = 0
@@ -106,11 +145,23 @@ export function reconnectNow() {
   reconnectAttempts = 0
   serverShutdown = false
   if (ws && (ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED)) {
-    ws = null
+    // Nulling without detach left a CLOSING socket able to deliver a stale
+    // close that stopped the NEW socket's heartbeat / cleared auth. Detach.
+    detachAndClose(ws)
   }
   if (ws?.readyState === WebSocket.OPEN) {
-    try { ws.send(JSON.stringify({ t: 'PING' })) } catch { /* reconnect below */ }
-    return
+    try {
+      ws.send(JSON.stringify({ t: 'PING' }))
+      return
+    } catch {
+      // OPEN-but-half-dead: PING threw. Fall through and replace the socket.
+      detachAndClose(ws)
+    }
+  }
+  // Explicit reconnect may also replace a CONNECTING socket stuck behind a
+  // black hole — doConnect would otherwise refuse to open a second one.
+  if (ws?.readyState === WebSocket.CONNECTING) {
+    detachAndClose(ws)
   }
   doConnect()
 }
@@ -119,12 +170,17 @@ function doConnect() {
   // Don't replace a socket that's already open *or* still connecting —
   // overwriting it leaves the old socket's `onopen` referencing the new ws
   // via closure, which then calls `ws.send` on a still-CONNECTING socket.
+  // Stuck CONNECTING is handled by the per-socket watchdog / reconnectNow.
   if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
 
   const sock = new WebSocket(wsUrl())
+  const generation = ++socketGeneration
   ws = sock
+  armConnectWatchdog(sock, generation)
 
   sock.onopen = () => {
+    if (ws !== sock) return
+    clearConnectWatchdog()
     sock.send(JSON.stringify({ t: 'AUTH', token }))
     startHeartbeat(sock)
     reconnectAttempts = 0
@@ -132,11 +188,19 @@ function doConnect() {
   }
 
   sock.onclose = (e) => {
+    // Generation / identity check: a detached socket's late close must not
+    // touch the live connection's heartbeat or auth state.
+    if (ws !== sock) return
+    clearConnectWatchdog()
     stopHeartbeat()
+    ws = null
     dispatch(disconnectHandlers, undefined, 'disconnect')
     // Server-side sessions are in-memory; after a server restart our cached
     // token comes back as 4002 INVALID_TOKEN. Stop reconnecting with the
     // dead token and let the auth store re-register from sessionStorage.
+    // Contract 3: 4001/4002 → onAuthInvalid (hard contract). 4003 is a
+    // transient AUTH timeout / non-AUTH first frame — reconnect with the
+    // SAME token through exponential backoff; do NOT burn a new session.
     if (e.code === 4001 || e.code === 4002) {
       serverShutdown = true
       dispatch(authInvalidHandlers, undefined, 'authInvalid')
@@ -146,10 +210,12 @@ function doConnect() {
   }
 
   sock.onerror = () => {
-    sock.close()
+    if (ws !== sock) return
+    try { sock.close() } catch { /* ignore */ }
   }
 
   sock.onmessage = (e) => {
+    if (ws !== sock) return
     let msg: WSServerMessage
     try {
       msg = JSON.parse(e.data as string) as WSServerMessage
@@ -170,7 +236,13 @@ function startHeartbeat(sock: WebSocket) {
       stopHeartbeat()
       return
     }
-    sock.send(JSON.stringify({ t: 'PING' }))
+    try {
+      sock.send(JSON.stringify({ t: 'PING' }))
+    } catch {
+      // Half-dead OPEN socket: stop hammering and let ownership-aware close
+      // (or the next reconnectNow) replace it.
+      stopHeartbeat()
+    }
   }, HEARTBEAT_INTERVAL_MS)
 }
 
@@ -206,6 +278,7 @@ export function disconnect() {
     clearTimeout(reconnectTimer)
     reconnectTimer = null
   }
+  clearConnectWatchdog()
   // BUG-001: the token used to survive disconnect(), so the module-level
   // `online` listener (or any reconnectNow() caller) happily re-opened a
   // socket with a token we had just released — the UI said "未接入" while a
@@ -219,9 +292,7 @@ export function disconnect() {
   // the first logout. Registrars call the returned unsubscribe instead.
   stopHeartbeat()
   if (ws) {
-    ws.onclose = null // prevent reconnect
-    ws.close()
-    ws = null
+    detachAndClose(ws)
   }
 }
 
