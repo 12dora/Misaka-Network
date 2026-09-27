@@ -78,6 +78,21 @@ jobs:
           echo "Resolved VITE_BASE=$base"
           echo "vite_base=$base" >> "$GITHUB_OUTPUT"
 
+      # The deployed signaling server is configuration, not source: it comes
+      # from repository secrets so the repo itself carries no real endpoint.
+      # Without the secrets the committed placeholder config.json is kept.
+      - name: Write runtime config
+        env:
+          MISAKA_API_BASE: ${{ secrets.MISAKA_API_BASE }}
+          MISAKA_WS_URL: ${{ secrets.MISAKA_WS_URL }}
+        run: |
+          if [ -n "$MISAKA_API_BASE" ] && [ -n "$MISAKA_WS_URL" ]; then
+            node -e 'require("fs").writeFileSync("client/public/config.json", JSON.stringify({API_BASE: process.env.MISAKA_API_BASE, WS_URL: process.env.MISAKA_WS_URL}, null, 2) + "\n")'
+            echo "runtime config written from secrets"
+          else
+            echo "MISAKA_API_BASE/MISAKA_WS_URL not set; keeping committed config.json"
+          fi
+
       - name: Install dependencies
         run: cd client && npm ci
 

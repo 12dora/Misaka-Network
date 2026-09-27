@@ -3,8 +3,8 @@
 //                        Vite env > hard-coded project default
 //
 // The project default points at the official public signaling server
-// (https://misaka.example.org) so a fresh GitHub Pages deployment of the
-// repo works out of the box without anyone having to edit config.json.
+// (https://misaka.example.org, a placeholder) — the real endpoint is written
+// into public/config.json at deploy time from repository secrets.
 // Forks can still override via public/config.json or VITE_API_BASE.
 //
 // In local dev (`vite dev`), defaults are empty so the Vite proxy at
